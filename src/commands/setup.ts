@@ -1,5 +1,6 @@
-import { existsSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import { AxiError, installSessionStartHooks } from "axi-sdk-js";
 import type { Ctx } from "../context.js";
 import { flagBool, flagString, parseArgs } from "../args.js";
@@ -25,16 +26,19 @@ export async function setupCommand(args: string[], _ctx: Ctx | undefined): Promi
   }
 
   if (wantHooks) {
-    let hookInstalled = true;
     installSessionStartHooks({
-      marker: "vault-axi",
+      marker: "vault",
       binaryNames: ["vault"],
+      distEntrypoints: ["dist/cli.js"],
+      shouldInstall: () => true,
       onError: (message) => {
-        hookInstalled = false;
         out.hookError = message;
       },
     });
-    out.sessionHook = hookInstalled ? "installed (Claude Code SessionStart)" : "failed";
+    const hook = findVaultSessionHook();
+    out.sessionHook = hook
+      ? `installed (Claude Code SessionStart: \`${hook}\`)`
+      : "failed (no SessionStart entry written)";
   }
 
   if (!vault && !wantHooks) {
@@ -48,4 +52,23 @@ export async function setupCommand(args: string[], _ctx: Ctx | undefined): Promi
 
   out.next = ["vault reindex", 'vault search "<query>"'];
   return out;
+}
+
+/** Read ~/.claude/settings.json and return the command of a vault SessionStart hook, if any. */
+function findVaultSessionHook(): string | null {
+  const path = join(homedir(), ".claude", "settings.json");
+  if (!existsSync(path)) return null;
+  try {
+    const settings = JSON.parse(readFileSync(path, "utf8")) as {
+      hooks?: { SessionStart?: { hooks?: { command?: string }[] }[] };
+    };
+    for (const group of settings.hooks?.SessionStart ?? []) {
+      for (const h of group.hooks ?? []) {
+        if (typeof h.command === "string" && h.command.includes("vault")) return h.command;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
