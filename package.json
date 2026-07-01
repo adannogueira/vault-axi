@@ -1,0 +1,36 @@
+{
+  "name": "vault-axi",
+  "version": "0.1.0",
+  "description": "Agent-ergonomic (AXI) CLI for reading, editing, and searching an Obsidian markdown vault.",
+  "type": "module",
+  "bin": {
+    "vault": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    ".agents"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "axi-sdk-js": "^0.1.8",
+    "better-sqlite3": "^12.11.1",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
