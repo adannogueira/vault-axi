@@ -9,10 +9,14 @@ export const DEFAULT_MODEL = "TaylorAI/bge-micro-v2";
 export const EMBED_DIM = 384;
 const MAX_INPUT_CHARS = 2000;
 
-type FeatureExtractor = (
+const MODEL_MAX_TOKENS = 512;
+
+type FeatureExtractor = ((
   texts: string[],
   opts: { pooling: "mean"; normalize: boolean },
-) => Promise<{ tolist: () => number[][] }>;
+) => Promise<{ tolist: () => number[][] }>) & {
+  tokenizer?: { _tokenizerConfig?: { model_max_length?: number } };
+};
 
 let pipe: FeatureExtractor | null = null;
 let initTried = false;
@@ -39,9 +43,15 @@ export async function initEmbedder(): Promise<boolean> {
     // Keep everything local; never hit a hub token path.
     env.allowLocalModels = true;
     const extractor = (await pipeline("feature-extraction", modelName())) as unknown as FeatureExtractor;
+    if (extractor.tokenizer?._tokenizerConfig) {
+      extractor.tokenizer._tokenizerConfig.model_max_length = MODEL_MAX_TOKENS;
+    }
     pipe = extractor;
     available = true;
-  } catch {
+  } catch (err) {
+    if (process.env.VAULT_AXI_DEBUG === "1") {
+      console.error("[vault-axi] embedder init failed:", err instanceof Error ? err.stack : err);
+    }
     available = false;
     pipe = null;
   }

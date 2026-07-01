@@ -1,4 +1,4 @@
-import { joinLines, parseDoc, splitLines } from "./sections.js";
+import { joinLines, splitLines } from "./sections.js";
 
 export interface WikiLink {
   /** Raw target as written, e.g. "plans/foo" or "foo.md" or "Foo#Heading". */
@@ -15,17 +15,17 @@ const WIKILINK_RE = /(!?)\[\[([^\]]+)\]\]/g;
 const FENCE_RE = /^([ \t]{0,3})(`{3,}|~{3,})/;
 const INLINE_CODE_RE = /`[^`]*`/g;
 
-/** Parse all [[wikilinks]] from markdown, ignoring fenced code and inline code spans. */
+/**
+ * Parse all [[wikilinks]] from markdown, ignoring fenced code and inline code
+ * spans. Frontmatter IS scanned, so `related: [[note]]` fields become graph edges.
+ */
 export function parseWikiLinks(raw: string): WikiLink[] {
   const { lines } = splitLines(raw);
-  const doc = parseDoc(raw);
-  const fmEnd = doc.frontmatter ? doc.frontmatter.endLine : -1;
 
   const links: WikiLink[] = [];
   let fence: string | null = null;
 
   for (let i = 0; i < lines.length; i++) {
-    if (i <= fmEnd) continue;
     const line = lines[i] ?? "";
 
     const fm = FENCE_RE.exec(line);

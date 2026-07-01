@@ -16,6 +16,8 @@ export async function homeCommand(_args: string[], ctx: Ctx | undefined): Promis
   const fileCount = (db.prepare("SELECT COUNT(*) n FROM files").get() as { n: number }).n;
   const blockCount = (db.prepare("SELECT COUNT(*) n FROM blocks").get() as { n: number }).n;
   const embedded = (db.prepare("SELECT COUNT(*) n FROM blocks WHERE embedding IS NOT NULL").get() as { n: number }).n;
+  // Blocks under 40 chars are intentionally not embedded, so compare against embeddable ones.
+  const embeddable = (db.prepare("SELECT COUNT(*) n FROM blocks WHERE length(text) >= 40").get() as { n: number }).n;
   const linkCount = (db.prepare("SELECT COUNT(*) n FROM links").get() as { n: number }).n;
   const dangling = (db.prepare("SELECT COUNT(*) n FROM links WHERE target_path IS NULL").get() as { n: number }).n;
 
@@ -41,7 +43,10 @@ export async function homeCommand(_args: string[], ctx: Ctx | undefined): Promis
     blocks: blockCount,
     links: linkCount,
     danglingLinks: dangling,
-    embeddings: embedded === blockCount ? "complete" : `${embedded}/${blockCount} (run \`vault reindex\`)`,
+    embeddings:
+      embedded >= embeddable
+        ? `complete (${embedded} blocks)`
+        : `${embedded}/${embeddable} (run \`vault reindex\`)`,
     lastIndexed: lastReconcile ? new Date(Number(lastReconcile)).toISOString() : "never",
     recent: recentNotes,
     next: [

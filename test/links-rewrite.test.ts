@@ -26,6 +26,12 @@ describe("parseWikiLinks", () => {
     expect(delta.heading).toBe("Section");
     expect(links.find((l) => l.target === "image")!.embed).toBe(true);
   });
+
+  it("captures wikilinks declared in frontmatter (related: [[note]])", () => {
+    const raw = ["---", "status: active", "related:", "  - \"[[parent-note]]\"", "---", "", "# Body", ""].join("\n");
+    const targets = parseWikiLinks(raw).map((l) => l.target);
+    expect(targets).toContain("parent-note");
+  });
 });
 
 describe("rewriteWikiLinks (move/rename)", () => {

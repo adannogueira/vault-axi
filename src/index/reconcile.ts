@@ -154,19 +154,39 @@ export async function reconcile(
       result.embeddingsAvailable = isAvailable();
       if (result.embeddingsAvailable) {
         const updateEmbedding = db.prepare("UPDATE blocks SET embedding = ? WHERE id = ?");
+        const write = (id: number, vec: Float32Array) => updateEmbedding.run(toBlob(vec), id);
         const BATCH = 32;
         for (let i = 0; i < pending.length; i += BATCH) {
           const batch = pending.slice(i, i + BATCH);
-          const vecs = await embed(batch.map((b) => b.text));
-          if (!vecs) break;
-          const writeBatch = db.transaction(() => {
-            batch.forEach((b, idx) => {
-              const vec = vecs[idx];
-              if (vec) updateEmbedding.run(toBlob(vec), b.id);
+          let vecs: Float32Array[] | null = null;
+          try {
+            vecs = await embed(batch.map((b) => b.text));
+          } catch {
+            vecs = null;
+          }
+          if (vecs) {
+            const writeBatch = db.transaction(() => {
+              batch.forEach((b, idx) => {
+                const vec = vecs![idx];
+                if (vec) write(b.id, vec);
+              });
             });
-          });
-          writeBatch();
-          result.embedded += batch.length;
+            writeBatch();
+            result.embedded += batch.length;
+          } else {
+            // A batch failed: retry items individually so one bad block can't sink the rest.
+            for (const b of batch) {
+              try {
+                const one = await embed([b.text]);
+                if (one && one[0]) {
+                  write(b.id, one[0]);
+                  result.embedded += 1;
+                }
+              } catch {
+                /* skip this block; leave its embedding NULL */
+              }
+            }
+          }
         }
       }
     } else {
