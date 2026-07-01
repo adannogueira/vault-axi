@@ -64,7 +64,6 @@ export async function reconcile(
   };
 
   const seen = new Set<string>();
-  const toEmbed: { blockId: number; text: string }[] = [];
 
   const insertFile = db.prepare(
     `INSERT INTO files(path, mtime_ms, size, hash, title, frontmatter, indexed_at)
@@ -104,16 +103,7 @@ export async function reconcile(
     deleteLinks.run(relPath);
 
     for (const block of toBlocks(raw)) {
-      const info = insertBlock.run(
-        relPath,
-        block.headingPath,
-        block.startLine,
-        block.endLine,
-        block.text,
-      );
-      if (withEmbeddings && block.text.length >= 40) {
-        toEmbed.push({ blockId: Number(info.lastInsertRowid), text: block.text });
-      }
+      insertBlock.run(relPath, block.headingPath, block.startLine, block.endLine, block.text);
     }
 
     for (const link of parseWikiLinks(raw)) {
@@ -155,25 +145,32 @@ export async function reconcile(
     }
   }
 
-  if (withEmbeddings && toEmbed.length > 0) {
-    await initEmbedder();
-    result.embeddingsAvailable = isAvailable();
-    if (result.embeddingsAvailable) {
-      const updateEmbedding = db.prepare("UPDATE blocks SET embedding = ? WHERE id = ?");
-      const BATCH = 32;
-      for (let i = 0; i < toEmbed.length; i += BATCH) {
-        const batch = toEmbed.slice(i, i + BATCH);
-        const vecs = await embed(batch.map((b) => b.text));
-        if (!vecs) break;
-        const writeBatch = db.transaction(() => {
-          batch.forEach((b, idx) => {
-            const vec = vecs[idx];
-            if (vec) updateEmbedding.run(toBlob(vec), b.blockId);
+  if (withEmbeddings) {
+    const pending = db
+      .prepare("SELECT id, text FROM blocks WHERE embedding IS NULL AND length(text) >= 40")
+      .all() as { id: number; text: string }[];
+    if (pending.length > 0) {
+      await initEmbedder();
+      result.embeddingsAvailable = isAvailable();
+      if (result.embeddingsAvailable) {
+        const updateEmbedding = db.prepare("UPDATE blocks SET embedding = ? WHERE id = ?");
+        const BATCH = 32;
+        for (let i = 0; i < pending.length; i += BATCH) {
+          const batch = pending.slice(i, i + BATCH);
+          const vecs = await embed(batch.map((b) => b.text));
+          if (!vecs) break;
+          const writeBatch = db.transaction(() => {
+            batch.forEach((b, idx) => {
+              const vec = vecs[idx];
+              if (vec) updateEmbedding.run(toBlob(vec), b.id);
+            });
           });
-        });
-        writeBatch();
-        result.embedded += batch.length;
+          writeBatch();
+          result.embedded += batch.length;
+        }
       }
+    } else {
+      result.embeddingsAvailable = isAvailable();
     }
   } else {
     result.embeddingsAvailable = isAvailable();
