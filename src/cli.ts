@@ -7,6 +7,12 @@ import { writeCommand } from "./commands/write.js";
 import { updateCommand } from "./commands/update.js";
 import { insertCommand } from "./commands/insert.js";
 import { reindexCommand } from "./commands/reindex.js";
+import { searchCommand } from "./commands/search.js";
+import { relatedCommand } from "./commands/related.js";
+import { linksCommand } from "./commands/links.js";
+import { lsCommand } from "./commands/ls.js";
+import { moveCommand } from "./commands/move.js";
+import { deleteCommand } from "./commands/delete.js";
 
 const DESCRIPTION = "Read, edit, and search an Obsidian markdown vault — built for agents.";
 
@@ -20,6 +26,12 @@ Commands:
   write <file>           Create a note; --content "..." | --content - (stdin); --force to overwrite
   update <file>          Surgical edit; --section <h> --mode replace|append|prepend | --frontmatter k=v | --anchor/--replace
   insert <file>          Insert a block; --after-heading <h> | --before-heading <h> | --append | --prepend
+  search <query>         Hybrid FTS5 + semantic search; --mode hybrid|fts|semantic | --limit N | --folder <dir>
+  related <file>         Notes related by [[links]] and meaning
+  links <file>           Outbound links and backlinks
+  ls [dir]               List notes with status/tags; --limit N
+  move <old> <new>       Move/rename a note and rewrite [[wikilinks]] vault-wide
+  delete <file>          Delete a note (warns about incoming backlinks)
   reindex                Refresh the search index; --force | --no-embed
 
 Flags for content: pass --content "text", or --content - / --stdin to read from stdin.
@@ -56,6 +68,29 @@ Examples:
 Example:
   vault insert plans/foo.md --after-heading "Goals" --content "- new goal"
 `,
+  search: `vault search "<query>" [flags]
+  --mode hybrid|fts|semantic   Default hybrid (RRF fusion of keyword + meaning)
+  --limit N                    Max results (default 8)
+  --folder <dir>               Restrict to a folder
+  --full                       Show full block text, not a preview
+Example:
+  vault search "targeted alerts for metrics service"
+`,
+  related: `vault related <file> [--limit N]
+Ranks notes connected by [[links]]/backlinks first, then by semantic similarity.
+`,
+  links: `vault links <file>
+Lists outbound links (with dangling ones flagged) and backlinks.
+`,
+  ls: `vault ls [dir] [--limit N]
+Lists notes with their frontmatter status and tags.
+`,
+  move: `vault move <old> <new> [--force]
+Moves/renames a note and rewrites every [[wikilink]] that pointed at it.
+`,
+  delete: `vault delete <file>
+Deletes a note (idempotent) and warns which notes now have dangling links.
+`,
   reindex: `vault reindex [--force] [--no-embed]
   --force     Reparse every note regardless of mtime
   --no-embed  Skip embeddings (FTS5 + graph only)
@@ -74,6 +109,12 @@ await runAxiCli<Ctx>({
     write: writeCommand,
     update: updateCommand,
     insert: insertCommand,
+    search: searchCommand,
+    related: relatedCommand,
+    links: linksCommand,
+    ls: lsCommand,
+    move: moveCommand,
+    delete: deleteCommand,
     reindex: reindexCommand,
   },
 });

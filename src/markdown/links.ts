@@ -1,4 +1,4 @@
-import { parseDoc, splitLines } from "./sections.js";
+import { joinLines, parseDoc, splitLines } from "./sections.js";
 
 export interface WikiLink {
   /** Raw target as written, e.g. "plans/foo" or "foo.md" or "Foo#Heading". */
@@ -47,6 +47,44 @@ export function parseWikiLinks(raw: string): WikiLink[] {
     }
   }
   return links;
+}
+
+/**
+ * Rewrite the target of wikilinks for which `mapTarget` returns a new target
+ * string (heading/alias/embed markers preserved). Fence-aware; returns the new
+ * text and the number of links rewritten.
+ */
+export function rewriteWikiLinks(
+  raw: string,
+  mapTarget: (link: WikiLink) => string | null,
+): { text: string; count: number } {
+  const { lines, eol, trailingNewline } = splitLines(raw);
+  let fence: string | null = null;
+  let count = 0;
+
+  const out = lines.map((line) => {
+    const fm = FENCE_RE.exec(line);
+    if (fm) {
+      const marker = fm[2]![0]!;
+      if (fence === null) fence = marker;
+      else if (marker === fence) fence = null;
+      return line;
+    }
+    if (fence !== null) return line;
+
+    WIKILINK_RE.lastIndex = 0;
+    return line.replace(WIKILINK_RE, (whole, bang: string, inner: string) => {
+      const link = parseInner(inner, bang === "!");
+      const next = mapTarget(link);
+      if (next === null) return whole;
+      count++;
+      const heading = link.heading ? `#${link.heading}` : "";
+      const alias = link.alias ? `|${link.alias}` : "";
+      return `${bang}[[${next}${heading}${alias}]]`;
+    });
+  });
+
+  return { text: joinLines(out, eol, trailingNewline), count };
 }
 
 function parseInner(inner: string, embed: boolean): WikiLink {
