@@ -13,6 +13,7 @@ import { linksCommand } from "./commands/links.js";
 import { lsCommand } from "./commands/ls.js";
 import { moveCommand } from "./commands/move.js";
 import { deleteCommand } from "./commands/delete.js";
+import { setupCommand } from "./commands/setup.js";
 
 const DESCRIPTION = "Read, edit, and search an Obsidian markdown vault — built for agents.";
 
@@ -33,6 +34,7 @@ Commands:
   move <old> <new>       Move/rename a note and rewrite [[wikilinks]] vault-wide
   delete <file>          Delete a note (warns about incoming backlinks)
   reindex                Refresh the search index; --force | --no-embed
+  setup                  Configure the vault path and install the session hook; --vault <path> | hooks
 
 Flags for content: pass --content "text", or --content - / --stdin to read from stdin.
 `;
@@ -95,6 +97,13 @@ Deletes a note (idempotent) and warns which notes now have dangling links.
   --force     Reparse every note regardless of mtime
   --no-embed  Skip embeddings (FTS5 + graph only)
 `,
+  setup: `vault setup [--vault <path>] [hooks]
+  --vault <path>   Point at your Obsidian vault (saved to ~/.vault-axi/config.json)
+  hooks            Install the Claude Code SessionStart hook so the dashboard loads each session
+Examples:
+  vault setup --vault ~/Documents/obsidian-vault/Vault
+  vault setup hooks
+`,
 };
 
 await runAxiCli<Ctx>({
@@ -116,5 +125,6 @@ await runAxiCli<Ctx>({
     move: moveCommand,
     delete: deleteCommand,
     reindex: reindexCommand,
+    setup: setupCommand,
   },
 });
