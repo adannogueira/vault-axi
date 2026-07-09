@@ -36,7 +36,7 @@ Commands:
   move <old> <new>       Move/rename a note and rewrite [[wikilinks]] vault-wide
   delete <file>          Delete a note (warns about incoming backlinks)
   reindex                Refresh the search index; --force | --no-embed
-  setup                  Configure the vault path and install the session hook; --vault <path> | hooks
+  setup                  Configure the vault path; 'hooks' installs the session dashboard hook + skill
 
 Providing content: for long notes prefer writing the file directly (see \`vault path\`) or
 --from <file>. --content "text" and --content - / --stdin also work for short content.
@@ -115,7 +115,8 @@ Deletes a note (idempotent) and warns which notes now have dangling links.
 `,
   setup: `vault setup [--vault <path>] [hooks]
   --vault <path>   Point at your Obsidian vault (saved to ~/.vault-axi/config.json)
-  hooks            Install the Claude Code SessionStart hook so the dashboard loads each session
+  hooks            Wire vault into agent sessions: install the Claude Code SessionStart
+                   dashboard hook AND the \`vault\` skill (~/.claude/skills/vault)
 Examples:
   vault setup --vault ~/Documents/obsidian-vault/Vault
   vault setup hooks
