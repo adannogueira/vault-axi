@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { AxiError } from "axi-sdk-js";
 
 export interface ParsedArgs {
@@ -72,17 +73,31 @@ export function flagInt(flags: ParsedArgs["flags"], key: string, fallback: numbe
 }
 
 /**
- * Resolve content for write/update commands: from `--content`, or from stdin
- * when `--content -` or `--stdin` is given. Throws a usage error otherwise.
+ * Resolve content for write/update commands. Precedence:
+ *   --from <file>   read the file (best for long notes; --from - means stdin)
+ *   --content "…"   inline text (--content - means stdin)
+ *   --stdin         read stdin
+ * Throws a usage error if none is given.
  */
 export function resolveContent(flags: ParsedArgs["flags"]): string {
+  const from = flagString(flags, "from");
+  if (from !== undefined) {
+    if (from === "-") return readStdin();
+    const path = resolve(from);
+    if (!existsSync(path)) {
+      throw new AxiError(`--from file not found: ${from}`, "VALIDATION_ERROR", [
+        "Pass a path to a file whose contents become the note body",
+      ]);
+    }
+    return readFileSync(path, "utf8");
+  }
   const content = flagString(flags, "content");
   if (content !== undefined && content !== "-") return content;
   if (content === "-" || flagBool(flags, "stdin")) {
     return readStdin();
   }
   throw new AxiError("No content provided", "VALIDATION_ERROR", [
-    "Pass --content \"text\", or --content - / --stdin to read from stdin",
+    'Pass --from <file> (best for long notes), --content "text", or --content - / --stdin',
   ]);
 }
 
