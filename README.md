@@ -29,9 +29,9 @@ Run `vault` for a dashboard, or `vault <command> --help`. See the command refere
 ```bash
 vault read plans/foo.md --section "Open Questions"
 vault update plans/foo.md --section "Design" --mode replace --content "new body"
-vault search "targeted alerts for the metrics service"
+vault search "some text with similarity"
 vault related decisions/some-decision.md
-vault move drafts/idea.md specs/idea.md
+vault move drafts/idea.md plans/idea.md
 ```
 
 ## How it works
