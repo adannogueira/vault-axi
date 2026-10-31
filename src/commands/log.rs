@@ -54,6 +54,7 @@ pub fn log_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
 
     let abs = resolve_in_vault(&root, &note_path)
         .map_err(|e| AxiError::new(e, "VALIDATION_ERROR", vec![]))?;
+    let _ = ctx.pull_before_mutation();
     let abs_path = Path::new(&abs);
 
     let kind_badge = flag_string(&parsed.flags, "kind")
@@ -97,10 +98,12 @@ pub fn log_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
 
     ctx.sync_after_mutation()?;
 
-    Ok(json!({
+    let mut resp = json!({
         "ok": true,
         "file": note_path,
         "section": heading_name,
         "entry": formatted_entry
-    }))
+    });
+    ctx.attach_sync_warnings(&mut resp);
+    Ok(resp)
 }

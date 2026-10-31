@@ -85,6 +85,7 @@ vault setup --remote git:<url> [--branch main] # configure Git sync (or s3://<bu
 vault setup [--auto-sync true|false] [hooks]   # toggle auto-sync or install Claude Code SessionStart hook + skill
 vault register --email <e> [--password '<p>'] [--vault-id <id>] # create an account on Vault Cloud (prompts for password if omitted)
 vault login --email <e> [--password '<p>']    # sign in to Vault Cloud (--mfa-code, --mfa-enroll, --mfa-verify, --token, --vault-id)
+vault token [create|list|revoke <id>] [--name <label>] [--vault-id <id>] # manage headless container API keys (set VAULT_API_KEY=vlt_...)
 vault sync [--pull|--push]                # manual cloud sync (runs automatically on reads/writes when configured)
 vault mcp                                 # start built-in stdio MCP server for Claude Desktop / Cursor
 ```

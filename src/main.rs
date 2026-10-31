@@ -17,7 +17,7 @@ use crate::commands::{
     links::links_command, log::log_command, ls::ls_command, mcp::mcp_command,
     move_cmd::move_command, path::path_command, read::read_command, reindex::reindex_command,
     related::related_command, search::search_command, setup::setup_command,
-    sync_cmd::{login_command, register_command, sync_command},
+    sync_cmd::{login_command, register_command, sync_command, token_command},
     update::update_command, write::write_command,
 };
 use crate::context::Ctx;
@@ -51,6 +51,7 @@ Commands:
   reindex                Refresh the search index; --force | --no-embed
   register               Create an account on Vault Cloud (--email <e> [--password '<p>'])
   login                  Sign in to Vault Cloud (--email <e> [--password '<p>'] [--mfa-code <code>])
+  token                  Manage headless/container API keys (create | list | revoke)
   sync                   Synchronize with cloud backend (Vault Cloud, Git, or S3); --pull | --push
   setup                  Configure vault path, remote backend (git/s3), or 'hooks'
   mcp                    Run built-in Model Context Protocol (MCP) server over stdio"#;
@@ -166,6 +167,13 @@ and automatically configures local sync. Omit --password to be prompted interact
   --mfa-verify <code>   Verify and activate TOTP MFA (elevates session to AAL2)
 Signs in to Vault Cloud and enables automatic background delta sync. Omit --password to be prompted interactively."#,
         ),
+        "token" => Some(
+            r#"vault token [create | list | revoke <id-or-prefix>] [--name <label>] [--vault-id <id>]
+  create [--name <label>]   Generate a long-lived `vlt_...` API key for headless containers / CI / agents
+  list                      List active API keys on your account
+  revoke <id-or-prefix>     Revoke an API key immediately
+In a headless container, set `VAULT_API_KEY=vlt_...` and `vault` will silently authenticate on first use."#,
+        ),
         "sync" => Some(
             r#"vault sync [--pull] [--push]
 Synchronizes notes with the configured cloud backend (Hosted Cloud, Git, or S3/R2)."#,
@@ -259,6 +267,7 @@ fn main() {
         "reindex" => reindex_command(rest, &mut ctx),
         "register" => register_command(rest, &mut ctx),
         "login" => login_command(rest, &mut ctx),
+        "token" => token_command(rest, &mut ctx),
         "sync" => sync_command(rest, &mut ctx),
         "setup" => setup_command(rest, &mut ctx),
         _ => {
@@ -272,7 +281,8 @@ fn main() {
     };
 
     match res {
-        Ok(val) => {
+        Ok(mut val) => {
+            ctx.attach_sync_warnings(&mut val);
             print_toon(&val);
             std::process::exit(0);
         }
@@ -292,7 +302,7 @@ mod tests {
         let cmds = [
             "read", "context", "write", "path", "update", "batch", "insert", "log", "check",
             "search", "related", "links", "ls", "doctor", "move", "delete", "reindex", "register",
-            "login", "sync", "setup", "mcp",
+            "login", "token", "sync", "setup", "mcp",
         ];
         for c in cmds {
             let h = get_command_help(c);

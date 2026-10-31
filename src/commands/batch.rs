@@ -60,6 +60,7 @@ pub fn batch_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
         ));
     };
     let note_path = normalize_note_path(rel);
+    let _ = ctx.pull_before_mutation();
     let abs = resolve_in_vault(&root, &note_path)
         .map_err(|e| AxiError::new(e, "VALIDATION_ERROR", vec![]))?;
     let abs_path = Path::new(&abs);
@@ -187,10 +188,12 @@ pub fn batch_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
         ctx.sync_after_mutation()?;
     }
 
-    Ok(json!({
+    let mut resp = json!({
         "ok": true,
         "changed": changed,
         "file": note_path,
         "operationsApplied": ops.len()
-    }))
+    });
+    ctx.attach_sync_warnings(&mut resp);
+    Ok(resp)
 }

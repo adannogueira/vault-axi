@@ -128,7 +128,7 @@ pub fn dispatch_mcp_tool(name: &str, args: &Value, ctx: &mut Ctx) -> Result<Valu
     let bool_arg = |k: &str| args.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
     let int_arg = |k: &str| args.get(k).and_then(|v| v.as_i64()).map(|n| n.to_string());
 
-    match name {
+    let mut res = match name {
         "vault_home" => home_command(&[], ctx),
         "vault_path" => {
             if let Some(f) = str_arg("file").or_else(|| str_arg("note")) {
@@ -392,7 +392,11 @@ pub fn dispatch_mcp_tool(name: &str, args: &Value, ctx: &mut Ctx) -> Result<Valu
             "UNKNOWN_COMMAND",
             vec![],
         )),
+    };
+    if let Ok(ref mut val) = res {
+        ctx.attach_sync_warnings(val);
     }
+    res
 }
 
 pub fn tool_definitions() -> Value {

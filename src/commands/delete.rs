@@ -19,6 +19,7 @@ pub fn delete_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
         ));
     };
     let note_path = normalize_note_path(rel);
+    let _ = ctx.pull_before_mutation();
     let abs = resolve_in_vault(&root, &note_path)
         .map_err(|e| AxiError::new(e, "VALIDATION_ERROR", vec![]))?;
 
@@ -61,5 +62,7 @@ pub fn delete_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
         );
         out.insert("danglingIn".to_string(), json!(backlinks));
     }
-    Ok(Value::Object(out))
+    let mut val = Value::Object(out);
+    ctx.attach_sync_warnings(&mut val);
+    Ok(val)
 }

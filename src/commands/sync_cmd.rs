@@ -2,7 +2,7 @@ use crate::args::{flag_bool, flag_string, parse_args, ParsedArgs};
 use crate::axi::AxiError;
 use crate::context::Ctx;
 use crate::index::reconcile::{reconcile, ReconcileOpts};
-use crate::sync::{handle_mfa, login_hosted, register_hosted, run_full_sync};
+use crate::sync::{handle_mfa, login_hosted, manage_api_tokens, register_hosted, run_full_sync};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 
@@ -183,7 +183,7 @@ pub fn sync_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
         },
     );
 
-    Ok(json!({
+    let mut out = json!({
         "ok": true,
         "backend": summary.backend,
         "pulled": summary.pulled,
@@ -193,7 +193,10 @@ pub fn sync_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
         "indexed": rec.indexed,
         "updated": rec.updated,
         "message": summary.message
-    }))
+    });
+    ctx.sync_conflicts.extend(summary.conflicts);
+    ctx.attach_sync_warnings(&mut out);
+    Ok(out)
 }
 
 pub fn register_command(args: &[String], _ctx: &mut Ctx) -> Result<Value, AxiError> {
@@ -248,5 +251,47 @@ pub fn login_command(args: &[String], _ctx: &mut Ctx) -> Result<Value, AxiError>
         mfa_code.as_deref(),
         token.as_deref(),
         vault_id.as_deref(),
+    )
+}
+
+pub fn token_command(args: &[String], _ctx: &mut Ctx) -> Result<Value, AxiError> {
+    let parsed = parse_args(args);
+    let subaction = parsed
+        .positionals
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or_else(|| {
+            if flag_bool(&parsed.flags, "create") || flag_string(&parsed.flags, "name").is_some() {
+                "create"
+            } else if flag_string(&parsed.flags, "revoke").is_some() {
+                "revoke"
+            } else {
+                "create"
+            }
+        });
+
+    let name = flag_string(&parsed.flags, "name").or_else(|| {
+        if subaction == "create" {
+            parsed.positionals.get(1).cloned()
+        } else {
+            None
+        }
+    });
+    let vault_id = flag_string(&parsed.flags, "vault-id");
+    let target = flag_string(&parsed.flags, "revoke")
+        .or_else(|| flag_string(&parsed.flags, "id"))
+        .or_else(|| {
+            if subaction == "revoke" {
+                parsed.positionals.get(1).cloned()
+            } else {
+                None
+            }
+        });
+
+    manage_api_tokens(
+        subaction,
+        name.as_deref(),
+        vault_id.as_deref(),
+        target.as_deref(),
     )
 }

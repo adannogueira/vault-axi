@@ -1,6 +1,7 @@
 use crate::axi::AxiError;
 use crate::config::{
-    load_config, save_config, RemoteBackendConfig, HOSTED_SUPABASE_ANON_KEY, HOSTED_SUPABASE_URL,
+    env_api_key, load_config, save_config, RemoteBackendConfig, HOSTED_SUPABASE_ANON_KEY,
+    HOSTED_SUPABASE_URL,
 };
 use crate::vault::{file_stat, list_markdown_files, resolve_in_vault};
 use rusqlite::{params, Connection};
@@ -15,6 +16,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const SYNC_COOLDOWN_MS: i64 = 15_000;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConflictInfo {
+    pub path: String,
+    pub resolution: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict_copy: Option<String>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncSummary {
     pub backend: String,
@@ -23,6 +33,209 @@ pub struct SyncSummary {
     pub deleted_remote: usize,
     pub deleted_local: usize,
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<ConflictInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    Clean(String),
+    AutoMerged(String),
+    Conflict,
+}
+
+#[derive(Debug, Clone)]
+struct DiffHunk<'a> {
+    b_start: usize,
+    b_end: usize,
+    replacement: Vec<&'a str>,
+}
+
+fn compute_lcs_hunks<'a>(base: &[&'a str], target: &[&'a str]) -> Option<Vec<DiffHunk<'a>>> {
+    let b_len = base.len();
+    let t_len = target.len();
+    if b_len.saturating_mul(t_len) > 4_000_000 {
+        return None;
+    }
+    let cols = t_len + 1;
+    let mut dp = vec![0u32; (b_len + 1) * cols];
+    for i in (0..b_len).rev() {
+        for j in (0..t_len).rev() {
+            dp[i * cols + j] = if base[i] == target[j] {
+                dp[(i + 1) * cols + (j + 1)] + 1
+            } else {
+                dp[(i + 1) * cols + j].max(dp[i * cols + (j + 1)])
+            };
+        }
+    }
+
+    let mut matches = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < b_len && j < t_len {
+        if base[i] == target[j] {
+            matches.push((i, j));
+            i += 1;
+            j += 1;
+        } else if dp[(i + 1) * cols + j] >= dp[i * cols + (j + 1)] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    matches.push((b_len, t_len));
+
+    let mut hunks = Vec::new();
+    let mut b_prev = 0;
+    let mut t_prev = 0;
+    for (b_m, t_m) in matches {
+        if b_prev < b_m || t_prev < t_m {
+            hunks.push(DiffHunk {
+                b_start: b_prev,
+                b_end: b_m,
+                replacement: target[t_prev..t_m].to_vec(),
+            });
+        }
+        b_prev = b_m + 1;
+        t_prev = t_m + 1;
+    }
+    Some(hunks)
+}
+
+/// Perform a line-based 3-way merge of `local` and `remote` against `base`.
+/// - Non-overlapping edits to different lines/sections or concurrent pure insertions
+///   (such as `vault log` appends) are automatically merged into `MergeOutcome::AutoMerged`.
+/// - Overlapping incompatible edits to the same base lines return `MergeOutcome::Conflict`.
+pub fn merge_three_way(base: &str, local: &str, remote: &str) -> MergeOutcome {
+    let b_norm = base.replace("\r\n", "\n");
+    let l_norm = local.replace("\r\n", "\n");
+    let r_norm = remote.replace("\r\n", "\n");
+
+    if l_norm == r_norm {
+        return MergeOutcome::Clean(l_norm);
+    }
+    if l_norm == b_norm {
+        return MergeOutcome::Clean(r_norm);
+    }
+    if r_norm == b_norm {
+        return MergeOutcome::Clean(l_norm);
+    }
+    if b_norm.is_empty() {
+        return MergeOutcome::Conflict;
+    }
+
+    let b_lines: Vec<&str> = b_norm.lines().collect();
+    let l_lines: Vec<&str> = l_norm.lines().collect();
+    let r_lines: Vec<&str> = r_norm.lines().collect();
+
+    let Some(l_hunks) = compute_lcs_hunks(&b_lines, &l_lines) else {
+        return MergeOutcome::Conflict;
+    };
+    let Some(r_hunks) = compute_lcs_hunks(&b_lines, &r_lines) else {
+        return MergeOutcome::Conflict;
+    };
+
+    let mut out_lines: Vec<&str> = Vec::with_capacity(l_lines.len().max(r_lines.len()) + 8);
+    let mut b_pos = 0;
+    let mut li = 0;
+    let mut ri = 0;
+
+    while li < l_hunks.len() || ri < r_hunks.len() {
+        let next_b = match (l_hunks.get(li), r_hunks.get(ri)) {
+            (Some(lh), Some(rh)) => lh.b_start.min(rh.b_start),
+            (Some(lh), None) => lh.b_start,
+            (None, Some(rh)) => rh.b_start,
+            (None, None) => b_lines.len(),
+        };
+        if b_pos < next_b {
+            out_lines.extend_from_slice(&b_lines[b_pos..next_b]);
+            b_pos = next_b;
+        }
+
+        match (l_hunks.get(li), r_hunks.get(ri)) {
+            (Some(lh), None) => {
+                out_lines.extend_from_slice(&lh.replacement);
+                b_pos = lh.b_end;
+                li += 1;
+            }
+            (None, Some(rh)) => {
+                out_lines.extend_from_slice(&rh.replacement);
+                b_pos = rh.b_end;
+                ri += 1;
+            }
+            (Some(lh), Some(rh)) => {
+                let both_pure_insert = lh.b_start == lh.b_end
+                    && rh.b_start == rh.b_end
+                    && lh.b_start == rh.b_start;
+                if both_pure_insert {
+                    if lh.replacement == rh.replacement {
+                        out_lines.extend_from_slice(&lh.replacement);
+                    } else {
+                        out_lines.extend_from_slice(&rh.replacement);
+                        out_lines.extend_from_slice(&lh.replacement);
+                    }
+                    li += 1;
+                    ri += 1;
+                } else if lh.b_end < rh.b_start
+                    || (lh.b_end == rh.b_start && !(lh.b_start == lh.b_end && rh.b_start == rh.b_end))
+                {
+                    out_lines.extend_from_slice(&lh.replacement);
+                    b_pos = lh.b_end;
+                    li += 1;
+                } else if rh.b_end < lh.b_start
+                    || (rh.b_end == lh.b_start && !(lh.b_start == lh.b_end && rh.b_start == rh.b_end))
+                {
+                    out_lines.extend_from_slice(&rh.replacement);
+                    b_pos = rh.b_end;
+                    ri += 1;
+                } else if lh.b_start == rh.b_start
+                    && lh.b_end == rh.b_end
+                    && lh.replacement == rh.replacement
+                {
+                    out_lines.extend_from_slice(&lh.replacement);
+                    b_pos = lh.b_end;
+                    li += 1;
+                    ri += 1;
+                } else {
+                    return MergeOutcome::Conflict;
+                }
+            }
+            (None, None) => break,
+        }
+    }
+
+    if b_pos < b_lines.len() {
+        out_lines.extend_from_slice(&b_lines[b_pos..]);
+    }
+
+    let mut merged = out_lines.join("\n");
+    if !merged.is_empty() && (l_norm.ends_with('\n') || r_norm.ends_with('\n')) {
+        merged.push('\n');
+    }
+    MergeOutcome::AutoMerged(merged)
+}
+
+fn make_conflict_copy_rel_path(rel_path: &str, ts_ms: i64) -> String {
+    let ts_sec = (ts_ms / 1000).max(1);
+    if let Some(stripped) = rel_path.strip_suffix(".md") {
+        format!("{stripped}.conflict-{ts_sec}.md")
+    } else {
+        format!("{rel_path}.conflict-{ts_sec}.md")
+    }
+}
+
+fn upsert_sync_state(
+    db: &Connection,
+    path: &str,
+    remote_hash: &str,
+    remote_mtime: i64,
+    synced_at: i64,
+    base_content: &str,
+) {
+    let _ = db.execute(
+        "INSERT INTO sync_state(path, remote_hash, remote_mtime, synced_at, base_content) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(path) DO UPDATE SET remote_hash=excluded.remote_hash, remote_mtime=excluded.remote_mtime, synced_at=excluded.synced_at, base_content=excluded.base_content",
+        params![path, remote_hash, remote_mtime, synced_at, base_content],
+    );
 }
 
 fn now_ms() -> i64 {
@@ -46,9 +259,14 @@ pub fn ensure_sync_table(db: &Connection) {
           path          TEXT PRIMARY KEY,
           remote_hash   TEXT NOT NULL,
           remote_mtime  INTEGER NOT NULL,
-          synced_at     INTEGER NOT NULL
+          synced_at     INTEGER NOT NULL,
+          base_content  TEXT NOT NULL DEFAULT ''
         );
         "#,
+    );
+    let _ = db.execute(
+        "ALTER TABLE sync_state ADD COLUMN base_content TEXT NOT NULL DEFAULT ''",
+        [],
     );
 }
 
@@ -127,6 +345,7 @@ pub fn auto_pull_if_needed(db: &Connection, vault_root: &str, force: bool) -> Op
 }
 
 /// Automatic push after write/update/insert/move/delete/check/log commands.
+/// Runs with `do_pull = true, do_push = true` so remote changes are checked and merged before pushing.
 pub fn auto_push_if_needed(db: &Connection, vault_root: &str) -> Option<SyncSummary> {
     if std::env::var("VAULT_AXI_NO_SYNC").as_deref() == Ok("1") {
         return None;
@@ -155,7 +374,7 @@ pub fn auto_push_if_needed(db: &Connection, vault_root: &str) -> Option<SyncSumm
             refresh_token.as_deref(),
             user_id.as_deref(),
             vault_id.as_deref().unwrap_or("default"),
-            false,
+            true,
             true,
         )
         .ok(),
@@ -169,7 +388,7 @@ pub fn auto_push_if_needed(db: &Connection, vault_root: &str) -> Option<SyncSumm
             endpoint,
             bucket,
             prefix.as_deref().unwrap_or(""),
-            false,
+            true,
             true,
         )
         .ok(),
@@ -326,7 +545,16 @@ fn sync_git(
         deleted_remote: 0,
         deleted_local: 0,
         message: Some(format!("Git sync complete (branch: {br})")),
+        conflicts: Vec::new(),
     })
+}
+
+#[derive(Debug, Clone)]
+struct SyncedEntry {
+    remote_hash: String,
+    #[allow(dead_code)]
+    remote_mtime: i64,
+    base_content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +574,158 @@ struct RemoteNoteFull {
     mtime_ms: i64,
     #[serde(default)]
     deleted: bool,
+}
+
+fn fetch_remote_note(
+    clean_url: &str,
+    anon_key: &str,
+    bearer: &str,
+    vault_id: &str,
+    path: &str,
+) -> Option<RemoteNoteFull> {
+    let fetch_url = format!(
+        "{clean_url}/rest/v1/vault_notes?vault_id=eq.{vault_id}&path=eq.{}&select=path,content,hash,mtime_ms,deleted",
+        urlencoding_simple(path)
+    );
+    let r = ureq::get(&fetch_url)
+        .set("apikey", anon_key)
+        .set("Authorization", &format!("Bearer {bearer}"))
+        .call()
+        .ok()?;
+    let s = r.into_string().ok()?;
+    let mut list: Vec<RemoteNoteFull> = serde_json::from_str(&s).ok()?;
+    list.pop()
+}
+
+/// Resolve a concurrent modification where both local (`local_content`) and remote (`full`)
+/// changed relative to `base_content`.
+#[allow(clippy::too_many_arguments)]
+fn resolve_concurrent_edit(
+    db: &Connection,
+    vault_root: &str,
+    r_path: &str,
+    abs_p: &Path,
+    local_content: &str,
+    full: &RemoteNoteFull,
+    base_content: &str,
+    now: i64,
+    synced_state: &mut HashMap<String, SyncedEntry>,
+    remote_map: &mut HashMap<String, RemoteNoteMeta>,
+    summary: &mut SyncSummary,
+) {
+    if let Some(parent) = abs_p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    match merge_three_way(base_content, local_content, &full.content) {
+        MergeOutcome::Clean(merged) => {
+            let merged_hash = sha1_hex(&merged);
+            let _ = fs::write(abs_p, &merged);
+            if merged_hash == full.hash {
+                upsert_sync_state(db, r_path, &full.hash, full.mtime_ms, now, &full.content);
+                synced_state.insert(
+                    r_path.to_string(),
+                    SyncedEntry {
+                        remote_hash: full.hash.clone(),
+                        remote_mtime: full.mtime_ms,
+                        base_content: full.content.clone(),
+                    },
+                );
+                summary.pulled += 1;
+            } else {
+                // Local was the superset; update expected remote hash to full.hash so do_push uploads cleanly
+                synced_state.insert(
+                    r_path.to_string(),
+                    SyncedEntry {
+                        remote_hash: full.hash.clone(),
+                        remote_mtime: full.mtime_ms,
+                        base_content: full.content.clone(),
+                    },
+                );
+            }
+            remote_map.insert(
+                r_path.to_string(),
+                RemoteNoteMeta {
+                    path: r_path.to_string(),
+                    hash: full.hash.clone(),
+                    mtime_ms: full.mtime_ms,
+                    deleted: false,
+                },
+            );
+        }
+        MergeOutcome::AutoMerged(merged) => {
+            if fs::write(abs_p, &merged).is_ok() {
+                // Set synced_state to the remote version so `do_push` sees `merged` as dirty
+                // relative to `full.hash` and pushes the merged result!
+                upsert_sync_state(db, r_path, &full.hash, full.mtime_ms, now, &full.content);
+                synced_state.insert(
+                    r_path.to_string(),
+                    SyncedEntry {
+                        remote_hash: full.hash.clone(),
+                        remote_mtime: full.mtime_ms,
+                        base_content: full.content.clone(),
+                    },
+                );
+                remote_map.insert(
+                    r_path.to_string(),
+                    RemoteNoteMeta {
+                        path: r_path.to_string(),
+                        hash: full.hash.clone(),
+                        mtime_ms: full.mtime_ms,
+                        deleted: false,
+                    },
+                );
+                summary.pulled += 1;
+                summary.conflicts.push(ConflictInfo {
+                    path: r_path.to_string(),
+                    resolution: "auto_merged".to_string(),
+                    conflict_copy: None,
+                    message: format!(
+                        "Concurrent edit detected on '{r_path}': non-overlapping remote changes were automatically 3-way merged with your local edits."
+                    ),
+                });
+            }
+        }
+        MergeOutcome::Conflict => {
+            let conflict_rel = make_conflict_copy_rel_path(r_path, now);
+            if let Ok(conflict_abs) = resolve_in_vault(vault_root, &conflict_rel) {
+                let conflict_p = Path::new(&conflict_abs);
+                if let Some(parent) = conflict_p.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(conflict_p, local_content);
+            }
+            if fs::write(abs_p, &full.content).is_ok() {
+                upsert_sync_state(db, r_path, &full.hash, full.mtime_ms, now, &full.content);
+                synced_state.insert(
+                    r_path.to_string(),
+                    SyncedEntry {
+                        remote_hash: full.hash.clone(),
+                        remote_mtime: full.mtime_ms,
+                        base_content: full.content.clone(),
+                    },
+                );
+                remote_map.insert(
+                    r_path.to_string(),
+                    RemoteNoteMeta {
+                        path: r_path.to_string(),
+                        hash: full.hash.clone(),
+                        mtime_ms: full.mtime_ms,
+                        deleted: false,
+                    },
+                );
+                summary.pulled += 1;
+                summary.conflicts.push(ConflictInfo {
+                    path: r_path.to_string(),
+                    resolution: "conflict_copy_saved".to_string(),
+                    conflict_copy: Some(conflict_rel.clone()),
+                    message: format!(
+                        "Concurrent edit conflict on '{r_path}': overlapping lines were modified on another device. Remote version is in '{r_path}' and your conflicting version was saved to '{conflict_rel}'."
+                    ),
+                });
+            }
+        }
+    }
 }
 
 fn try_refresh_hosted_token(refresh_token: &str) -> Option<(String, String)> {
@@ -378,6 +758,57 @@ fn try_refresh_hosted_token(refresh_token: &str) -> Option<(String, String)> {
     Some((new_access, new_refresh))
 }
 
+/// Exchange a long-lived `vlt_...` API key for a fresh Supabase JWT session via the `token-exchange` Edge Function.
+fn exchange_api_key(
+    api_key: &str,
+) -> Result<(String, Option<String>, Option<String>, Option<String>, String), String> {
+    let url = format!("{HOSTED_SUPABASE_URL}/functions/v1/token-exchange");
+    let payload = json!({
+        "action": "exchange",
+        "api_key": api_key.trim()
+    });
+    let resp = ureq::post(&url)
+        .set("apikey", HOSTED_SUPABASE_ANON_KEY)
+        .set("Content-Type", "application/json")
+        .send_string(&payload.to_string())
+        .map_err(extract_auth_error)?;
+    let body: Value = serde_json::from_str(&resp.into_string().unwrap_or_default())
+        .unwrap_or_else(|_| json!({}));
+    let Some(access_token) = body
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    else {
+        return Err("token-exchange did not return an access_token".to_string());
+    };
+    let refresh_token = body
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let user_id = body
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let email = body
+        .get("email")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let vault_id = body
+        .get("vault_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+        .to_string();
+
+    save_hosted_session(
+        Some(access_token.clone()),
+        refresh_token.clone(),
+        user_id.clone(),
+        email.clone(),
+        Some(&vault_id),
+    );
+    Ok((access_token, refresh_token, user_id, email, vault_id))
+}
+
 /// Delta sync with Hosted Cloud (`vault_notes` table protected by RLS `auth.uid() = user_id`).
 #[allow(clippy::too_many_arguments)]
 fn sync_hosted_cloud(
@@ -393,25 +824,66 @@ fn sync_hosted_cloud(
     let clean_url = HOSTED_SUPABASE_URL;
     let anon_key = HOSTED_SUPABASE_ANON_KEY;
     let mut bearer = access_token.unwrap_or(anon_key).to_string();
+    let mut effective_user_id: Option<String> = user_id.map(|s| s.to_string());
+    let mut effective_vault_id: String = vault_id.to_string();
+
+    // If `bearer` is a `vlt_...` API key (e.g. from VAULT_API_KEY in a headless container),
+    // silently exchange it for a short-lived JWT session before querying PostgREST.
+    if bearer.starts_with("vlt_") {
+        let (new_access, _, uid, _, vid) = exchange_api_key(&bearer).map_err(|msg| {
+            AxiError::new(
+                format!("VAULT_API_KEY authentication failed: {msg}"),
+                "AUTH_ERROR",
+                vec![
+                    "Verify your VAULT_API_KEY environment variable or create a new key with `vault token create`"
+                        .to_string(),
+                ],
+            )
+        })?;
+        bearer = new_access;
+        if uid.is_some() {
+            effective_user_id = uid;
+        }
+        if effective_vault_id == "default" && vid != "default" {
+            effective_vault_id = vid;
+        }
+    }
 
     let manifest_url = format!(
-        "{clean_url}/rest/v1/vault_notes?vault_id=eq.{vault_id}&select=path,hash,mtime_ms,deleted"
+        "{clean_url}/rest/v1/vault_notes?vault_id=eq.{effective_vault_id}&select=path,hash,mtime_ms,deleted"
     );
     let mut resp = ureq::get(&manifest_url)
         .set("apikey", anon_key)
         .set("Authorization", &format!("Bearer {bearer}"))
         .call();
 
-    // Automatically refresh expired JWT if refresh_token is available
+    // Automatically refresh expired JWT via refresh_token or VAULT_API_KEY if available
     if resp.is_err() {
+        let mut refreshed = false;
         if let Some(rt) = refresh_token {
             if let Some((new_access, _)) = try_refresh_hosted_token(rt) {
                 bearer = new_access;
-                resp = ureq::get(&manifest_url)
-                    .set("apikey", anon_key)
-                    .set("Authorization", &format!("Bearer {bearer}"))
-                    .call();
+                refreshed = true;
             }
+        }
+        if !refreshed {
+            if let Some(env_key) = env_api_key() {
+                if env_key.starts_with("vlt_") {
+                    if let Ok((new_access, _, uid, _, _)) = exchange_api_key(&env_key) {
+                        bearer = new_access;
+                        if uid.is_some() {
+                            effective_user_id = uid;
+                        }
+                        refreshed = true;
+                    }
+                }
+            }
+        }
+        if refreshed {
+            resp = ureq::get(&manifest_url)
+                .set("apikey", anon_key)
+                .set("Authorization", &format!("Bearer {bearer}"))
+                .call();
         }
     }
 
@@ -428,22 +900,27 @@ fn sync_hosted_cloud(
 
     let body_str = resp.into_string().unwrap_or_else(|_| "[]".to_string());
     let remote_manifest: Vec<RemoteNoteMeta> = serde_json::from_str(&body_str).unwrap_or_default();
-    let remote_map: HashMap<String, RemoteNoteMeta> = remote_manifest
+    let mut remote_map: HashMap<String, RemoteNoteMeta> = remote_manifest
         .into_iter()
         .map(|m| (m.path.clone(), m))
         .collect();
 
-    let mut synced_state: HashMap<String, (String, i64)> = HashMap::new();
-    if let Ok(mut stmt) = db.prepare("SELECT path, remote_hash, remote_mtime FROM sync_state") {
+    let mut synced_state: HashMap<String, SyncedEntry> = HashMap::new();
+    if let Ok(mut stmt) =
+        db.prepare("SELECT path, remote_hash, remote_mtime, COALESCE(base_content, '') FROM sync_state")
+    {
         if let Ok(rows) = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
+                SyncedEntry {
+                    remote_hash: r.get::<_, String>(1)?,
+                    remote_mtime: r.get::<_, i64>(2)?,
+                    base_content: r.get::<_, String>(3)?,
+                },
             ))
         }) {
-            for (p, h, m) in rows.flatten() {
-                synced_state.insert(p, (h, m));
+            for (p, entry) in rows.flatten() {
+                synced_state.insert(p, entry);
             }
         }
     }
@@ -454,65 +931,130 @@ fn sync_hosted_cloud(
     };
     let now = now_ms();
 
-    // Pull changed remote files
+    // Pull changed remote files (with 3-way merge / conflict copy when local is also dirty)
     if do_pull {
-        for (r_path, r_meta) in &remote_map {
-            let Ok(abs) = resolve_in_vault(vault_root, r_path) else {
+        let remote_keys: Vec<String> = remote_map.keys().cloned().collect();
+        for r_path in remote_keys {
+            let Some(r_meta) = remote_map.get(&r_path).cloned() else {
+                continue;
+            };
+            let Ok(abs) = resolve_in_vault(vault_root, &r_path) else {
                 continue;
             };
             let abs_p = Path::new(&abs);
-            let local_exists = abs_p.exists();
-            let local_hash = if local_exists {
-                fs::read_to_string(abs_p).ok().map(|s| sha1_hex(&s))
-            } else {
-                None
-            };
+            let local_content = fs::read_to_string(abs_p).ok();
+            let local_hash = local_content.as_ref().map(|s| sha1_hex(s));
+            let synced_entry = synced_state.get(&r_path).cloned();
 
             if r_meta.deleted {
-                if local_exists {
-                    let _ = fs::remove_file(abs_p);
-                    summary.deleted_local += 1;
+                if let Some(ref lh) = local_hash {
+                    let local_modified = match &synced_entry {
+                        Some(st) => lh != &st.remote_hash,
+                        None => true,
+                    };
+                    if local_modified {
+                        // Local user modified a note that was deleted on another device:
+                        // keep the local note, clear sync_state so do_push re-uploads it, and warn.
+                        let _ = db.execute("DELETE FROM sync_state WHERE path = ?1", params![&r_path]);
+                        synced_state.remove(&r_path);
+                        summary.conflicts.push(ConflictInfo {
+                            path: r_path.clone(),
+                            resolution: "kept_local_edit_over_remote_delete".to_string(),
+                            conflict_copy: None,
+                            message: format!(
+                                "Conflict on '{r_path}': note was deleted on another device but modified locally; kept your local version."
+                            ),
+                        });
+                    } else {
+                        let _ = fs::remove_file(abs_p);
+                        summary.deleted_local += 1;
+                        let _ = db.execute("DELETE FROM sync_state WHERE path = ?1", params![&r_path]);
+                        synced_state.remove(&r_path);
+                    }
+                } else {
+                    let _ = db.execute("DELETE FROM sync_state WHERE path = ?1", params![&r_path]);
+                    synced_state.remove(&r_path);
                 }
-                let _ = db.execute("DELETE FROM sync_state WHERE path = ?1", params![r_path]);
                 continue;
             }
 
-            let needs_download = match &local_hash {
+            // If local file already matches remote hash, ensure sync_state is up-to-date
+            if local_hash.as_deref() == Some(r_meta.hash.as_str()) {
+                if synced_entry.as_ref().map(|s| s.remote_hash.as_str()) != Some(r_meta.hash.as_str())
+                {
+                    if let Some(ref lc) = local_content {
+                        upsert_sync_state(db, &r_path, &r_meta.hash, r_meta.mtime_ms, now, lc);
+                        synced_state.insert(
+                            r_path.clone(),
+                            SyncedEntry {
+                                remote_hash: r_meta.hash.clone(),
+                                remote_mtime: r_meta.mtime_ms,
+                                base_content: lc.clone(),
+                            },
+                        );
+                    }
+                }
+                continue;
+            }
+
+            let remote_changed_since_sync = match &synced_entry {
+                Some(st) => st.remote_hash != r_meta.hash,
                 None => true,
-                Some(lh) if lh != &r_meta.hash => match synced_state.get(r_path) {
-                    Some((last_h, _)) => last_h != &r_meta.hash,
-                    None => true,
-                },
-                _ => false,
             };
 
-            if needs_download {
-                let fetch_url = format!(
-                    "{clean_url}/rest/v1/vault_notes?vault_id=eq.{vault_id}&path=eq.{}&select=path,content,hash,mtime_ms,deleted",
-                    urlencoding_simple(r_path)
-                );
-                if let Ok(r) = ureq::get(&fetch_url)
-                    .set("apikey", anon_key)
-                    .set("Authorization", &format!("Bearer {bearer}"))
-                    .call()
-                {
-                    if let Ok(s) = r.into_string() {
-                        if let Ok(mut list) = serde_json::from_str::<Vec<RemoteNoteFull>>(&s) {
-                            if let Some(full) = list.pop() {
-                                if let Some(parent) = abs_p.parent() {
-                                    let _ = fs::create_dir_all(parent);
-                                }
-                                if fs::write(abs_p, &full.content).is_ok() {
-                                    let _ = db.execute(
-                                        "INSERT INTO sync_state(path, remote_hash, remote_mtime, synced_at) VALUES (?1, ?2, ?3, ?4)
-                                         ON CONFLICT(path) DO UPDATE SET remote_hash=excluded.remote_hash, remote_mtime=excluded.remote_mtime, synced_at=excluded.synced_at",
-                                        params![r_path, full.hash, full.mtime_ms, now],
-                                    );
-                                    summary.pulled += 1;
-                                }
-                            }
-                        }
+            if remote_changed_since_sync {
+                let Some(full) = fetch_remote_note(
+                    clean_url,
+                    anon_key,
+                    &bearer,
+                    &effective_vault_id,
+                    &r_path,
+                ) else {
+                    continue;
+                };
+
+                let local_modified_since_sync = match (&local_hash, &synced_entry) {
+                    (None, _) => false,
+                    (Some(lh), Some(st)) => lh != &st.remote_hash,
+                    (Some(_), None) => true,
+                };
+
+                if !local_modified_since_sync {
+                    // Clean fast-forward pull: local file was untouched since last sync
+                    if let Some(parent) = abs_p.parent() {
+                        let _ = fs::create_dir_all(parent);
                     }
+                    if fs::write(abs_p, &full.content).is_ok() {
+                        upsert_sync_state(db, &r_path, &full.hash, full.mtime_ms, now, &full.content);
+                        synced_state.insert(
+                            r_path.clone(),
+                            SyncedEntry {
+                                remote_hash: full.hash.clone(),
+                                remote_mtime: full.mtime_ms,
+                                base_content: full.content.clone(),
+                            },
+                        );
+                        summary.pulled += 1;
+                    }
+                } else if let Some(ref lc) = local_content {
+                    // Both local and remote changed since last sync -> 3-way merge or conflict copy!
+                    let base_str = synced_entry
+                        .as_ref()
+                        .map(|s| s.base_content.as_str())
+                        .unwrap_or("");
+                    resolve_concurrent_edit(
+                        db,
+                        vault_root,
+                        &r_path,
+                        abs_p,
+                        lc,
+                        &full,
+                        base_str,
+                        now,
+                        &mut synced_state,
+                        &mut remote_map,
+                        &mut summary,
+                    );
                 }
             }
         }
@@ -527,22 +1069,153 @@ fn sync_hosted_cloud(
             let Ok(abs) = resolve_in_vault(vault_root, l_path) else {
                 continue;
             };
-            let Ok(content) = fs::read_to_string(&abs) else {
+            let abs_p = Path::new(&abs);
+            let Ok(mut content) = fs::read_to_string(abs_p) else {
                 continue;
             };
-            let l_hash = sha1_hex(&content);
+            let mut l_hash = sha1_hex(&content);
             let l_mtime = file_stat(&abs).map(|s| s.mtime_ms).unwrap_or(now);
 
+            // Safeguard 1: Only push if the file is locally dirty relative to `sync_state`
+            // (or does not exist remotely yet), so an untouched local file never overwrites a newer remote edit.
+            let is_locally_dirty = match synced_state.get(l_path) {
+                None => true,
+                Some(st) => st.remote_hash != l_hash,
+            };
+
+            // If `do_pull` was false (e.g. `vault sync --push`) and both local and remote changed
+            // since `synced_state`, run 3-way merge / conflict resolution before pushing!
+            if is_locally_dirty {
+                if let Some(rm) = remote_map.get(l_path).cloned() {
+                    if !rm.deleted && rm.hash != l_hash {
+                        let base_moved = match synced_state.get(l_path) {
+                            Some(st) => st.remote_hash != rm.hash,
+                            None => true,
+                        };
+                        if base_moved {
+                            if let Some(full) = fetch_remote_note(
+                                clean_url,
+                                anon_key,
+                                &bearer,
+                                &effective_vault_id,
+                                l_path,
+                            ) {
+                                let base_str = synced_state
+                                    .get(l_path)
+                                    .map(|s| s.base_content.clone())
+                                    .unwrap_or_default();
+                                resolve_concurrent_edit(
+                                    db,
+                                    vault_root,
+                                    l_path,
+                                    abs_p,
+                                    &content,
+                                    &full,
+                                    &base_str,
+                                    now,
+                                    &mut synced_state,
+                                    &mut remote_map,
+                                    &mut summary,
+                                );
+                                content = fs::read_to_string(abs_p).unwrap_or(content);
+                                l_hash = sha1_hex(&content);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let is_still_dirty = match synced_state.get(l_path) {
+                None => true,
+                Some(st) => st.remote_hash != l_hash,
+            };
             let needs_upload = match remote_map.get(l_path) {
                 None => true,
-                Some(rm) => rm.deleted || rm.hash != l_hash,
+                Some(rm) => is_still_dirty && (rm.deleted || rm.hash != l_hash),
             };
 
             if needs_upload {
+                // Safeguard 3: When updating an existing active remote note, use an optimistic
+                // conditional PATCH (`hash=eq.<expected_remote_hash>`) first to detect millisecond-level races.
+                let existing_active_hash = remote_map
+                    .get(l_path)
+                    .filter(|rm| !rm.deleted)
+                    .map(|rm| rm.hash.clone());
+
+                if let Some(expected_r_hash) = existing_active_hash {
+                    let patch_url = format!(
+                        "{clean_url}/rest/v1/vault_notes?vault_id=eq.{effective_vault_id}&path=eq.{}&hash=eq.{expected_r_hash}&select=path,hash",
+                        urlencoding_simple(l_path)
+                    );
+                    let patch_payload = json!({
+                        "content": content,
+                        "hash": l_hash,
+                        "mtime_ms": l_mtime,
+                        "deleted": false,
+                        "updated_at": chrono::Utc::now().to_rfc3339()
+                    });
+                    if let Ok(r) = ureq::request("PATCH", &patch_url)
+                        .set("apikey", anon_key)
+                        .set("Authorization", &format!("Bearer {bearer}"))
+                        .set("Content-Type", "application/json")
+                        .set("Prefer", "return=representation")
+                        .send_string(&patch_payload.to_string())
+                    {
+                        if r.status() < 300 {
+                            let body = r.into_string().unwrap_or_else(|_| "[]".to_string());
+                            let updated_rows: Vec<Value> =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            if !updated_rows.is_empty() {
+                                upsert_sync_state(db, l_path, &l_hash, l_mtime, now, &content);
+                                synced_state.insert(
+                                    l_path.clone(),
+                                    SyncedEntry {
+                                        remote_hash: l_hash,
+                                        remote_mtime: l_mtime,
+                                        base_content: content,
+                                    },
+                                );
+                                summary.pushed += 1;
+                                continue;
+                            } else if let Some(full) = fetch_remote_note(
+                                clean_url,
+                                anon_key,
+                                &bearer,
+                                &effective_vault_id,
+                                l_path,
+                            ) {
+                                // Another device updated the row in the milliseconds since manifest fetch!
+                                let base_str = synced_state
+                                    .get(l_path)
+                                    .map(|s| s.base_content.clone())
+                                    .unwrap_or_default();
+                                resolve_concurrent_edit(
+                                    db,
+                                    vault_root,
+                                    l_path,
+                                    abs_p,
+                                    &content,
+                                    &full,
+                                    &base_str,
+                                    now,
+                                    &mut synced_state,
+                                    &mut remote_map,
+                                    &mut summary,
+                                );
+                                content = fs::read_to_string(abs_p).unwrap_or(content);
+                                l_hash = sha1_hex(&content);
+                                if l_hash == full.hash {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let upsert_url =
                     format!("{clean_url}/rest/v1/vault_notes?on_conflict=user_id,vault_id,path");
                 let mut payload = json!({
-                    "vault_id": vault_id,
+                    "vault_id": effective_vault_id,
                     "path": l_path,
                     "content": content,
                     "hash": l_hash,
@@ -550,7 +1223,7 @@ fn sync_hosted_cloud(
                     "deleted": false,
                     "updated_at": chrono::Utc::now().to_rfc3339()
                 });
-                if let Some(uid) = user_id {
+                if let Some(ref uid) = effective_user_id {
                     payload["user_id"] = json!(uid);
                 }
                 if let Ok(r) = ureq::post(&upsert_url)
@@ -561,10 +1234,14 @@ fn sync_hosted_cloud(
                     .send_string(&payload.to_string())
                 {
                     if r.status() < 300 {
-                        let _ = db.execute(
-                            "INSERT INTO sync_state(path, remote_hash, remote_mtime, synced_at) VALUES (?1, ?2, ?3, ?4)
-                             ON CONFLICT(path) DO UPDATE SET remote_hash=excluded.remote_hash, remote_mtime=excluded.remote_mtime, synced_at=excluded.synced_at",
-                            params![l_path, l_hash, l_mtime, now],
+                        upsert_sync_state(db, l_path, &l_hash, l_mtime, now, &content);
+                        synced_state.insert(
+                            l_path.clone(),
+                            SyncedEntry {
+                                remote_hash: l_hash,
+                                remote_mtime: l_mtime,
+                                base_content: content,
+                            },
                         );
                         summary.pushed += 1;
                     }
@@ -572,12 +1249,58 @@ fn sync_hosted_cloud(
             }
         }
 
-        for (synced_path, _) in &synced_state {
-            if !local_set.contains(synced_path) {
+        let synced_keys: Vec<(String, String)> = synced_state
+            .iter()
+            .map(|(k, v)| (k.clone(), v.remote_hash.clone()))
+            .collect();
+        for (synced_path, last_remote_hash) in synced_keys {
+            if !local_set.contains(&synced_path) {
+                // If another device modified this note remotely since we last synced it,
+                // restore the newer remote edit instead of deleting it!
+                if let Some(rm) = remote_map.get(&synced_path) {
+                    if !rm.deleted && rm.hash != last_remote_hash {
+                        if let Some(full) = fetch_remote_note(
+                            clean_url,
+                            anon_key,
+                            &bearer,
+                            &effective_vault_id,
+                            &synced_path,
+                        ) {
+                            if let Ok(abs) = resolve_in_vault(vault_root, &synced_path) {
+                                let abs_p = Path::new(&abs);
+                                if let Some(parent) = abs_p.parent() {
+                                    let _ = fs::create_dir_all(parent);
+                                }
+                                if fs::write(abs_p, &full.content).is_ok() {
+                                    upsert_sync_state(
+                                        db,
+                                        &synced_path,
+                                        &full.hash,
+                                        full.mtime_ms,
+                                        now,
+                                        &full.content,
+                                    );
+                                    summary.pulled += 1;
+                                    summary.conflicts.push(ConflictInfo {
+                                        path: synced_path.clone(),
+                                        resolution: "restored_remote_edit_over_local_delete"
+                                            .to_string(),
+                                        conflict_copy: None,
+                                        message: format!(
+                                            "Conflict on '{synced_path}': note was deleted locally but modified on another device; restored the newer remote version."
+                                        ),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let upsert_url =
                     format!("{clean_url}/rest/v1/vault_notes?on_conflict=user_id,vault_id,path");
                 let mut payload = json!({
-                    "vault_id": vault_id,
+                    "vault_id": effective_vault_id,
                     "path": synced_path,
                     "content": "",
                     "hash": "",
@@ -585,7 +1308,7 @@ fn sync_hosted_cloud(
                     "deleted": true,
                     "updated_at": chrono::Utc::now().to_rfc3339()
                 });
-                if let Some(uid) = user_id {
+                if let Some(ref uid) = effective_user_id {
                     payload["user_id"] = json!(uid);
                 }
                 let _ = ureq::post(&upsert_url)
@@ -595,16 +1318,25 @@ fn sync_hosted_cloud(
                     .set("Prefer", "resolution=merge-duplicates")
                     .send_string(&payload.to_string());
                 let _ =
-                    db.execute("DELETE FROM sync_state WHERE path = ?1", params![synced_path]);
+                    db.execute("DELETE FROM sync_state WHERE path = ?1", params![&synced_path]);
                 summary.deleted_remote += 1;
             }
         }
     }
 
-    summary.message = Some(format!(
-        "Vault Cloud sync complete (pulled {}, pushed {})",
-        summary.pulled, summary.pushed
-    ));
+    summary.message = Some(if summary.conflicts.is_empty() {
+        format!(
+            "Vault Cloud sync complete (pulled {}, pushed {})",
+            summary.pulled, summary.pushed
+        )
+    } else {
+        format!(
+            "Vault Cloud sync complete (pulled {}, pushed {}, {} conflict(s) handled)",
+            summary.pulled,
+            summary.pushed,
+            summary.conflicts.len()
+        )
+    });
     Ok(summary)
 }
 
@@ -1116,9 +1848,35 @@ pub fn login_hosted(
     let clean_url = HOSTED_SUPABASE_URL;
     let anon_key = HOSTED_SUPABASE_ANON_KEY;
 
-    let mut final_token = token.map(|s| s.to_string());
+    let mut final_token = token.map(|s| s.to_string()).or_else(env_api_key);
     let mut final_refresh: Option<String> = None;
     let mut final_user_id: Option<String> = None;
+    let mut final_email: Option<String> = email.map(|s| s.to_string());
+    let mut final_vault_id: String = vault_id.unwrap_or("default").to_string();
+
+    if let Some(ref tok) = final_token.clone() {
+        if tok.starts_with("vlt_") {
+            let (new_access, refr, uid, em, vid) = exchange_api_key(tok).map_err(|msg| {
+                AxiError::new(
+                    format!("API key login failed: {msg}"),
+                    "AUTH_ERROR",
+                    vec![
+                        "Verify your vlt_... API key or generate a new one with `vault token create`"
+                            .to_string(),
+                    ],
+                )
+            })?;
+            final_token = Some(new_access);
+            final_refresh = refr;
+            final_user_id = uid;
+            if em.is_some() {
+                final_email = em;
+            }
+            if vault_id.is_none() {
+                final_vault_id = vid;
+            }
+        }
+    }
 
     if final_token.is_none() {
         let (Some(em), Some(pw)) = (email, password) else {
@@ -1127,6 +1885,8 @@ pub fn login_hosted(
                 "VALIDATION_ERROR",
                 vec![
                     "Usage: vault login --email <email> [--mfa-code <6-digit-totp>]".to_string(),
+                    "Headless container? Set VAULT_API_KEY=vlt_... (created via `vault token create`)"
+                        .to_string(),
                     "New user? Run `vault register --email <email>`".to_string(),
                 ],
             ));
@@ -1179,20 +1939,141 @@ pub fn login_hosted(
         final_token,
         final_refresh,
         final_user_id.clone(),
-        email.map(|s| s.to_string()),
-        vault_id,
+        final_email.clone(),
+        Some(&final_vault_id),
     );
 
     Ok(json!({
         "ok": true,
         "backend": "vault-cloud",
-        "email": email,
+        "email": final_email,
         "userId": final_user_id,
-        "vaultId": vault_id.unwrap_or("default"),
+        "vaultId": final_vault_id,
         "localVaultCache": local_cache,
         "autoSync": true,
-        "next": ["vault sync", "vault ls"]
+        "next": ["vault sync", "vault ls", "vault token create --name agent"]
     }))
+}
+
+/// Create, list, or revoke long-lived `vlt_...` API keys for headless containers and agents.
+pub fn manage_api_tokens(
+    subaction: &str,
+    name: Option<&str>,
+    vault_id: Option<&str>,
+    target: Option<&str>,
+) -> Result<Value, AxiError> {
+    let cfg = load_config();
+    let (mut bearer, refresh_tok, cfg_vault_id) = match cfg.remote {
+        Some(RemoteBackendConfig::Cloud {
+            access_token: Some(tok),
+            refresh_token,
+            vault_id: vid,
+            ..
+        }) => (tok, refresh_token, vid),
+        _ => {
+            return Err(AxiError::new(
+                "Not logged into Vault Cloud",
+                "AUTH_ERROR",
+                vec!["Run `vault login --email <email>` first".to_string()],
+            ));
+        }
+    };
+
+    if bearer.starts_with("vlt_") {
+        if let Ok((new_access, _, _, _, _)) = exchange_api_key(&bearer) {
+            bearer = new_access;
+        }
+    }
+
+    let url = format!("{HOSTED_SUPABASE_URL}/functions/v1/token-exchange");
+    let effective_vault_id = vault_id
+        .map(|s| s.to_string())
+        .or(cfg_vault_id)
+        .unwrap_or_else(|| "default".to_string());
+
+    let payload = match subaction {
+        "create" => json!({
+            "action": "create",
+            "name": name.unwrap_or("agent"),
+            "vault_id": effective_vault_id,
+        }),
+        "list" => json!({ "action": "list" }),
+        "revoke" => {
+            let Some(t) = target.filter(|s| !s.trim().is_empty()) else {
+                return Err(AxiError::new(
+                    "Missing API key id or prefix to revoke",
+                    "VALIDATION_ERROR",
+                    vec![
+                        "Usage: vault token revoke <id-or-prefix>".to_string(),
+                        "Run `vault token list` to see active keys".to_string(),
+                    ],
+                ));
+            };
+            json!({
+                "action": "revoke",
+                "target": t,
+            })
+        }
+        other => {
+            return Err(AxiError::new(
+                format!("Unknown token subcommand: {other} (use 'create', 'list', or 'revoke')"),
+                "VALIDATION_ERROR",
+                vec![
+                    "vault token create [--name <label>] [--vault-id <id>]".to_string(),
+                    "vault token list".to_string(),
+                    "vault token revoke <id-or-prefix>".to_string(),
+                ],
+            ));
+        }
+    };
+
+    let mut resp = ureq::post(&url)
+        .set("apikey", HOSTED_SUPABASE_ANON_KEY)
+        .set("Authorization", &format!("Bearer {bearer}"))
+        .set("Content-Type", "application/json")
+        .send_string(&payload.to_string());
+
+    if resp.is_err() {
+        if let Some(rt) = refresh_tok.as_deref() {
+            if let Some((new_access, _)) = try_refresh_hosted_token(rt) {
+                bearer = new_access;
+                resp = ureq::post(&url)
+                    .set("apikey", HOSTED_SUPABASE_ANON_KEY)
+                    .set("Authorization", &format!("Bearer {bearer}"))
+                    .set("Content-Type", "application/json")
+                    .send_string(&payload.to_string());
+            }
+        }
+    }
+
+    let r = resp.map_err(|e| {
+        let msg = extract_auth_error(e);
+        AxiError::new(
+            format!("Token operation failed: {msg}"),
+            "AUTH_ERROR",
+            vec!["Run `vault login --email <email>` to refresh your session".to_string()],
+        )
+    })?;
+
+    let body: Value = serde_json::from_str(&r.into_string().unwrap_or_default())
+        .unwrap_or_else(|_| json!({}));
+
+    if subaction == "create" {
+        let api_key = body.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
+        return Ok(json!({
+            "ok": true,
+            "action": "token_created",
+            "id": body.get("id"),
+            "name": body.get("name"),
+            "vaultId": body.get("vault_id"),
+            "keyPrefix": body.get("key_prefix"),
+            "apiKey": api_key,
+            "usage": format!("export VAULT_API_KEY=\"{api_key}\""),
+            "note": "Save this key now; it will not be shown again. Any container with VAULT_API_KEY set will silently authenticate on first command."
+        }));
+    }
+
+    Ok(body)
 }
 
 fn save_hosted_session(
@@ -1449,5 +2330,101 @@ mod tests {
         );
         let json_resp = client_thread2.join().unwrap();
         assert!(json_resp.contains(r#"{"ok":true}"#));
+    }
+
+    #[test]
+    fn three_way_merge_and_conflict_copy_resolution() {
+        let base = "# Plan\n\n## Objective\nInitial objective\n\n## Build Log\n- `2026-10-31 10:00` — Started\n";
+        let local_sec_edit = "# Plan\n\n## Objective\nUpdated objective on Machine B\n\n## Build Log\n- `2026-10-31 10:00` — Started\n";
+        let remote_log_edit = "# Plan\n\n## Objective\nInitial objective\n\n## Build Log\n- `2026-10-31 10:00` — Started\n- `2026-10-31 10:02` — Machine A step\n";
+
+        // 1. Non-overlapping edits to different sections auto-merge cleanly
+        match merge_three_way(base, local_sec_edit, remote_log_edit) {
+            MergeOutcome::AutoMerged(merged) => {
+                assert!(merged.contains("Updated objective on Machine B"));
+                assert!(merged.contains("Machine A step"));
+            }
+            other => panic!("Expected AutoMerged, got {other:?}"),
+        }
+
+        // 2. Concurrent pure appends at EOF (e.g. two `vault log` entries) auto-merge in order
+        let local_log_edit = "# Plan\n\n## Objective\nInitial objective\n\n## Build Log\n- `2026-10-31 10:00` — Started\n- `2026-10-31 10:03` — Machine B step\n";
+        match merge_three_way(base, local_log_edit, remote_log_edit) {
+            MergeOutcome::AutoMerged(merged) => {
+                assert!(merged.contains("Machine A step\n- `2026-10-31 10:03` — Machine B step"));
+            }
+            other => panic!("Expected AutoMerged for concurrent log appends, got {other:?}"),
+        }
+
+        // 3. Conflicting edits to the exact same line produce MergeOutcome::Conflict
+        let remote_conflicting_sec = "# Plan\n\n## Objective\nConflicting objective on Machine A\n\n## Build Log\n- `2026-10-31 10:00` — Started\n";
+        assert_eq!(
+            merge_three_way(base, local_sec_edit, remote_conflicting_sec),
+            MergeOutcome::Conflict
+        );
+
+        // 4. resolve_concurrent_edit saves a conflict copy and records a warning for the last writer
+        let tmp = std::env::temp_dir().join(format!(
+            "vault_axi_sync_conflict_test_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let root = tmp.to_string_lossy().to_string();
+        let db = open_db_at(":memory:").unwrap();
+        ensure_sync_table(&db);
+
+        let note_rel = "plans/roadmap.md";
+        let note_abs = tmp.join("plans").join("roadmap.md");
+        fs::create_dir_all(note_abs.parent().unwrap()).unwrap();
+        fs::write(&note_abs, local_sec_edit).unwrap();
+
+        let full_remote = RemoteNoteFull {
+            path: note_rel.to_string(),
+            content: remote_conflicting_sec.to_string(),
+            hash: sha1_hex(remote_conflicting_sec),
+            mtime_ms: 1700005000000,
+            deleted: false,
+        };
+        let mut synced_state = HashMap::new();
+        let mut remote_map = HashMap::new();
+        let mut summary = SyncSummary::default();
+
+        resolve_concurrent_edit(
+            &db,
+            &root,
+            note_rel,
+            &note_abs,
+            local_sec_edit,
+            &full_remote,
+            base,
+            1700005000000,
+            &mut synced_state,
+            &mut remote_map,
+            &mut summary,
+        );
+
+        assert_eq!(summary.conflicts.len(), 1);
+        assert_eq!(summary.conflicts[0].resolution, "conflict_copy_saved");
+        let conflict_copy_rel = summary.conflicts[0].conflict_copy.as_ref().unwrap();
+        assert_eq!(conflict_copy_rel, "plans/roadmap.conflict-1700005000.md");
+
+        let conflict_copy_abs = tmp.join(conflict_copy_rel);
+        assert!(conflict_copy_abs.exists());
+        assert_eq!(fs::read_to_string(&conflict_copy_abs).unwrap(), local_sec_edit);
+        assert_eq!(fs::read_to_string(&note_abs).unwrap(), remote_conflicting_sec);
+
+        // Verify Ctx::attach_sync_warnings surfaces the warning and conflict list to the last writer
+        let mut ctx = crate::context::Ctx::with_vault_and_db(&root, db);
+        ctx.sync_conflicts.extend(summary.conflicts);
+        let mut cmd_out = json!({ "ok": true, "changed": true, "file": note_rel });
+        ctx.attach_sync_warnings(&mut cmd_out);
+        assert!(cmd_out["warning"]
+            .as_str()
+            .unwrap()
+            .contains("Concurrent edit conflict on 'plans/roadmap.md'"));
+        assert_eq!(cmd_out["conflicts"].as_array().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

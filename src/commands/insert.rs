@@ -16,6 +16,7 @@ pub fn insert_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
         return Err(usage("Missing file path"));
     };
     let note_path = normalize_note_path(rel);
+    let _ = ctx.pull_before_mutation();
     let abs = resolve_in_vault(&root, &note_path)
         .map_err(|e| AxiError::new(e, "VALIDATION_ERROR", vec![]))?;
     let abs_path = Path::new(&abs);
@@ -78,12 +79,14 @@ pub fn insert_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
     fs::write(abs_path, &out)
         .map_err(|e| AxiError::new(format!("Write error: {e}"), "INTERNAL_ERROR", vec![]))?;
     ctx.sync_after_mutation()?;
-    Ok(json!({
+    let mut resp = json!({
         "ok": true,
         "changed": true,
         "file": note_path,
         "inserted": where_str
-    }))
+    });
+    ctx.attach_sync_warnings(&mut resp);
+    Ok(resp)
 }
 
 fn usage(message: &str) -> AxiError {

@@ -28,6 +28,13 @@ pub fn check_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
         ));
     };
     let note_path = normalize_note_path(rel);
+    let query = parsed.positionals.get(1..).map(|s| s.join(" ")).unwrap_or_default();
+    let list_only = flag_bool(&parsed.flags, "list") || query.trim().is_empty();
+    if list_only {
+        let _ = ctx.pull_if_due();
+    } else {
+        let _ = ctx.pull_before_mutation();
+    }
     let abs = resolve_in_vault(&root, &note_path)
         .map_err(|e| AxiError::new(e, "VALIDATION_ERROR", vec![]))?;
     let abs_path = Path::new(&abs);
@@ -42,9 +49,6 @@ pub fn check_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
     let raw = fs::read_to_string(abs_path)
         .map_err(|e| AxiError::new(format!("Read error: {e}"), "INTERNAL_ERROR", vec![]))?;
     let (mut lines, eol, trailing_newline) = split_lines(&raw);
-
-    let query = parsed.positionals.get(1..).map(|s| s.join(" ")).unwrap_or_default();
-    let list_only = flag_bool(&parsed.flags, "list") || query.trim().is_empty();
 
     if list_only {
         let mut tasks = Vec::new();
@@ -120,11 +124,13 @@ pub fn check_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
         ctx.sync_after_mutation()?;
     }
 
-    Ok(json!({
+    let mut resp = json!({
         "ok": true,
         "changed": changed,
         "file": note_path,
         "checked": !uncheck,
         "items": toggled
-    }))
+    });
+    ctx.attach_sync_warnings(&mut resp);
+    Ok(resp)
 }

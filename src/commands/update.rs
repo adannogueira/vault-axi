@@ -20,6 +20,7 @@ pub fn update_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
         return Err(usage("Missing file path"));
     };
     let note_path = normalize_note_path(rel);
+    let _ = ctx.pull_before_mutation();
     let abs = resolve_in_vault(&root, &note_path)
         .map_err(|e| AxiError::new(e, "VALIDATION_ERROR", vec![]))?;
     let abs_path = Path::new(&abs);
@@ -118,7 +119,9 @@ pub fn update_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
     for (k, v) in summary {
         resp.insert(k, v);
     }
-    Ok(Value::Object(resp))
+    let mut val = Value::Object(resp);
+    ctx.attach_sync_warnings(&mut val);
+    Ok(val)
 }
 
 fn collect_frontmatter(flags: &HashMap<String, FlagValue>) -> Vec<(String, Option<String>)> {

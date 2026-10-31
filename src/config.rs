@@ -77,15 +77,57 @@ pub fn ensure_config_dir() {
     }
 }
 
+/// Read a headless container / agent API key (`vlt_...` or JWT) from the environment.
+pub fn env_api_key() -> Option<String> {
+    if std::env::var("VAULT_AXI_NO_SYNC").as_deref() == Ok("1") {
+        return None;
+    }
+    for var in ["VAULT_API_KEY", "VAULT_AXI_API_KEY", "VAULT_AXI_TOKEN"] {
+        if let Ok(val) = std::env::var(var) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 pub fn load_config() -> VaultConfig {
     let p = config_path();
-    if !p.exists() {
-        return VaultConfig::default();
+    let mut cfg: VaultConfig = if p.exists() {
+        fs::read_to_string(&p)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    } else {
+        VaultConfig::default()
+    };
+
+    if cfg.remote.is_none() {
+        if let Some(key) = env_api_key() {
+            if cfg.vault_path.is_none() {
+                let default_vault = config_dir().join("cloud-vault");
+                let _ = fs::create_dir_all(&default_vault);
+                cfg.vault_path = Some(default_vault.to_string_lossy().to_string());
+            }
+            let vid = std::env::var("VAULT_AXI_VAULT_ID")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "default".to_string());
+            cfg.auto_sync = Some(cfg.auto_sync.unwrap_or(true));
+            cfg.remote = Some(RemoteBackendConfig::Cloud {
+                access_token: Some(key),
+                refresh_token: None,
+                user_id: None,
+                email: None,
+                vault_id: Some(vid),
+            });
+        }
     }
-    fs::read_to_string(&p)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+
+    cfg
 }
 
 pub fn save_config(config: &VaultConfig) {

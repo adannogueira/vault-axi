@@ -22,6 +22,7 @@ pub fn write_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
         ));
     };
     let note_path = normalize_note_path(rel);
+    let _ = ctx.pull_before_mutation();
     let abs = resolve_in_vault(&root, &note_path)
         .map_err(|e| AxiError::new(e, "VALIDATION_ERROR", vec![]))?;
     let abs_path = Path::new(&abs);
@@ -84,13 +85,15 @@ pub fn write_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
         .map_err(|e| AxiError::new(format!("Write error: {e}"), "INTERNAL_ERROR", vec![]))?;
     ctx.sync_after_mutation()?;
 
-    Ok(json!({
+    let mut out = json!({
         "ok": true,
         "action": if existed { "overwritten" } else { "created" },
         "file": note_path,
         "chars": content.chars().count(),
         "next": [format!("vault read {note_path} --outline"), format!("vault links {note_path}")]
-    }))
+    });
+    ctx.attach_sync_warnings(&mut out);
+    Ok(out)
 }
 
 fn collect_frontmatter(flags: &HashMap<String, FlagValue>) -> Vec<(String, Option<String>)> {

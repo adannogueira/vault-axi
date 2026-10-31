@@ -34,13 +34,19 @@ cargo install --path .
 ## Quick Start
 
 ### Option 1: Hosted Cloud Vault (Zero Manual Setup)
-For users who want instant cloud sync across devices or Claude Desktop without setting up Git, AWS S3, or their own database:
+For users who want instant cloud sync across devices, headless agent containers, or Claude Desktop without setting up Git, AWS S3, or their own database:
 ```bash
 vault register --email you@example.com
 # Prompts for password interactively (safe for '!', '$', etc.), or pass --password 'your!pass' in single quotes
 # To sign in on another machine (supports TOTP MFA via --mfa-code, --mfa-enroll, --mfa-verify):
 vault login --email you@example.com [--mfa-code <code>]
 vault setup hooks        # optional: install Claude Code SessionStart hook + skill
+
+# For headless containers / CI / remote agent sandboxes (zero interactive login):
+vault token create --name "agent-container"   # prints vlt_... API key
+# Inside the container, simply set:
+#   export VAULT_API_KEY="vlt_..."
+# `vault` will silently authenticate and bootstrap ~/.vault-axi/cloud-vault on the first command!
 ```
 
 ### Option 2: Local Obsidian Vault (+ Optional Git or S3 Sync)

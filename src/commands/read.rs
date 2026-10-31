@@ -20,6 +20,7 @@ fn lines_re() -> &'static Regex {
 
 pub fn read_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
     let root = ctx.require_vault()?;
+    let _ = ctx.pull_if_due();
     let parsed = parse_args(args);
     let Some(rel) = parsed.positionals.first() else {
         return Err(AxiError::new(

@@ -34,6 +34,7 @@ pub fn move_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
     };
     let old_path = normalize_note_path(old_raw);
     let new_path = normalize_note_path(new_raw);
+    let _ = ctx.pull_before_mutation();
     let old_abs = resolve_in_vault(&root, &old_path)
         .map_err(|e| AxiError::new(e, "VALIDATION_ERROR", vec![]))?;
     let new_abs = resolve_in_vault(&root, &new_path)
@@ -135,7 +136,7 @@ pub fn move_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
         json!(touched)
     };
 
-    Ok(json!({
+    let mut resp = json!({
         "ok": true,
         "changed": true,
         "from": old_path,
@@ -143,5 +144,7 @@ pub fn move_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
         "referrers": referrers.len(),
         "linksRewritten": rewritten_links,
         "filesTouched": files_touched
-    }))
+    });
+    ctx.attach_sync_warnings(&mut resp);
+    Ok(resp)
 }
