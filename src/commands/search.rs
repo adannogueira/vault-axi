@@ -1,8 +1,10 @@
 use crate::args::{flag_bool, flag_int, flag_string, parse_args};
 use crate::axi::AxiError;
+use crate::commands::ls::{matches_metadata_filter, parse_since_ms};
 use crate::context::Ctx;
 use crate::index::query::{block_by_id, breadcrumb, fts_search, rrf_fuse, semantic_search};
 use crate::index::reconcile::ReconcileOpts;
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
@@ -17,7 +19,7 @@ pub fn search_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
             "Missing search query",
             "VALIDATION_ERROR",
             vec![
-                "Usage: vault search \"<query>\" [--mode hybrid|fts|semantic] [--limit N] [--folder <dir>]"
+                "Usage: vault search \"<query>\" [--mode hybrid|fts|semantic] [--limit N] [--folder <dir>] [--status <s>] [--tag <t>] [--since 7d]"
                     .to_string(),
             ],
         ));
@@ -25,6 +27,9 @@ pub fn search_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
     let mode = flag_string(&parsed.flags, "mode").unwrap_or_else(|| "hybrid".to_string());
     let limit = flag_int(&parsed.flags, "limit", 8).max(1) as usize;
     let folder = flag_string(&parsed.flags, "folder");
+    let status_filter = flag_string(&parsed.flags, "status");
+    let tag_filter = flag_string(&parsed.flags, "tag");
+    let since_ms = flag_string(&parsed.flags, "since").and_then(|s| parse_since_ms(&s));
     let full = flag_bool(&parsed.flags, "full");
 
     ctx.sync(ReconcileOpts {
@@ -33,7 +38,7 @@ pub fn search_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
     })?;
     let db = ctx.db()?;
 
-    let pool = (limit * 3).max(24);
+    let pool = (limit * 4).max(32);
     let fts = fts_search(db, &query, pool);
     let vec_hits = if mode == "fts" {
         None
@@ -71,6 +76,9 @@ pub fn search_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
         }
     }
 
+    let has_meta_filter =
+        status_filter.is_some() || tag_filter.is_some() || since_ms.is_some();
+
     let mut results: Vec<Value> = Vec::new();
     for id in ordered_ids {
         if results.len() >= limit {
@@ -83,6 +91,29 @@ pub fn search_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
             let clean_f = f.trim_end_matches('/');
             let prefix = format!("{clean_f}/");
             if !block.path.starts_with(&prefix) && block.path != *f {
+                continue;
+            }
+        }
+        if has_meta_filter {
+            let meta: Option<(Option<String>, i64)> = db
+                .query_row(
+                    "SELECT frontmatter, mtime_ms FROM files WHERE path = ?1",
+                    params![block.path],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            let Some((fm_str, mtime)) = meta else {
+                continue;
+            };
+            if !matches_metadata_filter(
+                fm_str.as_deref(),
+                mtime,
+                status_filter.as_deref(),
+                tag_filter.as_deref(),
+                since_ms,
+            ) {
                 continue;
             }
         }

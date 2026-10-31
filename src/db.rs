@@ -47,6 +47,12 @@ fn migrate(db: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_blocks_path ON blocks(path);
 
+        CREATE TABLE IF NOT EXISTS embedding_cache (
+          text_hash     TEXT PRIMARY KEY,
+          embedding     BLOB NOT NULL,
+          updated_at    INTEGER NOT NULL
+        );
+
         CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts USING fts5(
           text,
           heading_path,
@@ -77,6 +83,13 @@ fn migrate(db: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS meta (
           key           TEXT PRIMARY KEY,
           value         TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_state (
+          path          TEXT PRIMARY KEY,
+          remote_hash   TEXT NOT NULL,
+          remote_mtime  INTEGER NOT NULL,
+          synced_at     INTEGER NOT NULL
         );
         "#,
     )

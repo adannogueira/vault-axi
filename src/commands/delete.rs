@@ -48,10 +48,7 @@ pub fn delete_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
 
     fs::remove_file(&abs)
         .map_err(|e| AxiError::new(format!("Delete error: {e}"), "INTERNAL_ERROR", vec![]))?;
-    ctx.sync(ReconcileOpts {
-        force: false,
-        with_embeddings: Some(false),
-    })?;
+    ctx.sync_after_mutation()?;
 
     let mut out = Map::new();
     out.insert("ok".to_string(), json!(true));

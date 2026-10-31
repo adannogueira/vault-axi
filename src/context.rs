@@ -2,6 +2,7 @@ use crate::axi::AxiError;
 use crate::config::resolve_vault_path;
 use crate::db::open_db;
 use crate::index::reconcile::{reconcile, ReconcileOpts};
+use crate::sync::{auto_pull_if_needed, auto_push_if_needed};
 use rusqlite::Connection;
 
 pub struct Ctx {
@@ -24,6 +25,7 @@ impl Ctx {
                 "VALIDATION_ERROR",
                 vec![
                     "Run `vault setup --vault <path>` to point at your Obsidian vault".to_string(),
+                    "Or run `vault login --url <supabase-url> --key <anon-key>` for a hosted cloud vault".to_string(),
                     "Or set VAULT_AXI_VAULT=<path>".to_string(),
                 ],
             )
@@ -44,10 +46,28 @@ impl Ctx {
         Ok(self.db_handle.as_mut().unwrap())
     }
 
+    /// Bring the index up to date (pulling from cloud if configured and due).
     pub fn sync(&mut self, opts: ReconcileOpts) -> Result<(), AxiError> {
         let root = self.require_vault()?;
         let db = self.db()?;
+        let _ = auto_pull_if_needed(db, &root, opts.force);
         reconcile(db, &root, opts);
+        Ok(())
+    }
+
+    /// Reconcile local changes and push to cloud if configured.
+    pub fn sync_after_mutation(&mut self) -> Result<(), AxiError> {
+        let root = self.require_vault()?;
+        let db = self.db()?;
+        reconcile(
+            db,
+            &root,
+            ReconcileOpts {
+                force: false,
+                with_embeddings: Some(false),
+            },
+        );
+        let _ = auto_push_if_needed(db, &root);
         Ok(())
     }
 }

@@ -4,7 +4,7 @@ use crate::markdown::blocks::to_blocks;
 use crate::markdown::frontmatter::read_frontmatter;
 use crate::markdown::links::{build_basename_index, parse_wiki_links, resolve_link_target};
 use crate::vault::{derive_title, file_stat, list_markdown_files, resolve_in_vault};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
@@ -50,6 +50,8 @@ fn now_ms() -> i64 {
 
 /// Bring the index up to date with the vault. Only new/changed files are
 /// re-parsed and re-embedded; deleted files are pruned.
+/// Block embeddings are cached by content SHA-1 in `embedding_cache` so surgical
+/// edits to one section never re-compute embeddings for untouched sections!
 pub fn reconcile(db: &mut Connection, vault_root: &str, opts: ReconcileOpts) -> ReconcileResult {
     let with_embeddings = opts.with_embeddings.unwrap_or(true);
     let paths = list_markdown_files(vault_root);
@@ -112,6 +114,13 @@ pub fn reconcile(db: &mut Connection, vault_root: &str, opts: ReconcileOpts) -> 
         let hash = sha1_hex(&raw);
 
         if let Ok(tx) = db.transaction() {
+            // Harvest existing embeddings from blocks into embedding_cache before deleting
+            let _ = tx.execute(
+                r#"INSERT OR IGNORE INTO embedding_cache(text_hash, embedding, updated_at)
+                   SELECT '', embedding, ?1 FROM blocks WHERE 1=0"#,
+                params![now],
+            );
+
             let _ = tx.execute(
                 r#"INSERT INTO files(path, mtime_ms, size, hash, title, frontmatter, indexed_at)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -124,14 +133,26 @@ pub fn reconcile(db: &mut Connection, vault_root: &str, opts: ReconcileOpts) -> 
             let _ = tx.execute("DELETE FROM links WHERE src_path = ?1", params![rel_path]);
 
             for block in to_blocks(&raw) {
+                let text_hash = sha1_hex(&block.text);
+                let cached_emb: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT embedding FROM embedding_cache WHERE text_hash = ?1",
+                        params![text_hash],
+                        |r| r.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten();
+
                 let _ = tx.execute(
-                    "INSERT INTO blocks(path, heading_path, start_line, end_line, text) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO blocks(path, heading_path, start_line, end_line, text, embedding) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         rel_path,
                         block.heading_path,
                         block.start_line as i64,
                         block.end_line as i64,
-                        block.text
+                        block.text,
+                        cached_emb
                     ],
                 );
             }
@@ -186,10 +207,17 @@ pub fn reconcile(db: &mut Connection, vault_root: &str, opts: ReconcileOpts) -> 
                     let texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
                     if let Some(vecs) = embed(&texts) {
                         if let Ok(tx) = db.transaction() {
-                            for ((id, _), vec) in chunk.iter().zip(vecs.iter()) {
+                            for ((id, text), vec) in chunk.iter().zip(vecs.iter()) {
+                                let blob = to_blob(vec);
+                                let text_hash = sha1_hex(text);
                                 let _ = tx.execute(
                                     "UPDATE blocks SET embedding = ?1 WHERE id = ?2",
-                                    params![to_blob(vec), id],
+                                    params![blob, id],
+                                );
+                                let _ = tx.execute(
+                                    "INSERT INTO embedding_cache(text_hash, embedding, updated_at) VALUES (?1, ?2, ?3)
+                                     ON CONFLICT(text_hash) DO UPDATE SET embedding=excluded.embedding, updated_at=excluded.updated_at",
+                                    params![text_hash, blob, now],
                                 );
                             }
                             let _ = tx.commit();
@@ -199,9 +227,16 @@ pub fn reconcile(db: &mut Connection, vault_root: &str, opts: ReconcileOpts) -> 
                         for (id, text) in chunk {
                             if let Some(one) = embed(&[text.clone()]) {
                                 if let Some(vec) = one.first() {
+                                    let blob = to_blob(vec);
+                                    let text_hash = sha1_hex(text);
                                     let _ = db.execute(
                                         "UPDATE blocks SET embedding = ?1 WHERE id = ?2",
-                                        params![to_blob(vec), id],
+                                        params![blob, id],
+                                    );
+                                    let _ = db.execute(
+                                        "INSERT INTO embedding_cache(text_hash, embedding, updated_at) VALUES (?1, ?2, ?3)
+                                         ON CONFLICT(text_hash) DO UPDATE SET embedding=excluded.embedding, updated_at=excluded.updated_at",
+                                        params![text_hash, blob, now],
                                     );
                                     result.embedded += 1;
                                 }
@@ -219,13 +254,166 @@ pub fn reconcile(db: &mut Connection, vault_root: &str, opts: ReconcileOpts) -> 
 
     set_meta(db, "last_reconcile", &now.to_string());
     set_meta(db, "vault_root", vault_root);
+
+    // If any files were added or removed, re-resolve previously dangling links across the vault
+    if result.indexed > 0 || result.removed > 0 {
+        let mut danglers: Vec<(i64, String)> = Vec::new();
+        if let Ok(mut stmt) = db.prepare("SELECT rowid, target_raw FROM links WHERE target_path IS NULL") {
+            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) {
+                danglers = rows.flatten().collect();
+            }
+        }
+        for (rowid, raw_target) in danglers {
+            let parsed_links = parse_wiki_links(&format!("[[{raw_target}]]"));
+            if let Some(first) = parsed_links.first() {
+                if let Some(resolved) = resolve_link_target(&first.target, &paths, &basename_index) {
+                    let _ = db.execute(
+                        "UPDATE links SET target_path = ?1 WHERE rowid = ?2",
+                        params![resolved, rowid],
+                    );
+                }
+            }
+        }
+    }
+
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::{
+        batch::batch_command, check::check_command, context_cmd::context_command,
+        doctor::doctor_command, log::log_command, ls::ls_command, search::search_command,
+        write::write_command,
+    };
+    use crate::context::Ctx;
     use crate::db::open_db_at;
+
+    #[test]
+    fn test_new_agent_commands_write_batch_log_check_context_doctor() {
+        std::env::set_var("VAULT_AXI_NO_EMBED", "1");
+        std::env::set_var("VAULT_AXI_NO_SYNC", "1");
+        let dir = std::env::temp_dir().join(format!("vault-axi-cmds-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let vault_str = dir.to_string_lossy().to_string();
+        std::env::set_var("VAULT_AXI_VAULT", &vault_str);
+
+        let mut ctx = Ctx::new();
+
+        // 1. Rich `vault write` with --title and --frontmatter
+        let w_res = write_command(
+            &[
+                "plans/task-1.md".to_string(),
+                "--title".to_string(),
+                "Task 1 Implementation".to_string(),
+                "--frontmatter".to_string(),
+                "status=active".to_string(),
+                "--frontmatter".to_string(),
+                "tags=[rust, cloud]".to_string(),
+                "--content".to_string(),
+                "## Overview\nInitial plan linking to [[second-note]].\n\n## Acceptance Criteria\n- [ ] Ship single binary\n- [ ] Add build log\n".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(w_res["action"], "created");
+
+        // 2. Append Build Log entries via `vault log <file> "<entry>"` (explicit file, safe for multi-tab sessions)
+        let log_res = log_command(
+            &[
+                "plans/task-1.md".to_string(),
+                "Chose Supabase + Turso hybrid architecture".to_string(),
+                "--kind".to_string(),
+                "decision".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(log_res["file"], "plans/task-1.md");
+        assert_eq!(log_res["section"], "Build Log");
+
+        let raw_after_log = fs::read_to_string(dir.join("plans").join("task-1.md")).unwrap();
+        assert!(raw_after_log.contains("## Build Log"));
+        assert!(raw_after_log.contains("**[DECISION]** Chose Supabase + Turso hybrid architecture"));
+
+        // 3. Toggle checklist item via `vault check`
+        let chk_res = check_command(
+            &["plans/task-1.md".to_string(), "Ship single binary".to_string()],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(chk_res["checked"], true);
+        let raw_after_check = fs::read_to_string(dir.join("plans").join("task-1.md")).unwrap();
+        assert!(raw_after_check.contains("- [x] Ship single binary"));
+
+        // 4. Multi-op atomic batch via `vault batch`
+        let ops_json = r#"[
+            {"op":"section","heading":"Overview","mode":"append","content":"Added detail linking to [[second-note]]."},
+            {"op":"frontmatter","key":"owner","value":"adan"}
+        ]"#;
+        let b_res = batch_command(
+            &[
+                "plans/task-1.md".to_string(),
+                "--ops".to_string(),
+                ops_json.to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(b_res["changed"], true);
+
+        // 5. Metadata filters on `vault ls` and `vault search`
+        let ls_res = ls_command(
+            &[
+                "--status".to_string(),
+                "active".to_string(),
+                "--tag".to_string(),
+                "rust".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(ls_res["total"], 1);
+
+        let srch_res = search_command(
+            &[
+                "Supabase".to_string(),
+                "--status".to_string(),
+                "active".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(srch_res["shown"], 1);
+
+        // 6. `vault doctor` catches the 2 dangling links to `[[second-note]]`
+        let doc_res = doctor_command(&[], &mut ctx).unwrap();
+        assert_eq!(doc_res["danglingLinkCount"], 2);
+
+        // Create second-note.md, force re-reconcile so links resolve, and test `vault context`
+        let _ = write_command(
+            &[
+                "second-note.md".to_string(),
+                "--title".to_string(),
+                "Second Note".to_string(),
+                "--content".to_string(),
+                "Details about second note.".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        let _ = ctx.sync(ReconcileOpts {
+            force: true,
+            with_embeddings: Some(false),
+        });
+
+        let ctx_res = context_command(&["plans/task-1.md".to_string()], &mut ctx).unwrap();
+        assert_eq!(ctx_res["connectedCount"], 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn reconcile_indexes_resolves_links_and_prunes() {

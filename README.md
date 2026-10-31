@@ -1,59 +1,92 @@
 # vault-axi
 
-An [AXI](https://www.axi.md) (agent-ergonomic) CLI for reading, editing, and searching an
-Obsidian markdown vault, compiled to a single standalone Rust binary (`vault`).
+An [AXI](https://www.axi.md) (agent-ergonomic) CLI and built-in MCP server for reading, editing,
+and searching an Obsidian markdown vault, compiled to a single standalone Rust binary (`vault`).
 
-- **Surgical edits.** Replace/append/prepend a section *in place*, set a frontmatter field,
-  or swap an exact text anchor.
-- **Partial reads.** Fetch just the outline, one `## section`, the frontmatter, or a line range.
-- **Real search.** SQLite **FTS5** keyword + **local semantic embeddings** (`TaylorAI/bge-micro-v2` via Hugging Face Candle) + a `[[wikilink]]` graph, fused with RRF.
-- **Link-aware.** `related`/`links` traverse the wikilink graph; `move` rewrites backlinks vault-wide.
-- **Works with Obsidian closed.** Files stay the source of truth; links stay Obsidian-compatible.
+- **Zero-config Hosted Cloud + Self-Hosted Sync.** Register or sign in with `vault register` / `vault login` (with optional TOTP MFA) on our hosted multi-tenant cloud for instant automatic sync, or point `--remote` at a **Git** repository or **S3 / Cloudflare R2** bucket.
+- **First-Class Task Build Logs (`vault log`).** Append timestamped entries with any custom `--kind <label>` directly into a task note's `## Build Log` section (`vault log plans/my-task.md "..." [--kind <label>]`)—safe across concurrent multi-tab sessions with zero global state collisions.
+- **Partial Reads & 1-Call Context.** Fetch just the outline, one `## section`, frontmatter, a line range, or a full `vault context` bundle (target note + connected `[[wikilink]]` outlines).
+- **Fast Hybrid Search & Content-Addressable Embedding Cache.** SQLite **FTS5** keyword + **local semantic embeddings** (`TaylorAI/bge-micro-v2` via Hugging Face Candle) + `[[wikilink]]` graph fused with RRF. Unchanged sections keep their cached embeddings across edits.
+- **Built-in MCP Server (`vault mcp`).** Run `vault mcp` to expose the entire toolset over stdio JSON-RPC for Claude Desktop, Cursor, or any MCP client.
 
 ## Install
 
-### Prebuilt Binary (GitHub Releases)
+### One-Line Install (macOS, Linux, WSL, Git Bash)
 
-Download the prebuilt `vault` binary for your platform from [GitHub Releases](../../releases) and place it on your `PATH`.
+```bash
+curl -fsSL https://raw.githubusercontent.com/adannogueira/vault-axi/main/install.sh | bash
+```
+
+### Windows (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/adannogueira/vault-axi/main/install.ps1 | iex
+```
+
+*(Downloads the latest prebuilt binary for your OS/CPU, verifies its SHA-256 checksum, installs `vault` to `~/.local/bin`, and automatically adds it to your `PATH`.)*
 
 ### From Source (Cargo)
 
 ```bash
 cargo install --path .
+```
+
+## Quick Start
+
+### Option 1: Hosted Cloud Vault (Zero Manual Setup)
+For users who want instant cloud sync across devices or Claude Desktop without setting up Git, AWS S3, or their own database:
+```bash
+vault register --email you@example.com --password <pw>
+# Or sign in on another machine (supports TOTP MFA via --mfa-code):
+vault login --email you@example.com --password <pw>
+vault setup hooks        # optional: install Claude Code SessionStart hook + skill
+```
+
+### Option 2: Local Obsidian Vault (+ Optional Git or S3 Sync)
+```bash
 vault setup --vault ~/Documents/obsidian-vault/Vault
+vault setup --remote git:git@github.com:you/vault.git   # optional automatic Git sync
 vault reindex            # first run downloads the embedding model (~one-time)
 vault setup hooks        # optional: load the dashboard at Claude Code session start
 ```
 
 ## Usage
 
-Run `vault` for a dashboard, or `vault <command> --help`. See the command reference in
+Run `vault` for a dashboard, or `vault <command> --help`. See the full agent skill reference in
 [`.agents/skills/vault/SKILL.md`](.agents/skills/vault/SKILL.md).
 
 ```bash
+# Reading & 1-call context bundle
 vault read plans/foo.md --section "Open Questions"
-vault update plans/foo.md --section "Design" --mode replace --content "new body"
-vault search "some text with similarity"
+vault context plans/foo.md
+
+# Creating & surgical editing
+vault write plans/foo.md --title "Foo Plan" --frontmatter status=active --content "## Design\nBody"
+vault update plans/foo.md --section "Design" --mode replace --content "New body"
+vault batch plans/foo.md --ops '[{"op":"section","heading":"Design","mode":"append","content":"More"},{"op":"frontmatter","key":"status","value":"done"}]'
+
+# Task Build Logs & Checklists (explicitly scoped per task file so multi-tab sessions never collide)
+vault log plans/foo.md "Switched to bundled SQLite FTS5" --kind decision
+vault check plans/foo.md "Ship single binary"
+
+# Search, Graph & Health
+vault search "targeted alerts" --status active --tag infra
+vault ls plans --status active --since 7d
 vault related decisions/some-decision.md
-vault move drafts/idea.md plans/idea.md
+vault doctor
 ```
 
-## How it works
+## Self-Hosted Cloud Options (Git & S3 / Cloudflare R2)
 
-- The index lives at `~/.vault-axi/index.db` (SQLite with bundled FTS5, outside the vault).
-- Every read command runs a cheap `reconcile` (mtime/size diff) first, so the index tracks
-  files edited in Obsidian or elsewhere. Embeddings backfill lazily and on `vault reindex`.
-- Markdown edits splice raw line ranges derived from a heading scan (fenced code and
-  frontmatter aware), the document is never round-tripped through a parser.
-- `vault setup hooks` installs the Claude Code `SessionStart` hook and writes the embedded
-  `SKILL.md` directly into `~/.claude/skills/vault/SKILL.md`.
+For self-hosted vaults, `vault` supports two backends out of the box:
 
-## Config
+```bash
+# Self-hosted Git repository (automatic pull --rebase / commit / push)
+vault setup --remote git:git@github.com:you/vault.git --branch main
 
-- `~/.vault-axi/config.json` — `{ "vaultPath": "…" }`.
-- `VAULT_AXI_VAULT` — override the vault path.
-- `VAULT_AXI_NO_EMBED=1` — disable embeddings (FTS5 + graph only).
-- `VAULT_AXI_EMBED_MODEL` — override the embedding model id.
+# Self-hosted S3 or Cloudflare R2 bucket
+vault setup --remote s3://my-vault-bucket/notes --endpoint https://<account>.r2.cloudflarestorage.com
+```
 
 ## Development
 

@@ -1,6 +1,8 @@
 use crate::args::{flag_bool, flag_string, parse_args};
 use crate::axi::{install_session_start_hooks, AxiError};
-use crate::config::{config_path, load_config, resolve_abs_string, save_config};
+use crate::config::{
+    config_path, load_config, resolve_abs_string, save_config, RemoteBackendConfig,
+};
 use crate::context::Ctx;
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -13,45 +15,98 @@ pub fn setup_command(args: &[String], _ctx: &mut Ctx) -> Result<Value, AxiError>
     let want_hooks = parsed.positionals.first().map(|s| s.as_str()) == Some("hooks")
         || flag_bool(&parsed.flags, "hooks");
     let vault = flag_string(&parsed.flags, "vault");
+    let remote = flag_string(&parsed.flags, "remote");
+    let auto_sync_flag = parsed.flags.get("auto-sync").map(|_| flag_bool(&parsed.flags, "auto-sync"));
 
-    if vault.is_none() && !want_hooks {
-        let current = load_config()
-            .vault_path
-            .unwrap_or_else(|| "(unset)".to_string());
+    if vault.is_none() && !want_hooks && remote.is_none() && auto_sync_flag.is_none() {
+        let cfg = load_config();
         return Ok(json!({
             "ok": true,
             "help": "Nothing to do",
             "usage": [
                 "vault setup --vault <path>",
-                "vault setup hooks   # SessionStart dashboard + the `vault` agent skill",
-                "vault setup --vault <path> --hooks"
+                "vault setup --remote git:<repo-url> [--branch main]   # Self-hosted Git sync",
+                "vault setup --remote s3://<bucket>/<prefix> --endpoint <https://...>   # Self-hosted S3/R2 sync",
+                "vault register --email <e> --password <p>             # Zero-config Hosted Cloud",
+                "vault login --email <e> --password <p>                # Sign in to Hosted Cloud",
+                "vault setup hooks   # SessionStart dashboard + the `vault` agent skill"
             ],
-            "current": current
+            "current": cfg.vault_path.unwrap_or_else(|| "(unset)".to_string()),
+            "autoSync": cfg.auto_sync.unwrap_or(true)
         }));
     }
 
     let mut out = Map::new();
     out.insert("ok".to_string(), json!(true));
+    let mut config = load_config();
 
     if let Some(ref v) = vault {
         let abs = resolve_abs_string(v);
         let p = Path::new(&abs);
-        if !p.exists() || !p.is_dir() {
+        if !p.exists() {
+            let _ = fs::create_dir_all(p);
+        }
+        if !p.is_dir() {
             return Err(AxiError::new(
                 format!("Not a directory: {abs}"),
                 "VALIDATION_ERROR",
                 vec!["Pass --vault <path to your Obsidian vault>".to_string()],
             ));
         }
-        let mut config = load_config();
         config.vault_path = Some(abs.clone());
-        save_config(&config);
         out.insert("vault".to_string(), json!(abs));
-        out.insert(
-            "config".to_string(),
-            json!(config_path().to_string_lossy().to_string()),
-        );
     }
+
+    if let Some(ref rem) = remote {
+        if let Some(s3_rest) = rem.strip_prefix("s3://") {
+            let endpoint = flag_string(&parsed.flags, "endpoint").ok_or_else(|| {
+                AxiError::new(
+                    "--remote s3:// requires --endpoint <https://...>",
+                    "VALIDATION_ERROR",
+                    vec![],
+                )
+            })?;
+            let (bucket, prefix) = match s3_rest.find('/') {
+                Some(idx) => (
+                    s3_rest[..idx].to_string(),
+                    Some(s3_rest[idx + 1..].to_string()),
+                ),
+                None => (s3_rest.to_string(), None),
+            };
+            config.remote = Some(RemoteBackendConfig::S3 {
+                endpoint,
+                bucket,
+                prefix,
+            });
+            out.insert("remote".to_string(), json!("s3"));
+        } else {
+            let git_url = rem.strip_prefix("git:").unwrap_or(rem).to_string();
+            let branch = flag_string(&parsed.flags, "branch");
+            config.remote = Some(RemoteBackendConfig::Git {
+                repo_url: if git_url.is_empty() || git_url == "local" {
+                    None
+                } else {
+                    Some(git_url)
+                },
+                branch,
+            });
+            out.insert("remote".to_string(), json!("git"));
+        }
+        if config.auto_sync.is_none() {
+            config.auto_sync = Some(true);
+        }
+    }
+
+    if let Some(as_val) = auto_sync_flag {
+        config.auto_sync = Some(as_val);
+        out.insert("autoSync".to_string(), json!(as_val));
+    }
+
+    save_config(&config);
+    out.insert(
+        "config".to_string(),
+        json!(config_path().to_string_lossy().to_string()),
+    );
 
     if want_hooks {
         match install_session_start_hooks("vault") {

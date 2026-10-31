@@ -125,10 +125,7 @@ pub fn move_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
         }
     }
 
-    ctx.sync(ReconcileOpts {
-        force: false,
-        with_embeddings: Some(false),
-    })?;
+    ctx.sync_after_mutation()?;
 
     let files_touched = if touched.is_empty() {
         json!("(none)")

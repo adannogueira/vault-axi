@@ -1,9 +1,79 @@
-use crate::args::{flag_int, parse_args};
+use crate::args::{flag_int, flag_string, parse_args};
 use crate::axi::AxiError;
 use crate::context::Ctx;
 use crate::index::reconcile::ReconcileOpts;
 use rusqlite::params;
 use serde_json::{json, Map, Value};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub fn parse_since_ms(since_str: &str) -> Option<i64> {
+    let trimmed = since_str.trim();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if let Some(days) = trimmed.strip_suffix('d').and_then(|s| s.parse::<i64>().ok()) {
+        return Some(now_ms - days * 86_400_000);
+    }
+    if let Some(hours) = trimmed.strip_suffix('h').and_then(|s| s.parse::<i64>().ok()) {
+        return Some(now_ms - hours * 3_600_000);
+    }
+    if let Some(weeks) = trimmed.strip_suffix('w').and_then(|s| s.parse::<i64>().ok()) {
+        return Some(now_ms - weeks * 7 * 86_400_000);
+    }
+    if let Ok(naive) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let dt = naive.and_hms_opt(0, 0, 0)?.and_utc();
+        return Some(dt.timestamp_millis());
+    }
+    None
+}
+
+pub fn matches_metadata_filter(
+    fm_str: Option<&str>,
+    mtime_ms: i64,
+    status_filter: Option<&str>,
+    tag_filter: Option<&str>,
+    since_ms: Option<i64>,
+) -> bool {
+    if let Some(min_ms) = since_ms {
+        if mtime_ms < min_ms {
+            return false;
+        }
+    }
+    if status_filter.is_none() && tag_filter.is_none() {
+        return true;
+    }
+    let Some(s) = fm_str else {
+        return false;
+    };
+    let Ok(Value::Object(fm)) = serde_json::from_str::<Value>(s) else {
+        return false;
+    };
+
+    if let Some(expected_status) = status_filter {
+        let actual = fm.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if !actual.eq_ignore_ascii_case(expected_status) {
+            return false;
+        }
+    }
+
+    if let Some(expected_tag) = tag_filter {
+        let has_tag = match fm.get("tags") {
+            Some(Value::Array(arr)) => arr.iter().any(|t| {
+                t.as_str()
+                    .map(|s| s.eq_ignore_ascii_case(expected_tag))
+                    .unwrap_or(false)
+            }),
+            Some(Value::String(st)) => st.eq_ignore_ascii_case(expected_tag),
+            _ => false,
+        };
+        if !has_tag {
+            return false;
+        }
+    }
+
+    true
+}
 
 pub fn ls_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
     let _ = ctx.require_vault()?;
@@ -14,6 +84,9 @@ pub fn ls_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
         .map(|s| s.trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty());
     let limit = flag_int(&parsed.flags, "limit", 50).max(1) as usize;
+    let status_filter = flag_string(&parsed.flags, "status");
+    let tag_filter = flag_string(&parsed.flags, "tag");
+    let since_ms = flag_string(&parsed.flags, "since").and_then(|s| parse_since_ms(&s));
 
     ctx.sync(ReconcileOpts {
         force: false,
@@ -21,41 +94,56 @@ pub fn ls_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
     })?;
     let db = ctx.db()?;
 
-    let mut rows: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+    let mut rows: Vec<(String, Option<String>, Option<String>, i64)> = Vec::new();
     if let Some(ref d) = dir {
         let like_pat = format!("{d}/%");
         if let Ok(mut stmt) = db.prepare(
-            "SELECT path, title, frontmatter FROM files WHERE path LIKE ?1 ORDER BY path",
+            "SELECT path, title, frontmatter, mtime_ms FROM files WHERE path LIKE ?1 ORDER BY path",
         ) {
             if let Ok(mapped) = stmt.query_map(params![like_pat], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<String>>(1)?,
                     r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)?,
                 ))
             }) {
                 rows = mapped.flatten().collect();
             }
         }
     } else if let Ok(mut stmt) =
-        db.prepare("SELECT path, title, frontmatter FROM files ORDER BY path")
+        db.prepare("SELECT path, title, frontmatter, mtime_ms FROM files ORDER BY path")
     {
         if let Ok(mapped) = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, Option<String>>(2)?,
+                r.get::<_, i64>(3)?,
             ))
         }) {
             rows = mapped.flatten().collect();
         }
     }
 
-    let total = rows.len();
-    let files: Vec<Value> = rows
+    let filtered: Vec<(String, Option<String>, Option<String>, i64)> = rows
+        .into_iter()
+        .filter(|(_, _, fm, mtime)| {
+            matches_metadata_filter(
+                fm.as_deref(),
+                *mtime,
+                status_filter.as_deref(),
+                tag_filter.as_deref(),
+                since_ms,
+            )
+        })
+        .collect();
+
+    let total = filtered.len();
+    let files: Vec<Value> = filtered
         .into_iter()
         .take(limit)
-        .map(|(path, title, fm_str)| {
+        .map(|(path, title, fm_str, _)| {
             let mut m = Map::new();
             m.insert("path".to_string(), json!(path));
             if let Some(t) = title {
@@ -85,8 +173,8 @@ pub fn ls_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
         return Ok(json!({
             "where": dir.clone().unwrap_or_else(|| "(vault root)".to_string()),
             "files": match dir {
-                Some(d) => format!("0 notes under \"{d}\""),
-                None => "0 notes in vault".to_string()
+                Some(d) => format!("0 matching notes under \"{d}\""),
+                None => "0 matching notes in vault".to_string()
             }
         }));
     }

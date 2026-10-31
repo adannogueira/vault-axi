@@ -1,7 +1,6 @@
 use crate::args::{flag_bool, flag_string, parse_args, resolve_content};
 use crate::axi::AxiError;
 use crate::context::Ctx;
-use crate::index::reconcile::ReconcileOpts;
 use crate::markdown::sections::{
     append_to_doc, insert_at_heading, prepend_to_doc, HeadingAnchor, SectionError, SectionErrorKind,
 };
@@ -78,10 +77,7 @@ pub fn insert_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
     }
     fs::write(abs_path, &out)
         .map_err(|e| AxiError::new(format!("Write error: {e}"), "INTERNAL_ERROR", vec![]))?;
-    ctx.sync(ReconcileOpts {
-        force: false,
-        with_embeddings: Some(false),
-    })?;
+    ctx.sync_after_mutation()?;
     Ok(json!({
         "ok": true,
         "changed": true,

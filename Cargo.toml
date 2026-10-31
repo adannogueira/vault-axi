@@ -26,3 +26,5 @@ serde_yaml = "0.9"
 sha1 = "0.10"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 toon-format = "0.4"
+ureq = { version = "2.12", features = ["json"] }
+

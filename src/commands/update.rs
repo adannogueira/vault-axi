@@ -1,7 +1,6 @@
 use crate::args::{flag_string, parse_args, resolve_content, FlagValue};
 use crate::axi::AxiError;
 use crate::context::Ctx;
-use crate::index::reconcile::ReconcileOpts;
 use crate::markdown::frontmatter::{
     coerce_value, set_frontmatter_field, unset_frontmatter_field,
 };
@@ -105,10 +104,7 @@ pub fn update_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
 
     fs::write(abs_path, &out)
         .map_err(|e| AxiError::new(format!("Write error: {e}"), "INTERNAL_ERROR", vec![]))?;
-    ctx.sync(ReconcileOpts {
-        force: false,
-        with_embeddings: Some(false),
-    })?;
+    ctx.sync_after_mutation()?;
 
     resp.insert("changed".to_string(), json!(true));
     resp.insert("file".to_string(), json!(note_path));
