@@ -74,39 +74,69 @@ SHA_URL="${BASE_URL}/${ASSET_NAME}.sha256"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+DOWNLOADED=0
 info "Downloading ${ASSET_NAME} from ${REPO} (${VERSION})..."
 if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$BIN_URL" -o "${TMP_DIR}/${ASSET_NAME}"
-  curl -fsSL "$SHA_URL" -o "${TMP_DIR}/${ASSET_NAME}.sha256" 2>/dev/null || true
+  if curl -fsSL "$BIN_URL" -o "${TMP_DIR}/${ASSET_NAME}" 2>/dev/null; then
+    DOWNLOADED=1
+    curl -fsSL "$SHA_URL" -o "${TMP_DIR}/${ASSET_NAME}.sha256" 2>/dev/null || true
+  fi
 elif command -v wget >/dev/null 2>&1; then
-  wget -qO "${TMP_DIR}/${ASSET_NAME}" "$BIN_URL"
-  wget -qO "${TMP_DIR}/${ASSET_NAME}.sha256" "$SHA_URL" 2>/dev/null || true
+  if wget -qO "${TMP_DIR}/${ASSET_NAME}" "$BIN_URL" 2>/dev/null; then
+    DOWNLOADED=1
+    wget -qO "${TMP_DIR}/${ASSET_NAME}.sha256" "$SHA_URL" 2>/dev/null || true
+  fi
 else
   err "Neither 'curl' nor 'wget' was found. Please install curl first."
 fi
 
-# 3. Verify SHA-256 checksum if available
-if [ -s "${TMP_DIR}/${ASSET_NAME}.sha256" ]; then
-  EXPECTED_SHA="$(awk '{print $1}' "${TMP_DIR}/${ASSET_NAME}.sha256" | tr -d '\r\n')"
-  ACTUAL_SHA=""
-  if command -v sha256sum >/dev/null 2>&1; then
-    ACTUAL_SHA="$(sha256sum "${TMP_DIR}/${ASSET_NAME}" | awk '{print $1}')"
-  elif command -v shasum >/dev/null 2>&1; then
-    ACTUAL_SHA="$(shasum -a 256 "${TMP_DIR}/${ASSET_NAME}" | awk '{print $1}')"
-  fi
-  if [ -n "$ACTUAL_SHA" ] && [ -n "$EXPECTED_SHA" ]; then
-    if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-      err "SHA-256 checksum mismatch! Expected ${EXPECTED_SHA}, got ${ACTUAL_SHA}"
-    fi
-    info "Verified SHA-256 checksum."
-  fi
-fi
-
-# 4. Install binary
 mkdir -p "$INSTALL_DIR"
 DEST_PATH="${INSTALL_DIR}/${BIN_NAME}"
-mv "${TMP_DIR}/${ASSET_NAME}" "$DEST_PATH"
-chmod +x "$DEST_PATH"
+
+if [ "$DOWNLOADED" -eq 1 ]; then
+  # 3. Verify SHA-256 checksum if available
+  if [ -s "${TMP_DIR}/${ASSET_NAME}.sha256" ]; then
+    EXPECTED_SHA="$(awk '{print $1}' "${TMP_DIR}/${ASSET_NAME}.sha256" | tr -d '\r\n')"
+    ACTUAL_SHA=""
+    if command -v sha256sum >/dev/null 2>&1; then
+      ACTUAL_SHA="$(sha256sum "${TMP_DIR}/${ASSET_NAME}" | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+      ACTUAL_SHA="$(shasum -a 256 "${TMP_DIR}/${ASSET_NAME}" | awk '{print $1}')"
+    fi
+    if [ -n "$ACTUAL_SHA" ] && [ -n "$EXPECTED_SHA" ]; then
+      if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+        err "SHA-256 checksum mismatch! Expected ${EXPECTED_SHA}, got ${ACTUAL_SHA}"
+      fi
+      info "Verified SHA-256 checksum."
+    fi
+  fi
+
+  # 4. Install binary
+  mv "${TMP_DIR}/${ASSET_NAME}" "$DEST_PATH"
+  chmod +x "$DEST_PATH"
+else
+  info "Prebuilt binary not found at ${BIN_URL}; building from source..."
+  if ! command -v cargo >/dev/null 2>&1; then
+    if [ -f "$HOME/.cargo/env" ]; then
+      # shellcheck disable=SC1091
+      . "$HOME/.cargo/env"
+    fi
+  fi
+  if ! command -v cargo >/dev/null 2>&1; then
+    info "Installing Rust toolchain via rustup (minimal profile)..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+  fi
+  CARGO_INSTALL_ROOT="${TMP_DIR}/cargo-root"
+  if [ "$VERSION" = "latest" ]; then
+    cargo install --git "https://github.com/${REPO}.git" --locked --root "$CARGO_INSTALL_ROOT"
+  else
+    cargo install --git "https://github.com/${REPO}.git" --tag "$VERSION" --locked --root "$CARGO_INSTALL_ROOT"
+  fi
+  mv "${CARGO_INSTALL_ROOT}/bin/${BIN_NAME}" "$DEST_PATH"
+  chmod +x "$DEST_PATH"
+fi
 
 # Remove macOS quarantine attribute if present
 if [ "$OS" = "macos" ] && command -v xattr >/dev/null 2>&1; then
@@ -155,4 +185,4 @@ case ":${PATH}:" in
     ;;
 esac
 
-printf "\nGet started:\n  vault register --email you@example.com --password <pw>\n  vault --help\n"
+printf "\nGet started:\n  vault register --email you@example.com\n  vault --help\n"

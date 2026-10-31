@@ -39,7 +39,7 @@ impl Ctx {
                 "VALIDATION_ERROR",
                 vec![
                     "Run `vault setup --vault <path>` to point at your Obsidian vault".to_string(),
-                    "Or run `vault login --email <email> --password <password>` for a hosted cloud vault".to_string(),
+                    "Or run `vault login --email <email>` for a hosted cloud vault".to_string(),
                     "Or set VAULT_AXI_VAULT=<path>".to_string(),
                 ],
             )

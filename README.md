@@ -36,9 +36,10 @@ cargo install --path .
 ### Option 1: Hosted Cloud Vault (Zero Manual Setup)
 For users who want instant cloud sync across devices or Claude Desktop without setting up Git, AWS S3, or their own database:
 ```bash
-vault register --email you@example.com --password <pw> [--vault-id <id>]
-# Or sign in on another machine (supports TOTP MFA via --mfa-code, --mfa-enroll, --mfa-verify):
-vault login --email you@example.com --password <pw> [--mfa-code <code>]
+vault register --email you@example.com
+# Prompts for password interactively (safe for '!', '$', etc.), or pass --password 'your!pass' in single quotes
+# To sign in on another machine (supports TOTP MFA via --mfa-code, --mfa-enroll, --mfa-verify):
+vault login --email you@example.com [--mfa-code <code>]
 vault setup hooks        # optional: install Claude Code SessionStart hook + skill
 ```
 

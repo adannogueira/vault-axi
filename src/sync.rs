@@ -723,6 +723,227 @@ fn urlencoding_simple(s: &str) -> String {
     out
 }
 
+fn extract_auth_error(err: ureq::Error) -> String {
+    match err {
+        ureq::Error::Status(code, resp) => {
+            if let Ok(raw) = resp.into_string() {
+                if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                    if let Some(msg) = v
+                        .get("msg")
+                        .or_else(|| v.get("error_description"))
+                        .or_else(|| v.get("message"))
+                        .or_else(|| v.get("error"))
+                        .and_then(|m| m.as_str())
+                    {
+                        return msg.to_string();
+                    }
+                }
+            }
+            format!("HTTP status {code}")
+        }
+        ureq::Error::Transport(t) => format!("Network error: {t}"),
+    }
+}
+
+fn try_password_login(
+    clean_url: &str,
+    anon_key: &str,
+    email: &str,
+    password: &str,
+) -> Result<(String, Option<String>, Option<String>), String> {
+    let auth_url = format!("{clean_url}/auth/v1/token?grant_type=password");
+    let payload = json!({ "email": email, "password": password });
+    let resp = ureq::post(&auth_url)
+        .set("apikey", anon_key)
+        .set("Content-Type", "application/json")
+        .send_string(&payload.to_string())
+        .map_err(extract_auth_error)?;
+    let body: Value = serde_json::from_str(&resp.into_string().unwrap_or_default())
+        .unwrap_or_else(|_| json!({}));
+    let Some(access_token) = body
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    else {
+        return Err("Missing access_token in response".to_string());
+    };
+    let refresh_token = body
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let user_id = body
+        .get("user")
+        .and_then(|u| u.get("id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    Ok((access_token, refresh_token, user_id))
+}
+
+const CONFIRM_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>vault-axi — Email Confirmed</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0d1117;
+      color: #e6edf3;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    .card {
+      max-width: 420px;
+      padding: 32px;
+      border-radius: 12px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      text-align: center;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+    }
+    .icon {
+      width: 48px;
+      height: 48px;
+      margin: 0 auto 16px;
+      border-radius: 50%;
+      background: rgba(46, 160, 67, 0.15);
+      color: #3fb950;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+      font-weight: bold;
+    }
+    h1 { margin: 0 0 10px; font-size: 20px; }
+    p { margin: 0; color: #8b949e; line-height: 1.5; font-size: 14px; }
+    code { color: #79c0ff; background: rgba(110,118,129,0.2); padding: 2px 6px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">&#10003;</div>
+    <h1>Email Confirmed</h1>
+    <p id="msg">Your <code>vault-axi</code> cloud account is active and signed in. You can close this tab and return to your terminal.</p>
+  </div>
+  <script>
+    if (window.location.hash && window.location.hash.length > 1) {
+      fetch('/auth-callback?' + window.location.hash.substring(1)).catch(function(){});
+      history.replaceState(null, '', window.location.pathname);
+    }
+  </script>
+</body>
+</html>"#;
+
+fn parse_query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key && !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn serve_confirm_request(mut stream: std::net::TcpStream) -> Option<(String, Option<String>)> {
+    use std::io::{Read, Write};
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    let mut buf = [0u8; 4096];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let first_line = req.lines().next().unwrap_or("");
+    let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+
+    if let Some(q) = path.strip_prefix("/auth-callback?") {
+        let token = parse_query_param(q, "access_token");
+        let refresh = parse_query_param(q, "refresh_token");
+        let body = r#"{"ok":true}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
+        if let Some(t) = token {
+            return Some((t, refresh));
+        }
+        return None;
+    }
+
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        CONFIRM_HTML.len(),
+        CONFIRM_HTML
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.flush();
+    None
+}
+
+fn wait_for_email_confirmation(
+    clean_url: &str,
+    anon_key: &str,
+    email: &str,
+    password: &str,
+) -> Option<(String, Option<String>, Option<String>)> {
+    if cfg!(test)
+        || std::env::var("VAULT_AXI_NO_SYNC").as_deref() == Ok("1")
+        || std::env::var("VAULT_AXI_NO_WAIT").as_deref() == Ok("1")
+    {
+        return None;
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:3000").ok();
+    if let Some(ref l) = listener {
+        let _ = l.set_nonblocking(true);
+    }
+
+    eprintln!("==> Confirmation email sent to {email}.");
+    eprintln!("==> Waiting for you to click the confirmation link in your email... (Ctrl+C to skip)");
+
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(180);
+    let mut last_poll = std::time::Instant::now();
+
+    while start.elapsed() < timeout {
+        if let Some(ref l) = listener {
+            while let Ok((stream, _)) = l.accept() {
+                if let Some((tok, refr)) = serve_confirm_request(stream) {
+                    eprintln!("==> Email confirmed! Logging in...");
+                    return Some((tok, refr, None));
+                }
+            }
+        }
+
+        if last_poll.elapsed() >= std::time::Duration::from_millis(2500) {
+            last_poll = std::time::Instant::now();
+            if let Ok((tok, refr, uid)) = try_password_login(clean_url, anon_key, email, password) {
+                // Keep serving localhost:3000 briefly in case the browser redirect is still in flight
+                if let Some(ref l) = listener {
+                    let grace = std::time::Instant::now();
+                    while grace.elapsed() < std::time::Duration::from_millis(700) {
+                        if let Ok((stream, _)) = l.accept() {
+                            let _ = serve_confirm_request(stream);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+                eprintln!("==> Email confirmed! Logged in as {email}.");
+                return Some((tok, refr, uid));
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    None
+}
+
 /// Register a new user account on the official Hosted Cloud.
 pub fn register_hosted(
     email: &str,
@@ -732,24 +953,69 @@ pub fn register_hosted(
     let clean_url = HOSTED_SUPABASE_URL;
     let anon_key = HOSTED_SUPABASE_ANON_KEY;
 
-    let signup_url = format!("{clean_url}/auth/v1/signup");
-    let payload = json!({ "email": email, "password": password });
-    let resp = ureq::post(&signup_url)
+    let edge_register_url = format!("{clean_url}/functions/v1/register");
+    let edge_payload = json!({
+        "email": email,
+        "password": password,
+    });
+    let resp = match ureq::post(&edge_register_url)
         .set("apikey", anon_key)
         .set("Content-Type", "application/json")
-        .send_string(&payload.to_string())
-        .map_err(|e| {
-            AxiError::new(
-                format!("Registration failed: {e}"),
+        .send_string(&edge_payload.to_string())
+    {
+        Ok(r) => Ok(r),
+        Err(ureq::Error::Status(404, _)) => {
+            let signup_url = format!("{clean_url}/auth/v1/signup");
+            let payload = json!({
+                "email": email,
+                "password": password,
+                "options": {
+                    "email_redirect_to": "http://localhost:3000"
+                }
+            });
+            ureq::post(&signup_url)
+                .set("apikey", anon_key)
+                .set("Content-Type", "application/json")
+                .send_string(&payload.to_string())
+        }
+        Err(e) => Err(e),
+    };
+
+    let body: Value = match resp {
+        Ok(r) => serde_json::from_str(&r.into_string().unwrap_or_default())
+            .unwrap_or_else(|_| json!({})),
+        Err(e) => {
+            // If the account already exists and is confirmed, log in directly
+            if let Ok((tok, refr, uid)) = try_password_login(clean_url, anon_key, email, password) {
+                let local_cache = save_hosted_session(
+                    Some(tok),
+                    refr,
+                    uid.clone(),
+                    Some(email.to_string()),
+                    vault_id,
+                );
+                return Ok(json!({
+                    "ok": true,
+                    "action": "logged_in_existing_account",
+                    "email": email,
+                    "userId": uid,
+                    "vaultId": vault_id.unwrap_or("default"),
+                    "localVaultCache": local_cache,
+                    "autoSync": true,
+                    "next": ["vault sync", "vault ls"]
+                }));
+            }
+            let msg = extract_auth_error(e);
+            return Err(AxiError::new(
+                format!("Registration failed: {msg}"),
                 "AUTH_ERROR",
                 vec![
                     "Ensure the email is valid and password is at least 6 characters".to_string(),
                 ],
-            )
-        })?;
+            ));
+        }
+    };
 
-    let body: Value = serde_json::from_str(&resp.into_string().unwrap_or_default())
-        .unwrap_or_else(|_| json!({}));
     let access_token = body
         .get("access_token")
         .and_then(|v| v.as_str())
@@ -766,7 +1032,7 @@ pub fn register_hosted(
         .map(|s| s.to_string());
 
     if access_token.is_some() {
-        save_hosted_session(
+        let local_cache = save_hosted_session(
             access_token,
             refresh_token,
             user_id.clone(),
@@ -779,6 +1045,53 @@ pub fn register_hosted(
             "email": email,
             "userId": user_id,
             "vaultId": vault_id.unwrap_or("default"),
+            "localVaultCache": local_cache,
+            "autoSync": true,
+            "next": ["vault sync", "vault ls", "vault login --mfa-enroll"]
+        }));
+    }
+
+    // If the user already confirmed their account earlier, password login will succeed immediately
+    if let Ok((tok, refr, uid)) = try_password_login(clean_url, anon_key, email, password) {
+        let final_uid = uid.or(user_id);
+        let local_cache = save_hosted_session(
+            Some(tok),
+            refr,
+            final_uid.clone(),
+            Some(email.to_string()),
+            vault_id,
+        );
+        return Ok(json!({
+            "ok": true,
+            "action": "registered_and_logged_in",
+            "email": email,
+            "userId": final_uid,
+            "vaultId": vault_id.unwrap_or("default"),
+            "localVaultCache": local_cache,
+            "autoSync": true,
+            "next": ["vault sync", "vault ls", "vault login --mfa-enroll"]
+        }));
+    }
+
+    // Wait for the user to click the confirmation link (serving localhost:3000 + polling)
+    if let Some((tok, refr, uid)) =
+        wait_for_email_confirmation(clean_url, anon_key, email, password)
+    {
+        let final_uid = uid.or(user_id);
+        let local_cache = save_hosted_session(
+            Some(tok),
+            refr,
+            final_uid.clone(),
+            Some(email.to_string()),
+            vault_id,
+        );
+        return Ok(json!({
+            "ok": true,
+            "action": "registered_and_logged_in",
+            "email": email,
+            "userId": final_uid,
+            "vaultId": vault_id.unwrap_or("default"),
+            "localVaultCache": local_cache,
             "autoSync": true,
             "next": ["vault sync", "vault ls", "vault login --mfa-enroll"]
         }));
@@ -786,10 +1099,9 @@ pub fn register_hosted(
 
     Ok(json!({
         "ok": true,
-        "action": "registered_confirmation_required",
+        "status": "awaiting_email_confirmation",
         "email": email,
-        "userId": user_id,
-        "note": "Check your email inbox to confirm your account, then run `vault login --email <email> --password <password>`"
+        "message": format!("Confirmation email sent to {email}. Once confirmed, run `vault login --email {email}`.")
     }))
 }
 
@@ -811,48 +1123,47 @@ pub fn login_hosted(
     if final_token.is_none() {
         let (Some(em), Some(pw)) = (email, password) else {
             return Err(AxiError::new(
-                "Missing --email or --password",
+                "Missing email or password",
                 "VALIDATION_ERROR",
                 vec![
-                    "Usage: vault login --email <email> --password <password> [--mfa-code <6-digit-totp>]".to_string(),
-                    "New user? Run `vault register --email <email> --password <password>`".to_string(),
+                    "Usage: vault login --email <email> [--mfa-code <6-digit-totp>]".to_string(),
+                    "New user? Run `vault register --email <email>`".to_string(),
                 ],
             ));
         };
-        let auth_url = format!("{clean_url}/auth/v1/token?grant_type=password");
-        let payload = json!({ "email": em, "password": pw });
-        let resp = ureq::post(&auth_url)
-            .set("apikey", anon_key)
-            .set("Content-Type", "application/json")
-            .send_string(&payload.to_string())
-            .map_err(|e| {
-                AxiError::new(
-                    format!("Login failed: {e}"),
-                    "AUTH_ERROR",
-                    vec![
-                        "Verify your email and password, or register first with `vault register --email <e> --password <p>`".to_string(),
-                    ],
-                )
-            })?;
-        let body: Value = serde_json::from_str(&resp.into_string().unwrap_or_default())
-            .unwrap_or_else(|_| json!({}));
-        if let Some(tok) = body.get("access_token").and_then(|v| v.as_str()) {
-            final_token = Some(tok.to_string());
-            final_refresh = body
-                .get("refresh_token")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            final_user_id = body
-                .get("user")
-                .and_then(|u| u.get("id"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        } else {
-            return Err(AxiError::new(
-                "Login response did not include an access_token",
-                "AUTH_ERROR",
-                vec![],
-            ));
+        match try_password_login(clean_url, anon_key, em, pw) {
+            Ok((tok, refr, uid)) => {
+                final_token = Some(tok);
+                final_refresh = refr;
+                final_user_id = uid;
+            }
+            Err(msg) => {
+                if msg.to_lowercase().contains("not confirmed") {
+                    if let Some((tok, refr, uid)) =
+                        wait_for_email_confirmation(clean_url, anon_key, em, pw)
+                    {
+                        final_token = Some(tok);
+                        final_refresh = refr;
+                        final_user_id = uid;
+                    } else {
+                        return Err(AxiError::new(
+                            format!("Login failed: {msg}"),
+                            "AUTH_ERROR",
+                            vec![
+                                "Check your email inbox and click the confirmation link, then run `vault login` again".to_string(),
+                            ],
+                        ));
+                    }
+                } else {
+                    return Err(AxiError::new(
+                        format!("Login failed: {msg}"),
+                        "AUTH_ERROR",
+                        vec![
+                            "Verify your email and password, or register first with `vault register --email <email>`".to_string(),
+                        ],
+                    ));
+                }
+            }
         }
 
         // If user provided an MFA TOTP code, elevate session to AAL2
@@ -1085,5 +1396,58 @@ mod tests {
         assert_eq!(err.code, "VALIDATION_ERROR");
         let err2 = login_hosted(None, Some("secret"), None, None, None).unwrap_err();
         assert_eq!(err2.code, "VALIDATION_ERROR");
+
+        // parse_query_param and local confirmation server HTML/callback handling
+        assert_eq!(
+            parse_query_param("access_token=abc&refresh_token=def", "access_token"),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            parse_query_param("access_token=abc&refresh_token=def", "refresh_token"),
+            Some("def".to_string())
+        );
+        assert_eq!(parse_query_param("access_token=&other=1", "access_token"), None);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 1. Landing page request `GET /` returns HTML confirmation page
+        let client_thread = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut client = std::net::TcpStream::connect(addr).unwrap();
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            let mut resp = String::new();
+            client.read_to_string(&mut resp).unwrap();
+            resp
+        });
+        let (srv_stream, _) = listener.accept().unwrap();
+        assert!(serve_confirm_request(srv_stream).is_none());
+        let html_resp = client_thread.join().unwrap();
+        assert!(html_resp.contains("200 OK"));
+        assert!(html_resp.contains("Email Confirmed"));
+
+        // 2. Callback request `GET /auth-callback?access_token=...` extracts tokens
+        let client_thread2 = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut client = std::net::TcpStream::connect(addr).unwrap();
+            client
+                .write_all(
+                    b"GET /auth-callback?access_token=jwt123&refresh_token=ref456 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .unwrap();
+            let mut resp = String::new();
+            client.read_to_string(&mut resp).unwrap();
+            resp
+        });
+        let (srv_stream2, _) = listener.accept().unwrap();
+        let extracted = serve_confirm_request(srv_stream2);
+        assert_eq!(
+            extracted,
+            Some(("jwt123".to_string(), Some("ref456".to_string())))
+        );
+        let json_resp = client_thread2.join().unwrap();
+        assert!(json_resp.contains(r#"{"ok":true}"#));
     }
 }

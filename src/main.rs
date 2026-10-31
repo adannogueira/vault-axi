@@ -49,8 +49,8 @@ Commands:
   move <old> <new>       Move/rename a note and rewrite [[wikilinks]] vault-wide
   delete <file>          Delete a note (warns about incoming backlinks)
   reindex                Refresh the search index; --force | --no-embed
-  register               Create an account on Vault Cloud (--email <e> --password <p>)
-  login                  Sign in to Vault Cloud (--email <e> --password <p> [--mfa-code <code>])
+  register               Create an account on Vault Cloud (--email <e> [--password '<p>'])
+  login                  Sign in to Vault Cloud (--email <e> [--password '<p>'] [--mfa-code <code>])
   sync                   Synchronize with cloud backend (Vault Cloud, Git, or S3); --pull | --push
   setup                  Configure vault path, remote backend (git/s3), or 'hooks'
   mcp                    Run built-in Model Context Protocol (MCP) server over stdio"#;
@@ -156,15 +156,15 @@ Deletes a note (idempotent) and warns which notes now have dangling links."#,
   --no-embed  Skip embeddings (FTS5 + graph only)"#,
         ),
         "register" => Some(
-            r#"vault register --email <you@example.com> --password <password> [--vault-id <id>]
+            r#"vault register [--email <you@example.com>] [--password '<password>' | --password-stdin] [--vault-id <id>]
 Creates a new account on Vault Cloud (hosted multi-tenant cloud with strict per-user RLS isolation)
-and automatically configures local sync."#,
+and automatically configures local sync. Omit --password to be prompted interactively (safe for special characters)."#,
         ),
         "login" => Some(
-            r#"vault login --email <you@example.com> --password <password> [--mfa-code <6-digit-totp>] [--vault-id <id>]
+            r#"vault login [--email <you@example.com>] [--password '<password>' | --password-stdin] [--mfa-code <6-digit-totp>] [--vault-id <id>]
   --mfa-enroll          Enroll a new TOTP authenticator app for Multi-Factor Authentication
   --mfa-verify <code>   Verify and activate TOTP MFA (elevates session to AAL2)
-Signs in to Vault Cloud and enables automatic background delta sync."#,
+Signs in to Vault Cloud and enables automatic background delta sync. Omit --password to be prompted interactively."#,
         ),
         "sync" => Some(
             r#"vault sync [--pull] [--push]
