@@ -12,6 +12,10 @@ Obsidian markdown vault, compiled to a single standalone Rust binary (`vault`).
 
 ## Install
 
+### Prebuilt Binary (GitHub Releases)
+
+Download the prebuilt `vault` binary for your platform from [GitHub Releases](../../releases) and place it on your `PATH`.
+
 ### From Source (Cargo)
 
 ```bash
