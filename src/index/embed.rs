@@ -207,3 +207,29 @@ pub fn from_blob(buf: &[u8]) -> Vec<f32> {
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blob_roundtrip_and_cosine_similarity() {
+        let orig = vec![0.5f32, -0.5, 0.0, 1.25, -3.75];
+        let blob = to_blob(&orig);
+        assert_eq!(blob.len(), orig.len() * 4);
+        let decoded = from_blob(&blob);
+        assert_eq!(decoded, orig);
+
+        // Trailing incomplete bytes ignored safely by chunks_exact(4)
+        let mut ragged = blob.clone();
+        ragged.push(0xFF);
+        assert_eq!(from_blob(&ragged), orig);
+
+        let a = vec![1.0f32, 0.0, 0.0];
+        let b = vec![0.0f32, 1.0, 0.0];
+        let c = vec![-1.0f32, 0.0, 0.0];
+        assert!((cosine(&a, &a) - 1.0).abs() < 1e-6);
+        assert!(cosine(&a, &b).abs() < 1e-6);
+        assert!((cosine(&a, &c) + 1.0).abs() < 1e-6);
+    }
+}

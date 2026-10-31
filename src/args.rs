@@ -17,8 +17,29 @@ pub struct ParsedArgs {
     pub flags: HashMap<String, FlagValue>,
 }
 
+/// True when `arg` is shaped like a flag token (`--name` or `--name=value`, where
+/// `name` starts with a letter and contains only `[A-Za-z0-9_-]`). Anything else that
+/// merely *starts* with `--` (e.g. a `---` frontmatter fence, or "--force broke it")
+/// is data, so it can be consumed as a flag value or positional.
+pub fn looks_like_flag(arg: &str) -> bool {
+    let Some(body) = arg.strip_prefix("--") else {
+        return false;
+    };
+    let name = match body.find('=') {
+        Some(eq) => &body[..eq],
+        None => body,
+    };
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// Minimal flag parser. Supports `--key value`, `--key=value`, boolean `--flag`,
 /// and repeated `--key` (collected into an array). Everything else is positional.
+/// A bare `--` ends flag parsing (everything after it is positional).
 pub fn parse_args<S: AsRef<str>>(args: &[S]) -> ParsedArgs {
     let mut positionals = Vec::new();
     let mut flags: HashMap<String, FlagValue> = HashMap::new();
@@ -32,7 +53,8 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> ParsedArgs {
             }
             break;
         }
-        if let Some(body) = arg.strip_prefix("--") {
+        if looks_like_flag(arg) {
+            let body = &arg[2..];
             let (key, value) = if let Some(eq) = body.find('=') {
                 let k = body[..eq].to_string();
                 let v = FlagValue::Single(body[eq + 1..].to_string());
@@ -40,7 +62,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> ParsedArgs {
             } else {
                 let k = body.to_string();
                 if let Some(next) = args.get(i + 1).map(|s| s.as_ref()) {
-                    if !next.starts_with("--") {
+                    if !looks_like_flag(next) && next != "--" {
                         i += 1;
                         (k, FlagValue::Single(next.to_string()))
                     } else {
@@ -109,19 +131,36 @@ pub fn flag_int(flags: &HashMap<String, FlagValue>, key: &str, fallback: i64) ->
 ///   --stdin         read stdin
 /// Returns a validation error if none is given.
 pub fn resolve_content(flags: &HashMap<String, FlagValue>) -> Result<String, AxiError> {
+    resolve_optional_content(flags)?.ok_or_else(|| {
+        AxiError::new(
+            "No content provided",
+            "VALIDATION_ERROR",
+            vec![
+                "Pass --from <file> (best for long notes), --content \"text\", or --content - / --stdin"
+                    .to_string(),
+            ],
+        )
+    })
+}
+
+/// Like [`resolve_content`], but returns `Ok(None)` when no content source was given,
+/// while still surfacing real errors (e.g. a missing `--from` file).
+pub fn resolve_optional_content(
+    flags: &HashMap<String, FlagValue>,
+) -> Result<Option<String>, AxiError> {
     if let Some(from) = flag_string(flags, "from") {
         if from == "-" {
-            return Ok(read_stdin());
+            return Ok(Some(read_stdin()));
         }
         let path = PathBuf::from(&from);
-        if !path.exists() {
+        if !path.is_file() {
             return Err(AxiError::new(
                 format!("--from file not found: {from}"),
                 "VALIDATION_ERROR",
                 vec!["Pass a path to a file whose contents become the note body".to_string()],
             ));
         }
-        return fs::read_to_string(&path).map_err(|e| {
+        return fs::read_to_string(&path).map(Some).map_err(|e| {
             AxiError::new(
                 format!("Failed to read --from file {from}: {e}"),
                 "VALIDATION_ERROR",
@@ -131,21 +170,14 @@ pub fn resolve_content(flags: &HashMap<String, FlagValue>) -> Result<String, Axi
     }
     if let Some(content) = flag_string(flags, "content") {
         if content != "-" {
-            return Ok(content);
+            return Ok(Some(content));
         }
-        return Ok(read_stdin());
+        return Ok(Some(read_stdin()));
     }
     if flag_bool(flags, "stdin") {
-        return Ok(read_stdin());
+        return Ok(Some(read_stdin()));
     }
-    Err(AxiError::new(
-        "No content provided",
-        "VALIDATION_ERROR",
-        vec![
-            "Pass --from <file> (best for long notes), --content \"text\", or --content - / --stdin"
-                .to_string(),
-        ],
-    ))
+    Ok(None)
 }
 
 pub fn read_stdin() -> String {
@@ -197,5 +229,72 @@ mod tests {
         let parsed_none = parse_args(&["notes/a.md"]);
         let err2 = resolve_content(&parsed_none.flags).unwrap_err();
         assert!(err2.message.contains("No content provided"));
+        assert_eq!(resolve_optional_content(&parsed_none.flags).unwrap(), None);
+    }
+
+    #[test]
+    fn looks_like_flag_edge_cases() {
+        assert!(looks_like_flag("--a"));
+        assert!(looks_like_flag("--Z"));
+        assert!(looks_like_flag("--foo-bar_1=baz"));
+        assert!(!looks_like_flag("-a"));
+        assert!(!looks_like_flag("--"));
+        assert!(!looks_like_flag("---"));
+        assert!(!looks_like_flag("--1abc"));
+        assert!(!looks_like_flag("--=val"));
+        assert!(!looks_like_flag("--foo$bar"));
+        assert!(!looks_like_flag("plain"));
+    }
+
+    #[test]
+    fn double_dash_and_repeated_flags_and_typed_accessors() {
+        let parsed = parse_args(&[
+            "pos1",
+            "--tag",
+            "one",
+            "--tag=two",
+            "--tag",
+            "three",
+            "--bool-flag",
+            "--str-bool=true",
+            "--str-false=false",
+            "--limit",
+            "25",
+            "--bad-int",
+            "notanint",
+            "--",
+            "--not-a-flag",
+            "pos3",
+        ]);
+        assert_eq!(parsed.positionals, vec!["pos1", "--not-a-flag", "pos3"]);
+        assert_eq!(
+            parsed.flags.get("tag"),
+            Some(&FlagValue::Multiple(vec![
+                "one".to_string(),
+                "two".to_string(),
+                "three".to_string()
+            ]))
+        );
+        // flag_string on Multiple returns the last item; on Bool returns None
+        assert_eq!(flag_string(&parsed.flags, "tag").as_deref(), Some("three"));
+        assert_eq!(flag_string(&parsed.flags, "bool-flag"), None);
+        assert_eq!(flag_string(&parsed.flags, "missing"), None);
+
+        // flag_bool across Bool, Single("true"/"false"), Multiple, None
+        assert!(flag_bool(&parsed.flags, "bool-flag"));
+        assert!(flag_bool(&parsed.flags, "str-bool"));
+        assert!(!flag_bool(&parsed.flags, "str-false"));
+        assert!(!flag_bool(&parsed.flags, "tag"));
+        assert!(!flag_bool(&parsed.flags, "missing"));
+
+        let parsed_multi_bool = parse_args(&["--b=false", "--b=true"]);
+        assert!(flag_bool(&parsed_multi_bool.flags, "b"));
+        let parsed_multi_bool2 = parse_args(&["--b=true", "--b=false"]);
+        assert!(!flag_bool(&parsed_multi_bool2.flags, "b"));
+
+        // flag_int
+        assert_eq!(flag_int(&parsed.flags, "limit", 10), 25);
+        assert_eq!(flag_int(&parsed.flags, "bad-int", 10), 10);
+        assert_eq!(flag_int(&parsed.flags, "missing", 42), 42);
     }
 }

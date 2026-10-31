@@ -103,8 +103,8 @@ Applies multiple surgical edits atomically in one call. Supported op types:
         ),
         "log" => Some(
             r#"vault log <file> "<entry>" [--kind <label>] [--section "Build Log"]
-Appends a timestamped entry (`- YYYY-MM-DD HH:MM — **[<KIND>]** <entry>`) directly into <file>'s
-`## Build Log` section (creating the section if absent). `--kind` accepts any free-form string label.
+Appends a timestamped entry (`- `YYYY-MM-DD HH:MM` — **[<KIND>]** <entry>`) directly into <file>'s
+`## Build Log` section (creating the note/section if absent). `--kind` accepts any free-form string label.
 Requires `<file>` on every call so multiple concurrent agent sessions in different tabs never collide.
 Examples:
   vault log plans/metrics-alerts.md "Switched to NRQL count query because Apdex was noisy" --kind decision
@@ -280,5 +280,25 @@ fn main() {
             print_error(&err);
             std::process::exit(err.exit_code());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_help_covers_all_documented_commands() {
+        let cmds = [
+            "read", "context", "write", "path", "update", "batch", "insert", "log", "check",
+            "search", "related", "links", "ls", "doctor", "move", "delete", "reindex", "register",
+            "login", "sync", "setup", "mcp",
+        ];
+        for c in cmds {
+            let h = get_command_help(c);
+            assert!(h.is_some(), "Missing help for command: {c}");
+            assert!(h.unwrap().contains(c));
+        }
+        assert!(get_command_help("unknown_cmd").is_none());
     }
 }

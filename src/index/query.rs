@@ -190,3 +190,79 @@ pub fn breadcrumb(db: &Connection, path: &str, heading_path: &str) -> String {
         format!("{base} > {heading_path}")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::open_db_at;
+    use crate::index::embed::to_blob;
+
+    #[test]
+    fn build_fts_query_filters_stopwords_short_tokens_and_caps_at_12() {
+        assert_eq!(build_fts_query(""), "");
+        assert_eq!(build_fts_query("a b c and or not near"), "");
+        // 2-character tokens (> 1 char) must be preserved while 1-character tokens are filtered out
+        assert_eq!(build_fts_query("go db a x"), "go* OR db*");
+        assert_eq!(
+            build_fts_query("Rust AND SQLite! \"injection\" (test)"),
+            "rust* OR sqlite* OR injection* OR test*"
+        );
+        let many = "t01 t02 t03 t04 t05 t06 t07 t08 t09 t10 t11 t12 t13 t14";
+        let built = build_fts_query(many);
+        assert_eq!(built.split(" OR ").count(), 12);
+        assert!(!built.contains("t13"));
+    }
+
+    #[test]
+    fn rrf_fuse_and_vector_ranking_and_mean_vector_and_breadcrumb() {
+        let l1 = vec![Hit { id: 10, score: 5.0 }, Hit { id: 20, score: 3.0 }];
+        let l2 = vec![Hit { id: 20, score: 0.9 }, Hit { id: 30, score: 0.8 }];
+        let fused = rrf_fuse(&[l1, l2], 60.0);
+        // id 20 appears in both lists so its RRF score must beat id 10 and id 30
+        assert!(fused[&20] > fused[&10]);
+        assert!(fused[&10] > fused[&30]);
+
+        let db = open_db_at(":memory:").unwrap();
+        db.execute(
+            "INSERT INTO files(path, mtime_ms, size, hash, title, frontmatter, indexed_at) VALUES ('a.md', 1, 1, 'h', 'Alpha Title', NULL, 1)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO files(path, mtime_ms, size, hash, title, frontmatter, indexed_at) VALUES ('b.md', 1, 1, 'h', '', NULL, 1)",
+            [],
+        )
+        .unwrap();
+
+        let v1 = to_blob(&[1.0f32, 0.0, 0.0]);
+        let v2 = to_blob(&[0.0f32, 1.0, 0.0]);
+        db.execute(
+            "INSERT INTO blocks(id, path, heading_path, start_line, end_line, text, embedding) VALUES (1, 'a.md', '(preamble)', 1, 2, 'block one', ?1)",
+            params![v1],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO blocks(id, path, heading_path, start_line, end_line, text, embedding) VALUES (2, 'a.md', 'Design > Sub', 3, 5, 'block two', ?1)",
+            params![v2],
+        )
+        .unwrap();
+
+        let ranked = rank_by_vector(&db, &[1.0f32, 0.0, 0.0], 10);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].id, 1);
+        assert!((ranked[0].score - 1.0).abs() < 1e-5);
+
+        let mean = file_mean_vector(&db, "a.md").unwrap();
+        let norm: f32 = mean.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
+        assert!((mean[0] - mean[1]).abs() < 1e-5);
+        assert!(file_mean_vector(&db, "b.md").is_none());
+
+        assert_eq!(breadcrumb(&db, "a.md", "(preamble)"), "a.md (Alpha Title)");
+        assert_eq!(
+            breadcrumb(&db, "a.md", "Design > Sub"),
+            "a.md (Alpha Title) > Design > Sub"
+        );
+        assert_eq!(breadcrumb(&db, "b.md", "Sec"), "b.md > Sec");
+    }
+}

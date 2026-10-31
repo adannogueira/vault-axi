@@ -40,6 +40,14 @@ pub fn log_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
         ));
     };
 
+    if message.trim().is_empty() {
+        return Err(AxiError::new(
+            "Build log entry message must not be empty",
+            "VALIDATION_ERROR",
+            vec![format!("Usage: vault log {note_path} \"<entry>\" [--kind <label>]")],
+        ));
+    }
+
     let now = Local::now();
     let date_str = now.format("%Y-%m-%d").to_string();
     let time_str = now.format("%H:%M").to_string();

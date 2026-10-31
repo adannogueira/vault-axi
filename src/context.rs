@@ -18,6 +18,20 @@ impl Ctx {
         }
     }
 
+    pub fn with_vault(vault_path: impl Into<String>) -> Self {
+        Self {
+            vault_path: Some(crate::config::resolve_abs_string(&vault_path.into())),
+            db_handle: None,
+        }
+    }
+
+    pub fn with_vault_and_db(vault_path: impl Into<String>, db: Connection) -> Self {
+        Self {
+            vault_path: Some(crate::config::resolve_abs_string(&vault_path.into())),
+            db_handle: Some(db),
+        }
+    }
+
     pub fn require_vault(&self) -> Result<String, AxiError> {
         self.vault_path.clone().ok_or_else(|| {
             AxiError::new(
@@ -25,7 +39,7 @@ impl Ctx {
                 "VALIDATION_ERROR",
                 vec![
                     "Run `vault setup --vault <path>` to point at your Obsidian vault".to_string(),
-                    "Or run `vault login --url <supabase-url> --key <anon-key>` for a hosted cloud vault".to_string(),
+                    "Or run `vault login --email <email> --password <password>` for a hosted cloud vault".to_string(),
                     "Or set VAULT_AXI_VAULT=<path>".to_string(),
                 ],
             )

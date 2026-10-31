@@ -68,6 +68,13 @@ pub fn update_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
         let mut cur = raw.clone();
         let mut changed = Vec::new();
         for (key, value) in frontmatter {
+            if key.is_empty() || key.contains(':') || key.contains('\n') || key.contains('\r') {
+                return Err(AxiError::new(
+                    format!("Invalid frontmatter key: \"{key}\""),
+                    "VALIDATION_ERROR",
+                    vec!["Use --frontmatter key=value (or --frontmatter key to unset)".to_string()],
+                ));
+            }
             cur = match value {
                 None => unset_frontmatter_field(&cur, &key),
                 Some(v) => set_frontmatter_field(&cur, &key, &coerce_value(&v)),

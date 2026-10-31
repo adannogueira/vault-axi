@@ -74,9 +74,23 @@ pub fn read_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
                 vec![],
             ));
         };
+        let (Ok(raw_a), Ok(raw_b)) = (caps[1].parse::<usize>(), caps[2].parse::<usize>()) else {
+            return Err(AxiError::new(
+                "Invalid --lines range (numbers out of bounds)",
+                "VALIDATION_ERROR",
+                vec![],
+            ));
+        };
+        if raw_a == 0 || raw_b == 0 || raw_a > raw_b {
+            return Err(AxiError::new(
+                "Invalid --lines range (start must be >= 1 and <= end)",
+                "VALIDATION_ERROR",
+                vec![],
+            ));
+        }
         let (all, eol, _) = split_lines(&raw);
-        let a = caps[1].parse::<usize>().unwrap_or(1).max(1);
-        let b = caps[2].parse::<usize>().unwrap_or(all.len()).min(all.len());
+        let a = raw_a;
+        let b = raw_b.min(all.len());
         let slice = if a <= b && a <= all.len() {
             all[a - 1..b].join(eol)
         } else {
@@ -84,7 +98,7 @@ pub fn read_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
         };
         return Ok(json!({
             "file": note_path,
-            "lines": format!("{a}-{b}"),
+            "lines": format!("{raw_a}-{b}"),
             "content": slice
         }));
     }

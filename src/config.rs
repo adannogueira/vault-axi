@@ -48,7 +48,15 @@ pub struct VaultConfig {
     pub remote: Option<RemoteBackendConfig>,
 }
 
+/// Directory holding `config.json` and `index.db`. Defaults to `~/.vault-axi`;
+/// override with the `VAULT_AXI_HOME` env var (used for isolated tests / multiple profiles).
 pub fn config_dir() -> PathBuf {
+    if let Ok(custom) = std::env::var("VAULT_AXI_HOME") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".vault-axi")
@@ -123,11 +131,60 @@ pub fn normalize_os_path(path: &std::path::Path) -> String {
         match comp {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                components.pop();
+                if matches!(components.last(), Some(std::path::Component::Normal(_))) {
+                    components.pop();
+                }
             }
             c => components.push(c),
         }
     }
     let rebuilt: PathBuf = components.iter().collect();
     rebuilt.to_string_lossy().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn normalize_os_path_collapses_dots_and_never_pops_root() {
+        let p = Path::new("/a/b/./c/../d");
+        let norm = normalize_os_path(p).replace('\\', "/");
+        assert!(norm.ends_with("/a/b/d"));
+
+        let escape = Path::new("/a/../../../../../../etc/passwd");
+        let norm_escape = normalize_os_path(escape).replace('\\', "/");
+        assert!(norm_escape.starts_with('/'));
+        assert!(norm_escape.ends_with("/etc/passwd"));
+    }
+
+    #[test]
+    fn remote_backend_config_serde_supports_cloud_and_supabase_alias() {
+        let raw_supabase = r#"{"vaultPath":"/tmp/v","autoSync":true,"remote":{"type":"supabase","vaultId":"v1"}}"#;
+        let cfg: VaultConfig = serde_json::from_str(raw_supabase).unwrap();
+        assert_eq!(cfg.vault_path.as_deref(), Some("/tmp/v"));
+        assert_eq!(cfg.auto_sync, Some(true));
+        match cfg.remote.unwrap() {
+            RemoteBackendConfig::Cloud { vault_id, .. } => {
+                assert_eq!(vault_id.as_deref(), Some("v1"));
+            }
+            other => panic!("Expected Cloud, got {other:?}"),
+        }
+
+        let raw_s3 = r#"{"remote":{"type":"s3","endpoint":"https://s3.example.com","bucket":"b","prefix":"p"}}"#;
+        let cfg_s3: VaultConfig = serde_json::from_str(raw_s3).unwrap();
+        match cfg_s3.remote.unwrap() {
+            RemoteBackendConfig::S3 {
+                endpoint,
+                bucket,
+                prefix,
+            } => {
+                assert_eq!(endpoint, "https://s3.example.com");
+                assert_eq!(bucket, "b");
+                assert_eq!(prefix.as_deref(), Some("p"));
+            }
+            other => panic!("Expected S3, got {other:?}"),
+        }
+    }
 }

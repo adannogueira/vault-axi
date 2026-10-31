@@ -112,3 +112,48 @@ pub fn set_meta(db: &Connection, key: &str, value: &str) {
         params![key, value],
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_db_migrates_meta_and_fts_triggers() {
+        let db = open_db_at(":memory:").unwrap();
+        assert_eq!(get_meta(&db, "nonexistent"), None);
+        set_meta(&db, "k1", "v1");
+        assert_eq!(get_meta(&db, "k1").as_deref(), Some("v1"));
+        set_meta(&db, "k1", "v2");
+        assert_eq!(get_meta(&db, "k1").as_deref(), Some("v2"));
+
+        db.execute(
+            "INSERT INTO files(path, mtime_ms, size, hash, title, frontmatter, indexed_at) VALUES ('a.md', 1, 10, 'h', 'A', NULL, 1)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO blocks(path, heading_path, start_line, end_line, text, embedding) VALUES ('a.md', 'H', 1, 2, 'unique_fts_token', NULL)",
+            [],
+        )
+        .unwrap();
+
+        let count_after_insert: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM blocks_fts WHERE blocks_fts MATCH 'unique_fts_token'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_after_insert, 1);
+
+        db.execute("DELETE FROM blocks WHERE path = 'a.md'", []).unwrap();
+        let count_after_delete: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM blocks_fts WHERE blocks_fts MATCH 'unique_fts_token'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_after_delete, 0);
+    }
+}

@@ -46,19 +46,19 @@ pub fn move_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
             vec![],
         ));
     }
-    if Path::new(&new_abs).exists() && !flag_bool(&parsed.flags, "force") {
-        return Err(AxiError::new(
-            format!("Target already exists: {new_path}"),
-            "VALIDATION_ERROR",
-            vec!["Pass --force to overwrite".to_string()],
-        ));
-    }
     if old_path == new_path {
         return Ok(json!({
             "ok": true,
             "changed": false,
             "note": "Source and target are identical"
         }));
+    }
+    if Path::new(&new_abs).exists() && !flag_bool(&parsed.flags, "force") {
+        return Err(AxiError::new(
+            format!("Target already exists: {new_path}"),
+            "VALIDATION_ERROR",
+            vec!["Pass --force to overwrite".to_string()],
+        ));
     }
 
     ctx.sync(ReconcileOpts {
@@ -98,7 +98,9 @@ pub fn move_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
 
     let mut rewritten_links = 0;
     let mut touched = Vec::new();
-    for ref_path in &referrers {
+    let mut check_paths = referrers.clone();
+    check_paths.push(new_path.clone());
+    for ref_path in &check_paths {
         let Ok(abs) = resolve_in_vault(&root, ref_path) else {
             continue;
         };

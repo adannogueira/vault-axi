@@ -60,3 +60,69 @@ pub fn to_blocks(raw: &str) -> Vec<Block> {
 
     blocks
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_doc_into_preamble_and_nested_heading_blocks() {
+        let raw = [
+            "---",
+            "status: active",
+            "---",
+            "",
+            "Preamble text before first heading.",
+            "",
+            "# Main Title",
+            "Intro under main.",
+            "",
+            "## Sub A",
+            "Line 1 of A.",
+            "Line 2 of A.",
+            "",
+            "### Deep A1",
+            "Deep content.",
+        ]
+        .join("\n");
+
+        let blocks = to_blocks(&raw);
+        assert_eq!(blocks.len(), 4);
+
+        assert_eq!(blocks[0].heading_path, "(preamble)");
+        assert_eq!(blocks[0].start_line, 4);
+        assert_eq!(blocks[0].end_line, 6);
+        assert_eq!(blocks[0].text, "Preamble text before first heading.");
+
+        assert_eq!(blocks[1].heading_path, "Main Title");
+        assert_eq!(blocks[1].start_line, 7);
+        assert_eq!(blocks[1].end_line, 9);
+        assert_eq!(blocks[1].text, "# Main Title\nIntro under main.");
+
+        assert_eq!(blocks[2].heading_path, "Main Title > Sub A");
+        assert_eq!(blocks[2].start_line, 10);
+        assert_eq!(blocks[2].end_line, 13);
+
+        assert_eq!(blocks[3].heading_path, "Main Title > Sub A > Deep A1");
+        assert_eq!(blocks[3].start_line, 14);
+        assert_eq!(blocks[3].end_line, 15);
+    }
+
+    #[test]
+    fn skips_whitespace_only_preamble_and_handles_headingless_doc() {
+        let raw = "---\na: 1\n---\n\n   \n# Heading\nBody\n";
+        let blocks = to_blocks(raw);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].heading_path, "Heading");
+
+        let no_headings = "Just a plain note without any headings.\nSecond line.\n";
+        let blocks_nh = to_blocks(no_headings);
+        assert_eq!(blocks_nh.len(), 1);
+        assert_eq!(blocks_nh[0].heading_path, "(preamble)");
+        assert_eq!(blocks_nh[0].start_line, 1);
+        assert_eq!(blocks_nh[0].end_line, 2);
+
+        let empty = "   \n\n  ";
+        assert!(to_blocks(empty).is_empty());
+    }
+}

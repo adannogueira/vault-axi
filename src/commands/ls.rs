@@ -2,30 +2,60 @@ use crate::args::{flag_int, flag_string, parse_args};
 use crate::axi::AxiError;
 use crate::context::Ctx;
 use crate::index::reconcile::ReconcileOpts;
-use rusqlite::params;
 use serde_json::{json, Map, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn parse_since_ms(since_str: &str) -> Option<i64> {
     let trimmed = since_str.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     if let Some(days) = trimmed.strip_suffix('d').and_then(|s| s.parse::<i64>().ok()) {
-        return Some(now_ms - days * 86_400_000);
+        if days < 0 {
+            return None;
+        }
+        let delta = days.checked_mul(86_400_000)?;
+        return now_ms.checked_sub(delta);
     }
     if let Some(hours) = trimmed.strip_suffix('h').and_then(|s| s.parse::<i64>().ok()) {
-        return Some(now_ms - hours * 3_600_000);
+        if hours < 0 {
+            return None;
+        }
+        let delta = hours.checked_mul(3_600_000)?;
+        return now_ms.checked_sub(delta);
     }
     if let Some(weeks) = trimmed.strip_suffix('w').and_then(|s| s.parse::<i64>().ok()) {
-        return Some(now_ms - weeks * 7 * 86_400_000);
+        if weeks < 0 {
+            return None;
+        }
+        let delta = weeks.checked_mul(7 * 86_400_000)?;
+        return now_ms.checked_sub(delta);
     }
     if let Ok(naive) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
         let dt = naive.and_hms_opt(0, 0, 0)?.and_utc();
         return Some(dt.timestamp_millis());
     }
     None
+}
+
+pub fn normalize_dir_filter(raw_dir: &str) -> Option<String> {
+    let mut d = raw_dir
+        .trim()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+        .replace('\\', "/");
+    while let Some(stripped) = d.strip_prefix("./").or_else(|| d.strip_prefix('/')) {
+        d = stripped.to_string();
+    }
+    d = d.trim_end_matches('/').to_string();
+    if d.is_empty() || d == "." {
+        None
+    } else {
+        Some(d)
+    }
 }
 
 pub fn matches_metadata_filter(
@@ -81,12 +111,21 @@ pub fn ls_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
     let dir = parsed
         .positionals
         .first()
-        .map(|s| s.trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty());
+        .and_then(|s| normalize_dir_filter(s));
     let limit = flag_int(&parsed.flags, "limit", 50).max(1) as usize;
     let status_filter = flag_string(&parsed.flags, "status");
     let tag_filter = flag_string(&parsed.flags, "tag");
-    let since_ms = flag_string(&parsed.flags, "since").and_then(|s| parse_since_ms(&s));
+    let since_ms = if let Some(s) = flag_string(&parsed.flags, "since") {
+        Some(parse_since_ms(&s).ok_or_else(|| {
+            AxiError::new(
+                format!("Invalid --since value: \"{s}\" (use e.g. 7d, 24h, 2w, or YYYY-MM-DD)"),
+                "VALIDATION_ERROR",
+                vec![],
+            )
+        })?)
+    } else {
+        None
+    };
 
     ctx.sync(ReconcileOpts {
         force: false,
@@ -95,23 +134,7 @@ pub fn ls_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
     let db = ctx.db()?;
 
     let mut rows: Vec<(String, Option<String>, Option<String>, i64)> = Vec::new();
-    if let Some(ref d) = dir {
-        let like_pat = format!("{d}/%");
-        if let Ok(mut stmt) = db.prepare(
-            "SELECT path, title, frontmatter, mtime_ms FROM files WHERE path LIKE ?1 ORDER BY path",
-        ) {
-            if let Ok(mapped) = stmt.query_map(params![like_pat], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            }) {
-                rows = mapped.flatten().collect();
-            }
-        }
-    } else if let Ok(mut stmt) =
+    if let Ok(mut stmt) =
         db.prepare("SELECT path, title, frontmatter, mtime_ms FROM files ORDER BY path")
     {
         if let Ok(mapped) = stmt.query_map([], |r| {
@@ -124,6 +147,11 @@ pub fn ls_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
         }) {
             rows = mapped.flatten().collect();
         }
+    }
+
+    if let Some(ref d) = dir {
+        let prefix = format!("{d}/");
+        rows.retain(|(path, _, _, _)| path.starts_with(&prefix) || path == d);
     }
 
     let filtered: Vec<(String, Option<String>, Option<String>, i64)> = rows

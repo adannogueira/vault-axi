@@ -58,7 +58,10 @@ pub fn parse_wiki_links(raw: &str) -> Vec<WikiLink> {
         for caps in wikilink_re().captures_iter(&scrubbed) {
             let embed = caps.get(1).map(|m| m.as_str()) == Some("!");
             let inner = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            links.push(parse_inner(inner, embed));
+            let link = parse_inner(inner, embed);
+            if !link.target.is_empty() {
+                links.push(link);
+            }
         }
     }
 
@@ -66,8 +69,8 @@ pub fn parse_wiki_links(raw: &str) -> Vec<WikiLink> {
 }
 
 /// Rewrite the target of wikilinks for which `map_target` returns a new target
-/// string (heading/alias/embed markers preserved). Fence-aware; returns the new
-/// text and the number of links rewritten.
+/// string (heading/alias/embed markers preserved). Fence-aware and inline-code-aware;
+/// returns the new text and the number of links rewritten.
 pub fn rewrite_wiki_links<F>(raw: &str, mut map_target: F) -> (String, usize)
 where
     F: FnMut(&WikiLink) -> Option<String>,
@@ -93,12 +96,26 @@ where
                 return line;
             }
 
+            let code_ranges: Vec<(usize, usize)> = inline_code_re()
+                .find_iter(&line)
+                .map(|m| (m.start(), m.end()))
+                .collect();
+
             wikilink_re()
                 .replace_all(&line, |caps: &Captures| {
-                    let whole = caps.get(0).unwrap().as_str();
+                    let whole_match = caps.get(0).unwrap();
+                    let start = whole_match.start();
+                    let end = whole_match.end();
+                    if code_ranges.iter().any(|&(cs, ce)| start >= cs && end <= ce) {
+                        return whole_match.as_str().to_string();
+                    }
+                    let whole = whole_match.as_str();
                     let bang = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                     let inner = caps.get(2).map(|m| m.as_str()).unwrap_or("");
                     let link = parse_inner(inner, bang == "!");
+                    if link.target.is_empty() {
+                        return whole.to_string();
+                    }
                     let Some(next) = map_target(&link) else {
                         return whole.to_string();
                     };
@@ -264,5 +281,60 @@ mod tests {
         let (text3, count3) = rewrite_wiki_links(&raw3, |_| Some("new".to_string()));
         assert_eq!(count3, 1);
         assert_eq!(text3, ["[[new]]", "```", "[[old]]", "```"].join("\n"));
+    }
+
+    #[test]
+    fn rewrite_preserves_inline_code_and_ignores_empty_or_anchor_only_links() {
+        let raw = "Real [[old-note]] and inline `[[old-note]]` on the same line, plus [[#HeadingOnly]] and [[   ]].";
+        let parsed = parse_wiki_links(raw);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].target, "old-note");
+
+        let (rewritten, count) = rewrite_wiki_links(raw, |l| {
+            if l.target == "old-note" {
+                Some("renamed-note".to_string())
+            } else {
+                None
+            }
+        });
+        assert_eq!(count, 1);
+        assert_eq!(
+            rewritten,
+            "Real [[renamed-note]] and inline `[[old-note]]` on the same line, plus [[#HeadingOnly]] and [[   ]]."
+        );
+    }
+
+    #[test]
+    fn resolve_link_target_and_basename_index_and_mismatched_fences() {
+        let paths = vec![
+            "plans/alpha.md".to_string(),
+            "notes/Beta.MD".to_string(),
+            "root.md".to_string(),
+        ];
+        let idx = build_basename_index(&paths);
+        assert_eq!(resolve_link_target("", &paths, &idx), None);
+        assert_eq!(
+            resolve_link_target("alpha", &paths, &idx).as_deref(),
+            Some("plans/alpha.md")
+        );
+        assert_eq!(
+            resolve_link_target("beta", &paths, &idx).as_deref(),
+            Some("notes/Beta.MD")
+        );
+        assert_eq!(
+            resolve_link_target("./plans/ALPHA", &paths, &idx).as_deref(),
+            Some("plans/alpha.md")
+        );
+        assert_eq!(
+            resolve_link_target("plans/alpha.md", &paths, &idx).as_deref(),
+            Some("plans/alpha.md")
+        );
+        assert_eq!(resolve_link_target("nonexistent", &paths, &idx), None);
+
+        // Tilde fence inside backtick fence does not close the backtick fence
+        let fenced = ["```", "~~~", "[[inside-fence]]", "```", "[[outside-fence]]"].join("\n");
+        let links = parse_wiki_links(&fenced);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "outside-fence");
     }
 }

@@ -115,11 +115,23 @@ pub fn reconcile(db: &mut Connection, vault_root: &str, opts: ReconcileOpts) -> 
 
         if let Ok(tx) = db.transaction() {
             // Harvest existing embeddings from blocks into embedding_cache before deleting
-            let _ = tx.execute(
-                r#"INSERT OR IGNORE INTO embedding_cache(text_hash, embedding, updated_at)
-                   SELECT '', embedding, ?1 FROM blocks WHERE 1=0"#,
-                params![now],
-            );
+            let mut existing_embs: Vec<(String, Vec<u8>)> = Vec::new();
+            if let Ok(mut stmt) = tx.prepare(
+                "SELECT text, embedding FROM blocks WHERE path = ?1 AND embedding IS NOT NULL",
+            ) {
+                if let Ok(rows) = stmt.query_map(params![rel_path], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+                }) {
+                    existing_embs = rows.flatten().collect();
+                }
+            }
+            for (b_text, b_emb) in existing_embs {
+                let th = sha1_hex(&b_text);
+                let _ = tx.execute(
+                    "INSERT OR IGNORE INTO embedding_cache(text_hash, embedding, updated_at) VALUES (?1, ?2, ?3)",
+                    params![th, b_emb, now],
+                );
+            }
 
             let _ = tx.execute(
                 r#"INSERT INTO files(path, mtime_ms, size, hash, title, frontmatter, indexed_at)
@@ -283,51 +295,86 @@ pub fn reconcile(db: &mut Connection, vault_root: &str, opts: ReconcileOpts) -> 
 mod tests {
     use super::*;
     use crate::commands::{
-        batch::batch_command, check::check_command, context_cmd::context_command,
-        doctor::doctor_command, log::log_command, ls::ls_command, search::search_command,
+        batch::batch_command,
+        check::check_command,
+        context_cmd::context_command,
+        delete::delete_command,
+        doctor::doctor_command,
+        home::home_command,
+        insert::insert_command,
+        links::links_command,
+        log::log_command,
+        ls::{ls_command, matches_metadata_filter, normalize_dir_filter, parse_since_ms},
+        mcp::{dispatch_mcp_tool, tool_definitions},
+        move_cmd::move_command,
+        path::path_command,
+        read::read_command,
+        reindex::reindex_command,
+        related::related_command,
+        search::search_command,
+        setup::setup_command,
+        sync_cmd::{login_command, register_command, sync_command},
+        update::update_command,
         write::write_command,
     };
     use crate::context::Ctx;
     use crate::db::open_db_at;
+    use crate::index::embed::to_blob;
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn make_vault(tag: &str) -> (PathBuf, Ctx) {
+        std::env::set_var("VAULT_AXI_NO_EMBED", "1");
+        std::env::set_var("VAULT_AXI_NO_SYNC", "1");
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "vault-axi-{tag}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = open_db_at(":memory:").unwrap();
+        let ctx = Ctx::with_vault_and_db(dir.to_string_lossy().to_string(), db);
+        (dir, ctx)
+    }
+
+    fn svec(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
 
     #[test]
     fn test_new_agent_commands_write_batch_log_check_context_doctor() {
-        std::env::set_var("VAULT_AXI_NO_EMBED", "1");
-        std::env::set_var("VAULT_AXI_NO_SYNC", "1");
-        let dir = std::env::temp_dir().join(format!("vault-axi-cmds-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let vault_str = dir.to_string_lossy().to_string();
-        std::env::set_var("VAULT_AXI_VAULT", &vault_str);
-
-        let mut ctx = Ctx::new();
+        let (dir, mut ctx) = make_vault("cmds");
 
         // 1. Rich `vault write` with --title and --frontmatter
         let w_res = write_command(
-            &[
-                "plans/task-1.md".to_string(),
-                "--title".to_string(),
-                "Task 1 Implementation".to_string(),
-                "--frontmatter".to_string(),
-                "status=active".to_string(),
-                "--frontmatter".to_string(),
-                "tags=[rust, cloud]".to_string(),
-                "--content".to_string(),
-                "## Overview\nInitial plan linking to [[second-note]].\n\n## Acceptance Criteria\n- [ ] Ship single binary\n- [ ] Add build log\n".to_string(),
-            ],
+            &svec(&[
+                "plans/task-1.md",
+                "--title",
+                "Task 1 Implementation",
+                "--frontmatter",
+                "status=active",
+                "--frontmatter",
+                "tags=[rust, cloud]",
+                "--content",
+                "## Overview\nInitial plan linking to [[second-note]].\n\n## Acceptance Criteria\n- [ ] Ship single binary\n- [ ] Add build log\n",
+            ]),
             &mut ctx,
         )
         .unwrap();
         assert_eq!(w_res["action"], "created");
 
-        // 2. Append Build Log entries via `vault log <file> "<entry>"` (explicit file, safe for multi-tab sessions)
+        // 2. Append Build Log entries via `vault log <file> "<entry>"`
         let log_res = log_command(
-            &[
-                "plans/task-1.md".to_string(),
-                "Chose Supabase + Turso hybrid architecture".to_string(),
-                "--kind".to_string(),
-                "decision".to_string(),
-            ],
+            &svec(&[
+                "plans/task-1.md",
+                "Chose bundled SQLite FTS5 architecture",
+                "--kind",
+                "decision",
+            ]),
             &mut ctx,
         )
         .unwrap();
@@ -336,11 +383,11 @@ mod tests {
 
         let raw_after_log = fs::read_to_string(dir.join("plans").join("task-1.md")).unwrap();
         assert!(raw_after_log.contains("## Build Log"));
-        assert!(raw_after_log.contains("**[DECISION]** Chose Supabase + Turso hybrid architecture"));
+        assert!(raw_after_log.contains("**[DECISION]** Chose bundled SQLite FTS5 architecture"));
 
         // 3. Toggle checklist item via `vault check`
         let chk_res = check_command(
-            &["plans/task-1.md".to_string(), "Ship single binary".to_string()],
+            &svec(&["plans/task-1.md", "Ship single binary"]),
             &mut ctx,
         )
         .unwrap();
@@ -354,11 +401,7 @@ mod tests {
             {"op":"frontmatter","key":"owner","value":"adan"}
         ]"#;
         let b_res = batch_command(
-            &[
-                "plans/task-1.md".to_string(),
-                "--ops".to_string(),
-                ops_json.to_string(),
-            ],
+            &svec(&["plans/task-1.md", "--ops", ops_json]),
             &mut ctx,
         )
         .unwrap();
@@ -366,23 +409,14 @@ mod tests {
 
         // 5. Metadata filters on `vault ls` and `vault search`
         let ls_res = ls_command(
-            &[
-                "--status".to_string(),
-                "active".to_string(),
-                "--tag".to_string(),
-                "rust".to_string(),
-            ],
+            &svec(&["--status", "active", "--tag", "rust"]),
             &mut ctx,
         )
         .unwrap();
         assert_eq!(ls_res["total"], 1);
 
         let srch_res = search_command(
-            &[
-                "Supabase".to_string(),
-                "--status".to_string(),
-                "active".to_string(),
-            ],
+            &svec(&["SQLite", "--status", "active"]),
             &mut ctx,
         )
         .unwrap();
@@ -392,29 +426,716 @@ mod tests {
         let doc_res = doctor_command(&[], &mut ctx).unwrap();
         assert_eq!(doc_res["danglingLinkCount"], 2);
 
-        // Create second-note.md, force re-reconcile so links resolve, and test `vault context`
+        // Create second-note.md — reconcile automatically re-resolves previously dangling links!
         let _ = write_command(
-            &[
-                "second-note.md".to_string(),
-                "--title".to_string(),
-                "Second Note".to_string(),
-                "--content".to_string(),
-                "Details about second note.".to_string(),
-            ],
+            &svec(&[
+                "second-note.md",
+                "--title",
+                "Second Note",
+                "--content",
+                "Details about second note.",
+            ]),
             &mut ctx,
         )
         .unwrap();
-        let _ = ctx.sync(ReconcileOpts {
-            force: true,
-            with_embeddings: Some(false),
-        });
 
-        let ctx_res = context_command(&["plans/task-1.md".to_string()], &mut ctx).unwrap();
+        let doc_after = doctor_command(&[], &mut ctx).unwrap();
+        assert_eq!(doc_after["danglingLinkCount"], 0);
+        assert_eq!(doc_after["healthy"], true);
+
+        let ctx_res = context_command(&svec(&["plans/task-1.md"]), &mut ctx).unwrap();
         assert_eq!(ctx_res["connectedCount"], 1);
 
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn reconcile_preserves_embedding_cache_across_surgical_edits() {
+        let (dir, mut ctx) = make_vault("emb-cache");
+        let sec1 = "## Section One\nThis first section has more than forty characters so it is embeddable.";
+        let sec2 = "## Section Two\nThis second section also has more than forty characters for embedding.";
+        write_command(
+            &svec(&["note.md", "--content", &format!("{sec1}\n\n{sec2}\n")]),
+            &mut ctx,
+        )
+        .unwrap();
+
+        // Manually attach a synthetic embedding to Section One in blocks
+        let fake_emb = to_blob(&[0.25f32, 0.75, 0.0]);
+        ctx.db()
+            .unwrap()
+            .execute(
+                "UPDATE blocks SET embedding = ?1 WHERE path = 'note.md' AND heading_path = 'Section One'",
+                params![fake_emb],
+            )
+            .unwrap();
+
+        // Surgically edit Section Two only
+        update_command(
+            &svec(&[
+                "note.md",
+                "--section",
+                "Section Two",
+                "--mode",
+                "replace",
+                "--content",
+                "Updated second section content with plenty of characters.",
+            ]),
+            &mut ctx,
+        )
+        .unwrap();
+
+        // Verify Section One's embedding was harvested into embedding_cache and restored!
+        let restored: Option<Vec<u8>> = ctx
+            .db()
+            .unwrap()
+            .query_row(
+                "SELECT embedding FROM blocks WHERE path = 'note.md' AND heading_path = 'Section One'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored, Some(fake_emb));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_home_path_and_reindex_commands() {
+        let mut unconfigured = Ctx::with_vault("unused");
+        unconfigured.vault_path = None;
+        let h_unconf = home_command(&[], &mut unconfigured).unwrap();
+        assert_eq!(h_unconf["status"], "not configured");
+        assert!(unconfigured.require_vault().is_err());
+
+        let (dir, mut ctx) = make_vault("home-path");
+        let p_root = path_command(&[], &mut ctx).unwrap();
+        assert_eq!(p_root["vault"], ctx.vault_path.clone().unwrap());
+
+        let p_new = path_command(&svec(&["deep/sub/note"]), &mut ctx).unwrap();
+        assert_eq!(p_new["file"], "deep/sub/note.md");
+        assert_eq!(p_new["exists"], false);
+        assert!(dir.join("deep").join("sub").is_dir());
+
+        // Exact 40-char block vs 39-char block to kill `length(text) >= 40` -> `> 40` mutation
+        // "# H1\n" is 5 chars + 35 'a's = 40 chars; "## H2\n" is 6 chars + 33 'b's = 39 chars
+        let exact_40_body = format!("# H1\n{}\n\n## H2\n{}\n", "a".repeat(35), "b".repeat(33));
+        write_command(
+            &svec(&[
+                "deep/sub/note.md",
+                "--frontmatter",
+                "status=active",
+                "--content",
+                &exact_40_body,
+            ]),
+            &mut ctx,
+        )
+        .unwrap();
+
+        let p_exists = path_command(&svec(&["deep/sub/note"]), &mut ctx).unwrap();
+        assert_eq!(p_exists["exists"], true);
+
+        // Home when 0/1 blocks are embedded (only the 40-char block is embeddable, not the 39-char block)
+        let h1 = home_command(&[], &mut ctx).unwrap();
+        assert_eq!(h1["notes"], 1);
+        assert_eq!(h1["blocks"], 2);
+        assert_eq!(h1["embeddings"], "0/1 (run `vault reindex`)");
+        assert_eq!(h1["recent"][0], "deep/sub/note.md (active)");
+
+        // Attach embedding to the 40-char block so embedded == embeddable (1 == 1)
+        ctx.db()
+            .unwrap()
+            .execute(
+                "UPDATE blocks SET embedding = ?1 WHERE length(text) >= 40",
+                params![to_blob(&[1.0f32, 0.0])],
+            )
+            .unwrap();
+        let h2 = home_command(&[], &mut ctx).unwrap();
+        assert_eq!(h2["embeddings"], "complete (1 blocks)");
+
+        let re_res = reindex_command(&svec(&["--force", "--no-embed"]), &mut ctx).unwrap();
+        assert_eq!(re_res["ok"], true);
+        assert_eq!(re_res["scanned"], 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_command_modes_boundaries_and_errors() {
+        let (dir, mut ctx) = make_vault("read");
+        assert!(read_command(&[], &mut ctx).is_err());
+        assert_eq!(
+            read_command(&svec(&["missing.md"]), &mut ctx)
+                .unwrap_err()
+                .code,
+            "NOT_FOUND"
+        );
+
+        // Note without frontmatter or headings, exactly 1200 chars vs 1201 chars
+        let exact_1200 = "a".repeat(1200);
+        fs::write(dir.join("exact.md"), &exact_1200).unwrap();
+        let r_exact = read_command(&svec(&["exact.md"]), &mut ctx).unwrap();
+        assert_eq!(r_exact["truncated"], false);
+        assert!(r_exact.get("hint").is_none());
+        assert_eq!(
+            read_command(&svec(&["exact.md", "--outline"]), &mut ctx).unwrap()["outline"],
+            "(no headings)"
+        );
+        assert_eq!(
+            read_command(&svec(&["exact.md", "--frontmatter"]), &mut ctx).unwrap()["frontmatter"],
+            "(none)"
+        );
+
+        let over_1201 = "b".repeat(1201);
+        fs::write(dir.join("over.md"), &over_1201).unwrap();
+        let r_over = read_command(&svec(&["over.md"]), &mut ctx).unwrap();
+        assert_eq!(r_over["truncated"], true);
+        assert_eq!(r_over["totalChars"], 1201);
+        assert!(r_over.get("hint").is_some());
+
+        let r_full = read_command(&svec(&["over.md", "--full"]), &mut ctx).unwrap();
+        assert_eq!(r_full["truncated"], false);
+        assert_eq!(r_full["content"], over_1201);
+
+        // Note with frontmatter, sections, and lines
+        let long_sec = "x".repeat(1250);
+        let structured = format!(
+            "---\nstatus: draft\n---\n# Title\n## Short\nLine A\nLine B\n## LongSec\n{long_sec}\n## Dup\n1\n## Dup\n2"
+        );
+        fs::write(dir.join("doc.md"), &structured).unwrap();
+
+        let fm = read_command(&svec(&["doc.md", "--frontmatter"]), &mut ctx).unwrap();
+        assert_eq!(fm["frontmatter"]["status"], "draft");
+
+        let ol = read_command(&svec(&["doc.md", "--outline"]), &mut ctx).unwrap();
+        assert_eq!(ol["headings"], 5);
+
+        // --lines boundaries
+        let l_single = read_command(&svec(&["doc.md", "--lines", "6-6"]), &mut ctx).unwrap();
+        assert_eq!(l_single["content"], "Line A");
+        let l_range = read_command(&svec(&["doc.md", "--lines", "6-7"]), &mut ctx).unwrap();
+        assert_eq!(l_range["content"], "Line A\nLine B");
+        let l_last = read_command(&svec(&["doc.md", "--lines", "13-13"]), &mut ctx).unwrap();
+        assert_eq!(l_last["content"], "2");
+        let l_past_eof = read_command(&svec(&["doc.md", "--lines", "50-60"]), &mut ctx).unwrap();
+        assert_eq!(l_past_eof["content"], "");
+
+        // Invalid --lines
+        assert!(read_command(&svec(&["doc.md", "--lines", "0-2"]), &mut ctx).is_err());
+        assert!(read_command(&svec(&["doc.md", "--lines", "5-3"]), &mut ctx).is_err());
+        assert!(read_command(&svec(&["doc.md", "--lines", "bad"]), &mut ctx).is_err());
+
+        // --section short, truncated, --full, not found, ambiguous
+        let s_short = read_command(&svec(&["doc.md", "--section", "Short"]), &mut ctx).unwrap();
+        assert_eq!(s_short["truncated"], false);
+        let s_long = read_command(&svec(&["doc.md", "--section", "LongSec"]), &mut ctx).unwrap();
+        assert_eq!(s_long["truncated"], true);
+        assert!(s_long.get("hint").is_some());
+        let s_long_full =
+            read_command(&svec(&["doc.md", "--section", "LongSec", "--full"]), &mut ctx).unwrap();
+        assert_eq!(s_long_full["truncated"], false);
+
+        assert_eq!(
+            read_command(&svec(&["doc.md", "--section", "Missing"]), &mut ctx)
+                .unwrap_err()
+                .code,
+            "NOT_FOUND"
+        );
+        assert_eq!(
+            read_command(&svec(&["doc.md", "--section", "Dup"]), &mut ctx)
+                .unwrap_err()
+                .code,
+            "VALIDATION_ERROR"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_update_insert_batch_log_check_edge_cases() {
+        let (dir, mut ctx) = make_vault("edit-edges");
+
+        // write edge cases
+        assert!(write_command(&[], &mut ctx).is_err());
+        assert!(write_command(&svec(&["a.md"]), &mut ctx).is_err());
+        assert!(write_command(&svec(&["a.md", "--frontmatter", "=bad", "--content", "x"]), &mut ctx).is_err());
+
+        // write with --title only, and --title when content already starts with `# `
+        write_command(&svec(&["title-only.md", "--title", "Only Title"]), &mut ctx).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("title-only.md")).unwrap(),
+            "# Only Title\n"
+        );
+
+        write_command(
+            &svec(&["has-h1.md", "--title", "Other", "--content", "# Existing H1\nBody"]),
+            &mut ctx,
+        )
+        .unwrap();
+        let has_h1_raw = fs::read_to_string(dir.join("has-h1.md")).unwrap();
+        assert_eq!(has_h1_raw, "# Existing H1\nBody\n");
+
+        // overwrite without --force fails; with --force succeeds
+        assert!(write_command(&svec(&["has-h1.md", "--content", "new"]), &mut ctx).is_err());
+        let ow = write_command(
+            &svec(&["has-h1.md", "--content", "# Doc\n\n## Sec\nBody\n", "--force"]),
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(ow["action"], "overwritten");
+
+        // update edge cases
+        assert!(update_command(&[], &mut ctx).is_err());
+        assert_eq!(
+            update_command(&svec(&["nope.md", "--frontmatter", "a=1"]), &mut ctx)
+                .unwrap_err()
+                .code,
+            "NOT_FOUND"
+        );
+        assert!(update_command(&svec(&["has-h1.md"]), &mut ctx).is_err());
+        assert!(update_command(
+            &svec(&["has-h1.md", "--section", "Sec", "--mode", "bad", "--content", "x"]),
+            &mut ctx
+        )
+        .is_err());
+        assert!(update_command(&svec(&["has-h1.md", "--anchor", "Body"]), &mut ctx).is_err());
+        assert!(update_command(&svec(&["has-h1.md", "--frontmatter", "=bad"]), &mut ctx).is_err());
+
+        // update no-op returns changed: false
+        let u_noop = update_command(
+            &svec(&["has-h1.md", "--section", "Sec", "--mode", "replace", "--content", "Body"]),
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(u_noop["changed"], false);
+
+        // update prepend, anchor, and frontmatter set/unset
+        let u_prep = update_command(
+            &svec(&["has-h1.md", "--section", "Sec", "--mode", "prepend", "--content", "Prepended"]),
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(u_prep["changed"], true);
+
+        let u_anc = update_command(
+            &svec(&["has-h1.md", "--anchor", "Prepended", "--replace", "Swapped"]),
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(u_anc["changed"], true);
+
+        update_command(
+            &svec(&["has-h1.md", "--frontmatter", "status=active", "--frontmatter", "temp=1"]),
+            &mut ctx,
+        )
+        .unwrap();
+        update_command(&svec(&["has-h1.md", "--frontmatter", "temp"]), &mut ctx).unwrap();
+        let fm_after = read_command(&svec(&["has-h1.md", "--frontmatter"]), &mut ctx).unwrap();
+        assert_eq!(fm_after["frontmatter"]["status"], "active");
+        assert!(fm_after["frontmatter"].get("temp").is_none());
+
+        // insert command: before-heading, after-heading, prepend, append, and empty content no-op
+        assert!(insert_command(&[], &mut ctx).is_err());
+        assert!(insert_command(&svec(&["has-h1.md", "--content", "x"]), &mut ctx).is_err());
+        let ins_empty = insert_command(
+            &svec(&["has-h1.md", "--append", "--content", "   "]),
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(ins_empty["changed"], false);
+
+        insert_command(
+            &svec(&["has-h1.md", "--before-heading", "Sec", "--content", "## BeforeSec\nB"]),
+            &mut ctx,
+        )
+        .unwrap();
+        insert_command(
+            &svec(&["has-h1.md", "--after-heading", "Sec", "--content", "AfterLine"]),
+            &mut ctx,
+        )
+        .unwrap();
+        insert_command(
+            &svec(&["has-h1.md", "--prepend", "--content", "Preamble line"]),
+            &mut ctx,
+        )
+        .unwrap();
+        insert_command(
+            &svec(&["has-h1.md", "--append", "--content", "Tail line"]),
+            &mut ctx,
+        )
+        .unwrap();
+
+        // batch command: all ops + atomicity when a later op fails
+        let before_failed_batch = fs::read_to_string(dir.join("has-h1.md")).unwrap();
+        let bad_batch = r#"[
+            {"op":"frontmatter","key":"status","value":"corrupted"},
+            {"op":"anchor","old_str":"DEFINITELY_NOT_PRESENT","new_str":"x"}
+        ]"#;
+        assert!(batch_command(&svec(&["has-h1.md", "--ops", bad_batch]), &mut ctx).is_err());
+        assert_eq!(
+            fs::read_to_string(dir.join("has-h1.md")).unwrap(),
+            before_failed_batch
+        );
+
+        let good_batch = r#"[
+            {"op":"insert","where_anchor":"before-heading","heading":"Sec","content":"Inserted via batch"},
+            {"op":"insert","where_anchor":"after-heading","heading":"Sec","content":"After via batch"},
+            {"op":"insert","where_anchor":"prepend","content":"Top via batch"},
+            {"op":"insert","where_anchor":"append","content":"Bottom via batch"},
+            {"op":"frontmatter","key":"status","value":null}
+        ]"#;
+        let gb_res = batch_command(&svec(&["has-h1.md", "--ops", good_batch]), &mut ctx).unwrap();
+        assert_eq!(gb_res["operationsApplied"], 5);
+
+        // log command: creating new file when absent, custom section, empty message error
+        assert!(log_command(&[], &mut ctx).is_err());
+        assert!(log_command(&svec(&["plans/new-log.md", "   "]), &mut ctx).is_err());
+        let l_new = log_command(
+            &svec(&["plans/new-log.md", "First entry", "--section", "Custom Log"]),
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(l_new["section"], "Custom Log");
+        assert!(fs::read_to_string(dir.join("plans").join("new-log.md"))
+            .unwrap()
+            .contains("## Custom Log"));
+
+        // check command: *, +, - [X], --list, --uncheck, --all
+        write_command(
+            &svec(&[
+                "tasks.md",
+                "--content",
+                "- [ ] Task alpha one\n* [ ] Task alpha two\n+ [X] Done item\n",
+            ]),
+            &mut ctx,
+        )
+        .unwrap();
+        let list_res = check_command(&svec(&["tasks.md", "--list"]), &mut ctx).unwrap();
+        assert_eq!(list_res["totalTasks"], 3);
+        assert_eq!(list_res["tasks"][2]["checked"], true);
+
+        // Ambiguous match without --all fails; with --all checks both
+        assert!(check_command(&svec(&["tasks.md", "Task alpha"]), &mut ctx).is_err());
+        let all_res =
+            check_command(&svec(&["tasks.md", "Task alpha", "--all"]), &mut ctx).unwrap();
+        assert_eq!(all_res["items"].as_array().unwrap().len(), 2);
+
+        // Uncheck item
+        let unchk = check_command(
+            &svec(&["tasks.md", "Done item", "--uncheck"]),
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(unchk["checked"], false);
+        assert_eq!(unchk["changed"], true);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ls_search_related_links_move_delete_and_mcp() {
+        let (dir, mut ctx) = make_vault("graph-search");
+
+        // parse_since_ms & normalize_dir_filter adversarial tests
+        assert!(parse_since_ms("7d").is_some());
+        assert!(parse_since_ms("24h").is_some());
+        assert!(parse_since_ms("2w").is_some());
+        assert!(parse_since_ms("2026-01-15").is_some());
+        assert!(parse_since_ms("-5d").is_none());
+        assert!(parse_since_ms("-1h").is_none());
+        assert!(parse_since_ms("-1w").is_none());
+        assert!(parse_since_ms("999999999999999999d").is_none());
+        assert!(parse_since_ms("not-a-date").is_none());
+        assert_eq!(normalize_dir_filter("./plans\\sub/"), Some("plans/sub".to_string()));
+        assert_eq!(normalize_dir_filter("/"), None);
+
+        // Create notes in `plans_v1` and `plansXv1` to verify SQL LIKE `_` wildcard is not triggered
+        write_command(
+            &svec(&[
+                "plans_v1/alpha.md",
+                "--title",
+                "Alpha",
+                "--frontmatter",
+                "status=active",
+                "--frontmatter",
+                "tags=single_tag",
+                "--content",
+                "## Goals\nLink to [[beta#Details|Beta Alias]] and [[missing]]. Also inline `[[beta]]`.",
+            ]),
+            &mut ctx,
+        )
+        .unwrap();
+        write_command(
+            &svec(&[
+                "plansXv1/other.md",
+                "--title",
+                "Other",
+                "--frontmatter",
+                "status=draft",
+                "--content",
+                "## Body\nUnrelated content in plansXv1 linking back to [[plans_v1/alpha]].",
+            ]),
+            &mut ctx,
+        )
+        .unwrap();
+        write_command(
+            &svec(&[
+                "beta.md",
+                "--title",
+                "Beta",
+                "--content",
+                "## Details\nBeta details with enough text for searching.",
+            ]),
+            &mut ctx,
+        )
+        .unwrap();
+
+        // ls with underscore folder must only return `plans_v1/alpha.md`, NOT `plansXv1/other.md`
+        let ls_u = ls_command(&svec(&["plans_v1"]), &mut ctx).unwrap();
+        assert_eq!(ls_u["total"], 1);
+        assert_eq!(ls_u["files"][0]["path"], "plans_v1/alpha.md");
+
+        // ls string tag match & invalid --since error
+        let ls_tag = ls_command(&svec(&["--tag", "SINGLE_TAG"]), &mut ctx).unwrap();
+        assert_eq!(ls_tag["total"], 1);
+        assert!(ls_command(&svec(&["--since", "invalid"]), &mut ctx).is_err());
+
+        // ls --limit pagination note
+        let ls_lim = ls_command(&svec(&["--limit", "1"]), &mut ctx).unwrap();
+        assert_eq!(ls_lim["total"], 3);
+        assert_eq!(ls_lim["shown"], 1);
+        assert!(ls_lim.get("note").is_some());
+
+        // links command
+        let lnk = links_command(&svec(&["plans_v1/alpha.md"]), &mut ctx).unwrap();
+        assert_eq!(lnk["outboundCount"], 2);
+        assert_eq!(lnk["backlinkCount"], 1);
+
+        // related command: test graph + semantic score boundary (0.5)
+        let v_alpha = to_blob(&[1.0f32, 0.0, 0.0]);
+        let v_beta = to_blob(&[0.5f32, 0.8660254, 0.0]); // cosine == 0.5 with alpha (linked -> link+semantic)
+        let v_other = to_blob(&[0.9f32, 0.4358899, 0.0]); // cosine == 0.9 with alpha
+        ctx.db()
+            .unwrap()
+            .execute(
+                "UPDATE blocks SET embedding = ?1 WHERE path = 'plans_v1/alpha.md'",
+                params![v_alpha],
+            )
+            .unwrap();
+        ctx.db()
+            .unwrap()
+            .execute(
+                "UPDATE blocks SET embedding = ?1 WHERE path = 'beta.md'",
+                params![v_beta],
+            )
+            .unwrap();
+        ctx.db()
+            .unwrap()
+            .execute(
+                "UPDATE blocks SET embedding = ?1 WHERE path = 'plansXv1/other.md'",
+                params![v_other],
+            )
+            .unwrap();
+
+        let rel = related_command(&svec(&["plans_v1/alpha.md"]), &mut ctx).unwrap();
+        let rel_arr = rel["related"].as_array().unwrap();
+        assert_eq!(rel_arr.len(), 2);
+        let beta_rel = rel_arr.iter().find(|r| r["path"] == "beta.md").unwrap();
+        assert_eq!(beta_rel["via"], "link+semantic");
+
+        // Now set beta's cosine similarity to 0.4 (< 0.5) to kill `sem >= 0.5` -> `sem > 0.0` mutation,
+        // and verify bidirectional link (`link+backlink`) on other.md when alpha also links to other.md!
+        let v_beta_low = to_blob(&[0.4f32, 0.9165151, 0.0]);
+        ctx.db()
+            .unwrap()
+            .execute(
+                "UPDATE blocks SET embedding = ?1 WHERE path = 'beta.md'",
+                params![v_beta_low],
+            )
+            .unwrap();
+        let rel2 = related_command(&svec(&["plans_v1/alpha.md"]), &mut ctx).unwrap();
+        let rel2_arr = rel2["related"].as_array().unwrap();
+        let beta_rel2 = rel2_arr.iter().find(|r| r["path"] == "beta.md").unwrap();
+        assert_eq!(beta_rel2["via"], "link");
+
+        // related --limit 1
+        let rel_lim = related_command(&svec(&["plans_v1/alpha.md", "--limit", "1"]), &mut ctx).unwrap();
+        assert_eq!(rel_lim["shown"], 1);
+
+        // context command: test --limit 1 and --full
+        let ctx_lim = context_command(&svec(&["plans_v1/alpha.md", "--limit", "1", "--full"]), &mut ctx).unwrap();
+        assert_eq!(ctx_lim["connectedCount"], 1);
+
+        // doctor command: test healthy=false when only dangling (no orphans) vs only orphan (no dangling)
+        // Currently: alpha -> beta, other -> alpha (all 3 connected, 0 orphans), but alpha -> [[missing]] (1 dangling)
+        let doc_dangling_only = doctor_command(&[], &mut ctx).unwrap();
+        assert_eq!(doc_dangling_only["orphanCount"], 0);
+        assert_eq!(doc_dangling_only["danglingLinkCount"], 1);
+        assert_eq!(doc_dangling_only["healthy"], false);
+
+        // Self-linking orphan note (`self.md` linking only to `[[self]]`) must still be flagged as an orphan!
+        write_command(
+            &svec(&["self.md", "--content", "# Self\nLinks only to [[self]].\n"]),
+            &mut ctx,
+        )
+        .unwrap();
+        // Fix the dangling link by creating missing.md linking to beta
+        write_command(
+            &svec(&["missing.md", "--frontmatter", "status=ok", "--content", "Links to [[beta]].\n"]),
+            &mut ctx,
+        )
+        .unwrap();
+        let doc_orphan_only = doctor_command(&[], &mut ctx).unwrap();
+        assert_eq!(doc_orphan_only["danglingLinkCount"], 0);
+        assert_eq!(doc_orphan_only["orphanCount"], 1);
+        assert_eq!(doc_orphan_only["orphanNotes"][0], "self.md");
+        assert_eq!(doc_orphan_only["healthy"], false);
+
+        // Deleting self-linking note `self.md` must NOT warn about dangling links (only linked to itself)
+        let del_self = delete_command(&svec(&["self.md"]), &mut ctx).unwrap();
+        assert_eq!(del_self["deleted"], true);
+        assert!(del_self.get("warning").is_none());
+
+        // move command: rewrites links to beta.md -> archive/beta-new.md, preserving inline `[[beta]]`
+        let mv_same = move_command(&svec(&["beta.md", "beta.md"]), &mut ctx).unwrap();
+        assert_eq!(mv_same["changed"], false);
+
+        let mv = move_command(&svec(&["beta.md", "archive/beta-new.md"]), &mut ctx).unwrap();
+        assert_eq!(mv["changed"], true);
+        assert_eq!(mv["linksRewritten"], 2);
+        let alpha_raw = fs::read_to_string(dir.join("plans_v1").join("alpha.md")).unwrap();
+        assert!(alpha_raw.contains("[[beta-new#Details|Beta Alias]]"));
+        assert!(alpha_raw.contains("`[[beta]]`"));
+
+        // delete command: warns about incoming backlinks from plans_v1/alpha.md and missing.md
+        let del = delete_command(&svec(&["archive/beta-new.md"]), &mut ctx).unwrap();
+        assert_eq!(del["deleted"], true);
+        assert!(del.get("warning").is_some());
+        let del_again = delete_command(&svec(&["archive/beta-new.md"]), &mut ctx).unwrap();
+        assert_eq!(del_again["deleted"], false);
+
+        // search preview boundary (PREVIEW = 220 chars) and --limit 1 and --full
+        // "# S\n" (4 chars) + 216 'z's -> collapsed "# S zzz..." is 4 + 216 = 220 chars (not truncated)
+        // "## L\n" (5 chars) + 216 'q's -> collapsed "## L qqq..." is 5 + 216 = 221 chars (truncated with `…`)
+        let s220 = format!("# S\n{}\n\n## L\n{}\n", "z".repeat(216), "q".repeat(216));
+        write_command(&svec(&["preview-bound.md", "--content", &s220]), &mut ctx).unwrap();
+        let srch_220 = search_command(&svec(&["zzzzzz", "--mode", "fts"]), &mut ctx).unwrap();
+        let p_220 = srch_220["results"][0]["preview"].as_str().unwrap();
+        assert_eq!(p_220.chars().count(), 220);
+        assert!(!p_220.ends_with('…'));
+
+        let srch_221 = search_command(&svec(&["qqqqqq", "--mode", "fts"]), &mut ctx).unwrap();
+        let p_221 = srch_221["results"][0]["preview"].as_str().unwrap();
+        assert!(p_221.ends_with('…'));
+
+        let srch_221_full = search_command(&svec(&["qqqqqq", "--mode", "fts", "--full"]), &mut ctx).unwrap();
+        let p_221_full = srch_221_full["results"][0]["preview"].as_str().unwrap();
+        assert!(!p_221_full.ends_with('…'));
+
+        let srch_lim1 = search_command(&svec(&["plansXv1 OR beta", "--limit", "1"]), &mut ctx).unwrap();
+        assert_eq!(srch_lim1["shown"], 1);
+
+        // search validation errors
+        assert!(search_command(&[], &mut ctx).is_err());
+        assert!(search_command(&svec(&["alpha", "--mode", "bogus"]), &mut ctx).is_err());
+        assert!(search_command(&svec(&["alpha", "--since", "bogus"]), &mut ctx).is_err());
+
+        // MCP dispatch & tool definitions (including values starting with `--`)
+        let tools = tool_definitions();
+        assert_eq!(tools.as_array().unwrap().len(), 19);
+
+        let mcp_w = dispatch_mcp_tool(
+            "vault_write",
+            &json!({
+                "file": "mcp-note.md",
+                "title": "--Weird Title",
+                "content": "--force is a flag",
+                "frontmatter": {"status": "active"}
+            }),
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(mcp_w["action"], "created");
+
+        let mcp_r = dispatch_mcp_tool(
+            "vault_read",
+            &json!({"file": "mcp-note.md", "full": true}),
+            &mut ctx,
+        )
+        .unwrap();
+        assert!(mcp_r["content"].as_str().unwrap().contains("--force is a flag"));
+
+        // sync/register/login validation errors when unconfigured
+        assert!(register_command(&[], &mut ctx).is_err());
+        assert!(login_command(&[], &mut ctx).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_setup_and_sync_config_flows() {
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let home_dir = std::env::temp_dir().join(format!("vx-home-{}-{id}", std::process::id()));
+        let vault_dir = home_dir.join("my-vault");
+        let _ = fs::remove_dir_all(&home_dir);
+        fs::create_dir_all(&home_dir).unwrap();
+        std::env::set_var("VAULT_AXI_HOME", &home_dir);
+
+        let mut ctx = Ctx::with_vault(vault_dir.to_string_lossy().to_string());
+
+        let s_noop = setup_command(&[], &mut ctx).unwrap();
+        assert_eq!(s_noop["help"], "Nothing to do");
+
+        // sync when no remote is configured must return VALIDATION_ERROR
+        assert_eq!(
+            sync_command(&[], &mut ctx).unwrap_err().code,
+            "VALIDATION_ERROR"
+        );
+
+        // S3 without --endpoint must error
+        assert!(setup_command(&svec(&["--remote", "s3://bucket/prefix"]), &mut ctx).is_err());
+
+        // S3 with --endpoint succeeds
+        let s_s3 = setup_command(
+            &svec(&[
+                "--vault",
+                &vault_dir.to_string_lossy(),
+                "--remote",
+                "s3://my-bucket/notes",
+                "--endpoint",
+                "https://r2.example.com",
+                "--auto-sync=false",
+            ]),
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(s_s3["remote"], "s3");
+        assert_eq!(s_s3["autoSync"], false);
+
+        // Git remote setup
+        let s_git = setup_command(
+            &svec(&["--remote", "git:https://github.com/example/vault.git", "--branch", "main"]),
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(s_git["remote"], "git");
+
+        // MFA when not logged into cloud returns AUTH_ERROR
+        assert_eq!(
+            login_command(&svec(&["--mfa-enroll"]), &mut ctx)
+                .unwrap_err()
+                .code,
+            "AUTH_ERROR"
+        );
+
+        // matches_metadata_filter direct unit coverage
+        assert!(matches_metadata_filter(None, 100, None, None, Some(100)));
+        assert!(!matches_metadata_filter(None, 99, None, None, Some(100)));
+        assert!(!matches_metadata_filter(None, 100, Some("active"), None, None));
+        assert!(!matches_metadata_filter(Some("not-json"), 100, Some("active"), None, None));
+
+        let _ = fs::remove_dir_all(&home_dir);
+    }
     #[test]
     fn reconcile_indexes_resolves_links_and_prunes() {
         std::env::set_var("VAULT_AXI_NO_EMBED", "1");

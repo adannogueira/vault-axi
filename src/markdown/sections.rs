@@ -145,9 +145,10 @@ pub fn parse_doc(raw: &str) -> ParsedDoc {
 
     let mut frontmatter = None;
     let mut scan_start = 0;
-    if lines.first().map(|s| s.as_str()) == Some("---") {
+    if lines.first().map(|s| s.trim_end_matches([' ', '\t'])) == Some("---") {
         for (i, line) in lines.iter().enumerate().skip(1) {
-            if line == "---" || line == "..." {
+            let trimmed = line.trim_end_matches([' ', '\t']);
+            if trimmed == "---" || trimmed == "..." {
                 frontmatter = Some(Frontmatter {
                     start_line: 0,
                     end_line: i,
@@ -571,6 +572,36 @@ mod tests {
             sub.path,
             vec!["AXI Tool Scratch Test", "Design", "Sub-detail"]
         );
+        // Open Questions (level 2) comes after Sub-detail (level 3) and Design (level 2),
+        // so both Sub-detail and Design must be popped from the ancestor stack.
+        let oq = doc.headings.iter().find(|h| h.title == "Open Questions").unwrap();
+        assert_eq!(oq.path, vec!["AXI Tool Scratch Test", "Open Questions"]);
+
+        // Test H1 through H6 and ensure 7 hashes is not treated as a heading,
+        // and jumping from H6 back to H2 pops all deeper levels.
+        let deep = "# H1\n## H2a\n### H3\n#### H4\n##### H5\n###### H6\n####### Seven\n## H2b\n";
+        let deep_doc = parse_doc(deep);
+        let deep_titles: Vec<(&str, usize)> = deep_doc
+            .headings
+            .iter()
+            .map(|h| (h.title.as_str(), h.level))
+            .collect();
+        assert_eq!(
+            deep_titles,
+            vec![
+                ("H1", 1),
+                ("H2a", 2),
+                ("H3", 3),
+                ("H4", 4),
+                ("H5", 5),
+                ("H6", 6),
+                ("H2b", 2),
+            ]
+        );
+        let h6 = deep_doc.headings.iter().find(|h| h.title == "H6").unwrap();
+        assert_eq!(h6.path, vec!["H1", "H2a", "H3", "H4", "H5", "H6"]);
+        let h2b = deep_doc.headings.iter().find(|h| h.title == "H2b").unwrap();
+        assert_eq!(h2b.path, vec!["H1", "H2b"]);
 
         let raw = ["# Real", "", "```", "# not a heading", "```", "", "## Also Real", ""].join("\n");
         let doc2 = parse_doc(&raw);
@@ -688,5 +719,50 @@ mod tests {
         assert!(out_last
             .trim_end()
             .ends_with("## Open Questions\n- New only question"));
+    }
+
+    #[test]
+    fn double_colon_paths_ambiguous_headings_and_empty_section_edits() {
+        let doc = parse_doc(DOC);
+        // "::" separator works identically to "/"
+        let s = resolve_section(&doc, "Design::Sub-detail").unwrap();
+        assert_eq!(s.heading.title, "Sub-detail");
+        assert!(find_headings(&doc, "").is_empty());
+        assert!(find_headings(&doc, "A/B/C/D/E").is_empty());
+
+        // Ambiguous headings under different parents
+        let ambig_doc = parse_doc("# P1\n## Notes\nA\n# P2\n## Notes\nB\n");
+        let err = resolve_section(&ambig_doc, "Notes").unwrap_err();
+        assert_eq!(err.kind, SectionErrorKind::Ambiguous);
+        assert_eq!(resolve_section(&ambig_doc, "P1/Notes").unwrap().body, "A");
+        assert_eq!(resolve_section(&ambig_doc, "P2/Notes").unwrap().body, "B");
+
+        // Append/prepend into an initially empty section
+        let empty_sec = "# Top\n## Empty\n\n## Next\nText\n";
+        let ap = edit_section(empty_sec, "Empty", SectionMode::Append, "Added").unwrap();
+        assert_eq!(ap, "# Top\n## Empty\nAdded\n\n## Next\nText\n");
+        let pr = edit_section(empty_sec, "Empty", SectionMode::Prepend, "First").unwrap();
+        assert_eq!(pr, "# Top\n## Empty\nFirst\n\n## Next\nText\n");
+
+        // Trailing hashes stripped from heading title
+        let hashed = "## Heading With Closing Hashes ###   \nBody\n";
+        let p_hashed = parse_doc(hashed);
+        assert_eq!(p_hashed.headings[0].title, "Heading With Closing Hashes");
+
+        // Empty anchor error
+        let empty_anc = replace_anchor(DOC, "", "x").unwrap_err();
+        assert_eq!(empty_anc.kind, SectionErrorKind::NotFound);
+
+        // Prepend on doc without frontmatter and empty block no-ops
+        assert_eq!(
+            prepend_to_doc("# H\nBody\n", "Top"),
+            "Top\n\n# H\nBody\n"
+        );
+        assert_eq!(prepend_to_doc("# H\n", "   "), "# H\n");
+        assert_eq!(append_to_doc("# H\n", "   "), "# H\n");
+        assert_eq!(
+            insert_at_heading("# H\n", "H", HeadingAnchor::AfterHeading, "  ").unwrap(),
+            "# H\n"
+        );
     }
 }

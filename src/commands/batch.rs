@@ -24,7 +24,9 @@ pub enum BatchOperation {
         content: String,
     },
     Anchor {
+        #[serde(alias = "anchor")]
         old_str: String,
+        #[serde(alias = "replace")]
         new_str: String,
     },
     Frontmatter {
@@ -130,10 +132,24 @@ pub fn batch_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
                 cur = replace_anchor(&cur, old_str, new_str).map_err(|e| map_sec_err(step, e))?;
             }
             BatchOperation::Frontmatter { key, value } => {
+                let trimmed_key = key.trim();
+                if trimmed_key.is_empty()
+                    || trimmed_key.contains(':')
+                    || trimmed_key.contains('\n')
+                    || trimmed_key.contains('\r')
+                {
+                    return Err(AxiError::new(
+                        format!("Batch op #{step}: invalid frontmatter key '{key}'"),
+                        "VALIDATION_ERROR",
+                        vec![],
+                    ));
+                }
                 cur = match value {
-                    None | Some(Value::Null) => unset_frontmatter_field(&cur, key),
-                    Some(Value::String(s)) => set_frontmatter_field(&cur, key, &coerce_value(s)),
-                    Some(v) => set_frontmatter_field(&cur, key, v),
+                    None | Some(Value::Null) => unset_frontmatter_field(&cur, trimmed_key),
+                    Some(Value::String(s)) => {
+                        set_frontmatter_field(&cur, trimmed_key, &coerce_value(s))
+                    }
+                    Some(v) => set_frontmatter_field(&cur, trimmed_key, v),
                 };
             }
             BatchOperation::Insert {

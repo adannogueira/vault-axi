@@ -128,3 +128,27 @@ pub fn install_session_start_hooks(marker: &str) -> Result<String, String> {
     fs::write(&settings_path, format!("{formatted}\n")).map_err(|e| e.to_string())?;
     Ok(command)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_exit_codes_and_display() {
+        let v_err = AxiError::new("bad arg", "VALIDATION_ERROR", vec!["help1".to_string()]);
+        assert_eq!(v_err.exit_code(), 2);
+        assert_eq!(format!("{v_err}"), "[VALIDATION_ERROR] bad arg");
+
+        let u_err = AxiError::new("bad usage", "USAGE_ERROR", vec![]);
+        assert_eq!(u_err.exit_code(), 2);
+
+        let unk_err = AxiError::new("no cmd", "UNKNOWN_COMMAND", vec![]);
+        assert_eq!(unk_err.exit_code(), 2);
+
+        let nf_err = AxiError::new("missing", "NOT_FOUND", vec![]);
+        assert_eq!(nf_err.exit_code(), 1);
+
+        let int_err = AxiError::new("boom", "INTERNAL_ERROR", vec![]);
+        assert_eq!(int_err.exit_code(), 1);
+    }
+}

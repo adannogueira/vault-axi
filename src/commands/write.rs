@@ -61,6 +61,13 @@ pub fn write_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
     }
 
     for (key, val) in fm_pairs {
+        if key.is_empty() || key.contains(':') || key.contains('\n') || key.contains('\r') {
+            return Err(AxiError::new(
+                format!("Invalid frontmatter key: \"{key}\""),
+                "VALIDATION_ERROR",
+                vec!["Use --frontmatter key=value".to_string()],
+            ));
+        }
         if let Some(v) = val {
             content = set_frontmatter_field(&content, &key, &coerce_value(&v));
         }

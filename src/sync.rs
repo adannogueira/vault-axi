@@ -1052,3 +1052,38 @@ fn verify_mfa_totp(
 
     Ok((new_access, new_refresh))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::open_db_at;
+
+    #[test]
+    fn urlencoding_and_sha1_and_sync_table_helpers() {
+        assert_eq!(
+            urlencoding_simple("plans/my task#1?.md"),
+            "plans/my%20task%231%3F.md"
+        );
+        assert_eq!(
+            sha1_hex("abc"),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        let db = open_db_at(":memory:").unwrap();
+        ensure_sync_table(&db);
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM sync_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // VAULT_AXI_NO_SYNC=1 short-circuits auto_pull_if_needed and auto_push_if_needed
+        std::env::set_var("VAULT_AXI_NO_SYNC", "1");
+        assert!(auto_pull_if_needed(&db, ".", true).is_none());
+        assert!(auto_push_if_needed(&db, ".").is_none());
+
+        // login_hosted without email/password or token returns VALIDATION_ERROR
+        let err = login_hosted(Some("user@example.com"), None, None, None, None).unwrap_err();
+        assert_eq!(err.code, "VALIDATION_ERROR");
+        let err2 = login_hosted(None, Some("secret"), None, None, None).unwrap_err();
+        assert_eq!(err2.code, "VALIDATION_ERROR");
+    }
+}

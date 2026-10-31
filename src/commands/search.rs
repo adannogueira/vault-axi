@@ -1,6 +1,6 @@
 use crate::args::{flag_bool, flag_int, flag_string, parse_args};
 use crate::axi::AxiError;
-use crate::commands::ls::{matches_metadata_filter, parse_since_ms};
+use crate::commands::ls::{matches_metadata_filter, normalize_dir_filter, parse_since_ms};
 use crate::context::Ctx;
 use crate::index::query::{block_by_id, breadcrumb, fts_search, rrf_fuse, semantic_search};
 use crate::index::reconcile::ReconcileOpts;
@@ -25,11 +25,28 @@ pub fn search_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
         ));
     }
     let mode = flag_string(&parsed.flags, "mode").unwrap_or_else(|| "hybrid".to_string());
+    if mode != "hybrid" && mode != "fts" && mode != "semantic" {
+        return Err(AxiError::new(
+            format!("Invalid --mode \"{mode}\" (use hybrid, fts, or semantic)"),
+            "VALIDATION_ERROR",
+            vec![],
+        ));
+    }
     let limit = flag_int(&parsed.flags, "limit", 8).max(1) as usize;
-    let folder = flag_string(&parsed.flags, "folder");
+    let folder = flag_string(&parsed.flags, "folder").and_then(|f| normalize_dir_filter(&f));
     let status_filter = flag_string(&parsed.flags, "status");
     let tag_filter = flag_string(&parsed.flags, "tag");
-    let since_ms = flag_string(&parsed.flags, "since").and_then(|s| parse_since_ms(&s));
+    let since_ms = if let Some(s) = flag_string(&parsed.flags, "since") {
+        Some(parse_since_ms(&s).ok_or_else(|| {
+            AxiError::new(
+                format!("Invalid --since value: \"{s}\" (use e.g. 7d, 24h, 2w, or YYYY-MM-DD)"),
+                "VALIDATION_ERROR",
+                vec![],
+            )
+        })?)
+    } else {
+        None
+    };
     let full = flag_bool(&parsed.flags, "full");
 
     ctx.sync(ReconcileOpts {
