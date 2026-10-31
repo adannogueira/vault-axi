@@ -103,6 +103,7 @@ pub fn detect_eol(raw: &str) -> &'static str {
 }
 
 pub fn split_lines(raw: &str) -> (Vec<String>, &'static str, bool) {
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     let eol = detect_eol(raw);
     let trailing_newline = raw.ends_with("\r\n") || raw.ends_with('\n');
     let mut lines: Vec<String> = Vec::new();
@@ -207,35 +208,52 @@ pub fn parse_doc(raw: &str) -> ParsedDoc {
     }
 }
 
-fn segments(path: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for part in path.split('/') {
-        for sub in part.split("::") {
-            let trimmed = sub.trim();
-            if !trimmed.is_empty() {
-                out.push(trimmed.to_string());
-            }
+fn matches_lower_tail(tail: &[String], query: &str) -> bool {
+    let q = query.trim();
+    if tail.is_empty() || q.is_empty() {
+        return false;
+    }
+    if tail.len() == 1 {
+        return tail[0] == q;
+    }
+    let first = &tail[0];
+    let Some(rest) = q.strip_prefix(first.as_str()) else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    if let Some(after_colons) = rest.strip_prefix("::") {
+        let cleaned = after_colons.trim_start_matches([':', ' ', '\t']);
+        if matches_lower_tail(&tail[1..], cleaned) {
+            return true;
         }
     }
-    out
+    if let Some(after_slash) = rest.strip_prefix('/') {
+        let cleaned = after_slash.trim_start_matches(['/', ' ', '\t']);
+        if matches_lower_tail(&tail[1..], cleaned) {
+            return true;
+        }
+    }
+    false
 }
 
 /// All headings whose ancestor chain ends with the given path segments (case-insensitive).
+/// Supports headings whose titles themselves contain `/` or `::` (e.g. `#### Usuários / Labels`
+/// or `--section "Multi Tenant/Usuários / Labels"`).
 pub fn find_headings(doc: &ParsedDoc, path: &str) -> Vec<Heading> {
-    let segs: Vec<String> = segments(path).into_iter().map(|s| s.to_lowercase()).collect();
-    if segs.is_empty() {
+    let q_raw = path.trim().to_lowercase();
+    let q_stripped = path.trim().trim_matches('/').trim().to_lowercase();
+    if q_raw.is_empty() && q_stripped.is_empty() {
         return Vec::new();
     }
     doc.headings
         .iter()
         .filter(|h| {
-            if segs.len() > h.path.len() {
-                return false;
-            }
-            let tail = &h.path[h.path.len() - segs.len()..];
-            tail.iter()
-                .zip(segs.iter())
-                .all(|(t, s)| t.to_lowercase() == *s)
+            let h_lower: Vec<String> = h.path.iter().map(|s| s.trim().to_lowercase()).collect();
+            (0..h_lower.len()).any(|start| {
+                let tail = &h_lower[start..];
+                matches_lower_tail(tail, &q_raw)
+                    || (!q_stripped.is_empty() && matches_lower_tail(tail, &q_stripped))
+            })
         })
         .cloned()
         .collect()
@@ -764,5 +782,20 @@ mod tests {
             insert_at_heading("# H\n", "H", HeadingAnchor::AfterHeading, "  ").unwrap(),
             "# H\n"
         );
+
+        // Headings whose titles contain `/` (e.g. "#### Usuários / Labels") must resolve
+        // both by bare title and by parent/child path
+        let slash_doc = parse_doc(
+            "# Supabase\n## Multi Tenant\n#### Usuários / Labels\nConteúdo de usuários e labels.\n",
+        );
+        let s1 = resolve_section(&slash_doc, "Usuários / Labels").unwrap();
+        assert_eq!(s1.heading.title, "Usuários / Labels");
+        assert_eq!(s1.body, "Conteúdo de usuários e labels.");
+
+        let s2 = resolve_section(&slash_doc, "Multi Tenant/Usuários / Labels").unwrap();
+        assert_eq!(s2.heading.title, "Usuários / Labels");
+
+        let s3 = resolve_section(&slash_doc, "Multi Tenant::Usuários / Labels").unwrap();
+        assert_eq!(s3.heading.title, "Usuários / Labels");
     }
 }

@@ -68,6 +68,12 @@ pub fn search_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
         mode.clone()
     };
 
+    let fts_empty = fts.is_empty();
+    let top_sem_score = vec_hits
+        .as_ref()
+        .and_then(|vh| vh.first().map(|h| h.score))
+        .unwrap_or(0.0);
+
     let mut ordered_ids: Vec<i64> = Vec::new();
     let mut score_by_id: HashMap<i64, f64> = HashMap::new();
 
@@ -170,6 +176,9 @@ pub fn search_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
             "note".to_string(),
             json!("Embeddings unavailable — fell back to FTS5. Run `vault reindex`."),
         );
+    }
+    if fts_empty && effective_mode != "fts" && top_sem_score < 0.62 {
+        out.insert("relevance".to_string(), json!("low"));
     }
     out.insert("shown".to_string(), json!(results.len()));
     out.insert("results".to_string(), Value::Array(results));

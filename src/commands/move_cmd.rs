@@ -128,6 +128,19 @@ pub fn move_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
         }
     }
 
+    // Force-invalidate index entries for touched files and update link target_path
+    // so sequential renames within the same millisecond never use stale link targets.
+    if let Ok(db) = ctx.db() {
+        let _ = db.execute(
+            "UPDATE links SET target_path = ?1 WHERE target_path = ?2",
+            params![new_path, old_path],
+        );
+        for t_path in &touched {
+            let _ = db.execute("DELETE FROM files WHERE path = ?1", params![t_path]);
+        }
+        let _ = db.execute("DELETE FROM files WHERE path = ?1", params![new_path]);
+    }
+
     ctx.sync_after_mutation()?;
 
     let files_touched = if touched.is_empty() {

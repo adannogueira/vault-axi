@@ -18,6 +18,7 @@ pub struct FrontmatterResult {
 
 /// Parse a leading YAML frontmatter block. Returns None data when absent.
 pub fn read_frontmatter(raw: &str) -> FrontmatterResult {
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     let Some(caps) = frontmatter_re().captures(raw) else {
         return FrontmatterResult {
             data: None,
@@ -61,7 +62,18 @@ pub fn coerce_value(value: &str) -> Value {
         Ok(Value::Object(_)) if !trimmed.starts_with('{') => Value::String(value.to_string()),
         Ok(Value::Array(_)) if !trimmed.starts_with('[') => Value::String(value.to_string()),
         Ok(v) => v,
-        Err(_) => Value::String(value.to_string()),
+        Err(_) => {
+            if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                let items: Vec<Value> = inner
+                    .split(',')
+                    .map(|item| item.trim().trim_matches(['"', '\'']).to_string())
+                    .filter(|s| !s.is_empty())
+                    .map(Value::String)
+                    .collect();
+                return Value::Array(items);
+            }
+            Value::String(value.to_string())
+        }
     }
 }
 

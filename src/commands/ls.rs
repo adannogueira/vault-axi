@@ -58,6 +58,14 @@ pub fn normalize_dir_filter(raw_dir: &str) -> Option<String> {
     }
 }
 
+fn normalize_tag_token(t: &str) -> &str {
+    t.trim()
+        .trim_matches(['[', ']', '"', '\''])
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+}
+
 pub fn matches_metadata_filter(
     fm_str: Option<&str>,
     mtime_ms: i64,
@@ -88,15 +96,26 @@ pub fn matches_metadata_filter(
     }
 
     if let Some(expected_tag) = tag_filter {
-        let has_tag = match fm.get("tags") {
-            Some(Value::Array(arr)) => arr.iter().any(|t| {
-                t.as_str()
-                    .map(|s| s.eq_ignore_ascii_case(expected_tag))
-                    .unwrap_or(false)
-            }),
-            Some(Value::String(st)) => st.eq_ignore_ascii_case(expected_tag),
-            _ => false,
+        let expected_norm = normalize_tag_token(expected_tag);
+        let matches_value = |val: &Value| -> bool {
+            match val {
+                Value::Array(arr) => arr.iter().any(|t| {
+                    t.as_str()
+                        .map(|s| normalize_tag_token(s).eq_ignore_ascii_case(expected_norm))
+                        .unwrap_or(false)
+                }),
+                Value::String(st) => {
+                    normalize_tag_token(st).eq_ignore_ascii_case(expected_norm)
+                        || st
+                            .split([',', ' ', '\t'])
+                            .map(normalize_tag_token)
+                            .any(|tok| !tok.is_empty() && tok.eq_ignore_ascii_case(expected_norm))
+                }
+                _ => false,
+            }
         };
+        let has_tag = fm.get("tags").map(matches_value).unwrap_or(false)
+            || fm.get("tag").map(matches_value).unwrap_or(false);
         if !has_tag {
             return false;
         }

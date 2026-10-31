@@ -143,6 +143,14 @@ pub fn resolve_content(flags: &HashMap<String, FlagValue>) -> Result<String, Axi
     })
 }
 
+fn strip_utf8_bom(s: String) -> String {
+    if let Some(stripped) = s.strip_prefix('\u{feff}') {
+        stripped.to_string()
+    } else {
+        s
+    }
+}
+
 /// Like [`resolve_content`], but returns `Ok(None)` when no content source was given,
 /// while still surfacing real errors (e.g. a missing `--from` file).
 pub fn resolve_optional_content(
@@ -150,7 +158,7 @@ pub fn resolve_optional_content(
 ) -> Result<Option<String>, AxiError> {
     if let Some(from) = flag_string(flags, "from") {
         if from == "-" {
-            return Ok(Some(read_stdin()));
+            return Ok(Some(strip_utf8_bom(read_stdin())));
         }
         let path = PathBuf::from(&from);
         if !path.is_file() {
@@ -160,22 +168,25 @@ pub fn resolve_optional_content(
                 vec!["Pass a path to a file whose contents become the note body".to_string()],
             ));
         }
-        return fs::read_to_string(&path).map(Some).map_err(|e| {
-            AxiError::new(
-                format!("Failed to read --from file {from}: {e}"),
-                "VALIDATION_ERROR",
-                vec![],
-            )
-        });
+        return fs::read_to_string(&path)
+            .map(strip_utf8_bom)
+            .map(Some)
+            .map_err(|e| {
+                AxiError::new(
+                    format!("Failed to read --from file {from}: {e}"),
+                    "VALIDATION_ERROR",
+                    vec![],
+                )
+            });
     }
     if let Some(content) = flag_string(flags, "content") {
         if content != "-" {
-            return Ok(Some(content));
+            return Ok(Some(strip_utf8_bom(content)));
         }
-        return Ok(Some(read_stdin()));
+        return Ok(Some(strip_utf8_bom(read_stdin())));
     }
     if flag_bool(flags, "stdin") {
-        return Ok(Some(read_stdin()));
+        return Ok(Some(strip_utf8_bom(read_stdin())));
     }
     Ok(None)
 }

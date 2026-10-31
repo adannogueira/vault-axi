@@ -198,6 +198,42 @@ pub fn reconcile(db: &mut Connection, vault_root: &str, opts: ReconcileOpts) -> 
         }
     }
 
+    // Whenever files are added, moved, or removed, re-resolve `target_path` across all
+    // links so untouched referrer files (whose mtime did not change) always point to the
+    // current target paths.
+    if result.indexed > 0 || result.removed > 0 || opts.force {
+        let mut all_links: Vec<(i64, String, Option<String>)> = Vec::new();
+        if let Ok(mut stmt) = db.prepare("SELECT id, target_raw, target_path FROM links") {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            }) {
+                all_links = rows.flatten().collect();
+            }
+        }
+        if !all_links.is_empty() {
+            if let Ok(tx) = db.transaction() {
+                for (link_id, target_raw, prev_target) in all_links {
+                    let bracketed = format!("[[{target_raw}]]");
+                    let parsed = parse_wiki_links(&bracketed);
+                    let new_target = parsed
+                        .first()
+                        .and_then(|wl| resolve_link_target(&wl.target, &paths, &basename_index));
+                    if new_target != prev_target {
+                        let _ = tx.execute(
+                            "UPDATE links SET target_path = ?1 WHERE id = ?2",
+                            params![new_target, link_id],
+                        );
+                    }
+                }
+                let _ = tx.commit();
+            }
+        }
+    }
+
     if with_embeddings {
         let mut pending: Vec<(i64, String)> = Vec::new();
         if let Ok(mut stmt) =
@@ -1222,6 +1258,126 @@ mod tests {
         let third = reconcile(&mut db, &vault, ReconcileOpts::default());
         assert_eq!(third.updated, 1);
         assert_eq!(third.removed, 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_bom_batch_hash_tag_filter_and_sequential_moves() {
+        std::env::set_var("VAULT_AXI_NO_EMBED", "1");
+        std::env::set_var("VAULT_AXI_NO_SYNC", "1");
+
+        let dir = std::env::temp_dir().join(format!(
+            "vault_axi_v1_findings_test_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("f1")).unwrap();
+
+        let vault = dir.to_string_lossy().to_string();
+        let db = open_db_at(":memory:").unwrap();
+        let mut ctx = crate::context::Ctx::with_vault_and_db(&vault, db);
+
+        // 1. Create a note with `#work` tag and a heading containing `/`
+        crate::commands::write::write_command(
+            &[
+                "Supabase.md".to_string(),
+                "--frontmatter".to_string(),
+                "tags=[#work, #backend]".to_string(),
+                "--content".to_string(),
+                "# Supabase\n\n## Multi Tenant\n\n#### Usuários / Labels\nOld body\n".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+
+        // 2. Tag filtering matches both `--tag work` and `--tag "#work"`
+        let ls_plain = crate::commands::ls::ls_command(
+            &["--tag".to_string(), "work".to_string()],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(ls_plain["total"], 1);
+
+        let ls_hash = crate::commands::ls::ls_command(
+            &["--tag".to_string(), "#work".to_string()],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(ls_hash["total"], 1);
+
+        // 3. UTF-8 BOM in `--from ops.json` for `vault batch` + section with `/`
+        let ops_file = dir.join("ops_bom.json");
+        let bom_ops = "\u{feff}[{\"op\":\"section\",\"heading\":\"Multi Tenant/Usuários / Labels\",\"mode\":\"replace\",\"content\":\"New body via BOM batch\"}]";
+        fs::write(&ops_file, bom_ops).unwrap();
+
+        let batch_res = crate::commands::batch::batch_command(
+            &[
+                "Supabase.md".to_string(),
+                "--from".to_string(),
+                ops_file.to_string_lossy().to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(batch_res["changed"], true);
+
+        let read_sec = crate::commands::read::read_command(
+            &[
+                "Supabase.md".to_string(),
+                "--section".to_string(),
+                "Usuários / Labels".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            read_sec["content"],
+            "#### Usuários / Labels\nNew body via BOM batch"
+        );
+
+        // 4. Sequential `vault move` where Move 1 changes folder (referrer text `[[target]]` unchanged)
+        // and Move 2 renames the note (must still find referrer and rewrite `[[target]]` -> `[[renamed]]`)
+        crate::commands::write::write_command(
+            &[
+                "f1/target.md".to_string(),
+                "--content".to_string(),
+                "# Target\nBody\n".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        crate::commands::write::write_command(
+            &[
+                "referrer.md".to_string(),
+                "--content".to_string(),
+                "# Referrer\nSee [[target]] for details.\n".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+
+        // Move 1: f1/target.md -> f2/target.md (basename is still `target`, so referrer.md mtime doesn't change)
+        let m1 = crate::commands::move_cmd::move_command(
+            &["f1/target.md".to_string(), "f2/target.md".to_string()],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(m1["referrers"], 1);
+        assert_eq!(m1["linksRewritten"], 0);
+
+        // Move 2: f2/target.md -> f2/renamed.md (must detect referrer.md and rewrite [[target]] -> [[renamed]])
+        let m2 = crate::commands::move_cmd::move_command(
+            &["f2/target.md".to_string(), "f2/renamed.md".to_string()],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(m2["referrers"], 1);
+        assert_eq!(m2["linksRewritten"], 1);
+
+        let ref_after = fs::read_to_string(dir.join("referrer.md")).unwrap();
+        assert!(ref_after.contains("[[renamed]]"));
 
         let _ = fs::remove_dir_all(&dir);
     }

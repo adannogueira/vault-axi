@@ -78,7 +78,8 @@ pub fn batch_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
         resolve_content(&parsed.flags)?
     };
 
-    let ops: Vec<BatchOperation> = serde_json::from_str(&raw_ops).map_err(|e| {
+    let ops_clean = raw_ops.trim_start_matches('\u{feff}');
+    let ops: Vec<BatchOperation> = serde_json::from_str(ops_clean).map_err(|e| {
         AxiError::new(
             format!("Invalid JSON operations array: {e}"),
             "VALIDATION_ERROR",

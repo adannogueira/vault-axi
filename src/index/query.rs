@@ -70,6 +70,10 @@ pub fn fts_search(db: &Connection, query: &str, limit: usize) -> Vec<Hit> {
         .collect()
 }
 
+/// Minimum cosine similarity threshold for `bge-micro-v2` semantic search hits
+/// so completely unrelated queries do not return random noise notes.
+pub const MIN_SEMANTIC_SCORE: f64 = 0.55;
+
 /// Semantic search over stored block vectors. Returns None if embeddings unavailable.
 pub fn semantic_search(db: &Connection, query: &str, limit: usize) -> Option<Vec<Hit>> {
     init_embedder();
@@ -78,7 +82,11 @@ pub fn semantic_search(db: &Connection, query: &str, limit: usize) -> Option<Vec
     }
     let vecs = embed(&[query.to_string()])?;
     let qvec = vecs.first()?;
-    Some(rank_by_vector(db, qvec, limit))
+    let hits: Vec<Hit> = rank_by_vector(db, qvec, limit)
+        .into_iter()
+        .filter(|h| h.score >= MIN_SEMANTIC_SCORE)
+        .collect();
+    Some(hits)
 }
 
 pub fn rank_by_vector(db: &Connection, qvec: &[f32], limit: usize) -> Vec<Hit> {
