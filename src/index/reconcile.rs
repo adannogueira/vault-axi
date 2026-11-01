@@ -1171,6 +1171,7 @@ mod tests {
         assert!(!matches_metadata_filter(Some("not-json"), 100, Some("active"), None, None));
 
         let _ = fs::remove_dir_all(&home_dir);
+        std::env::remove_var("VAULT_AXI_HOME");
     }
     #[test]
     fn reconcile_indexes_resolves_links_and_prunes() {

@@ -61,7 +61,8 @@ pub fn resolve_in_vault(vault_root: &str, rel_path: &str) -> Result<String, Stri
     if rel_path.contains('\0') {
         return Err("Invalid note path: contains null byte".to_string());
     }
-    let clean = rel_path.trim().trim_start_matches(['/', '\\']);
+    let normalized = rel_path.trim().replace('\\', "/");
+    let clean = normalized.trim_start_matches('/');
     if clean.is_empty() {
         return Err(format!("Path escapes the vault: {rel_path}"));
     }

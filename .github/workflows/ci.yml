@@ -30,4 +30,4 @@ jobs:
           key: ${{ matrix.os }}
 
       - name: Run test suite
-        run: cargo test --verbose
+        run: cargo test --verbose -- --nocapture
