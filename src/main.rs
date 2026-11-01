@@ -23,7 +23,7 @@ use crate::commands::{
 use crate::context::Ctx;
 use std::io::{self, Write};
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DESCRIPTION: &str = "Read, edit, and search an Obsidian markdown vault — built for agents.";
 
 const TOP_LEVEL_HELP: &str = r#"Read, edit, and search an Obsidian markdown vault — built for agents.

@@ -1,6 +1,6 @@
 [package]
 name = "vault-axi"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Agent-ergonomic (AXI) CLI for reading, editing, and searching an Obsidian markdown vault."
 license = "MIT"

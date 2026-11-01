@@ -51,7 +51,7 @@ pub fn mcp_command() -> Result<Value, AxiError> {
                     },
                     "serverInfo": {
                         "name": "vault-axi",
-                        "version": "0.1.0"
+                        "version": env!("CARGO_PKG_VERSION")
                     }
                 }
             }),
