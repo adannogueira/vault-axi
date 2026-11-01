@@ -56,6 +56,30 @@ pub fn related_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
         }
     }
 
+    // 2-hop graph proximity: co-citation (shared incoming hub) and bibliographic coupling (shared outbound target)
+    let mut co_linked: HashSet<String> = HashSet::new();
+    if let Ok(mut stmt) = db.prepare(
+        r#"
+        SELECT DISTINCT l2.src_path
+        FROM links l1
+        JOIN links l2 ON l1.target_path = l2.target_path
+        WHERE l1.src_path = ?1 AND l1.target_path IS NOT NULL AND l2.src_path != ?1
+        UNION
+        SELECT DISTINCT l2.target_path
+        FROM links l1
+        JOIN links l2 ON l1.src_path = l2.src_path
+        WHERE l1.target_path = ?1 AND l2.target_path IS NOT NULL AND l2.target_path != ?1
+        "#,
+    ) {
+        if let Ok(rows) = stmt.query_map(params![note_path], |r| r.get::<_, String>(0)) {
+            for p in rows.flatten() {
+                if !outbound.contains(&p) && !backlinks.contains(&p) {
+                    co_linked.insert(p);
+                }
+            }
+        }
+    }
+
     let mut semantic: HashMap<String, f32> = HashMap::new();
     let qvec = file_mean_vector(db, &note_path);
     if let Some(ref qv) = qvec {
@@ -79,13 +103,18 @@ pub fn related_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
     let mut candidates: HashSet<String> = HashSet::new();
     candidates.extend(outbound.iter().cloned());
     candidates.extend(backlinks.iter().cloned());
-    candidates.extend(semantic.keys().cloned());
+    candidates.extend(co_linked.iter().cloned());
+    for (p, &s) in &semantic {
+        if s >= 0.14 {
+            candidates.insert(p.clone());
+        }
+    }
 
     struct ScoredRow {
         path: String,
         title: Option<String>,
         via: String,
-        linked: bool,
+        hop_rank: u8,
         score: f64,
     }
 
@@ -99,9 +128,13 @@ pub fn related_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
             if backlinks.contains(&path) {
                 via.push("backlink");
             }
+            if co_linked.contains(&path) {
+                via.push("co-linked");
+            }
             let sem = semantic.get(&path).copied().unwrap_or(0.0);
-            let linked = outbound.contains(&path) || backlinks.contains(&path);
-            if sem > 0.0 && (!linked || sem >= 0.5) {
+            let direct_linked = outbound.contains(&path) || backlinks.contains(&path);
+            let two_hop_linked = co_linked.contains(&path);
+            if sem >= 0.14 && (!direct_linked && !two_hop_linked || sem >= 0.5) {
                 via.push("semantic");
             }
             let title: Option<String> = db
@@ -119,20 +152,27 @@ pub fn related_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
             } else {
                 via.join("+")
             };
+            let hop_rank = if direct_linked {
+                2
+            } else if two_hop_linked {
+                1
+            } else {
+                0
+            };
             let rounded = ((sem as f64) * 10000.0).round() / 10000.0;
             ScoredRow {
                 path,
                 title,
                 via: via_str,
-                linked,
+                hop_rank,
                 score: rounded,
             }
         })
         .collect();
 
     scored.sort_by(|a, b| {
-        b.linked
-            .cmp(&a.linked)
+        b.hop_rank
+            .cmp(&a.hop_rank)
             .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
     });
     scored.truncate(limit);
@@ -153,7 +193,7 @@ pub fn related_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
                 m.insert("title".to_string(), json!(t));
             }
             m.insert("via".to_string(), json!(r.via));
-            m.insert("linked".to_string(), json!(r.linked));
+            m.insert("linked".to_string(), json!(r.hop_rank > 0));
             m.insert("score".to_string(), json!(r.score));
             Value::Object(m)
         })

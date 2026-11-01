@@ -6,7 +6,7 @@ and searching an Obsidian markdown vault, compiled to a single standalone Rust b
 - **Zero-config Hosted Cloud + Self-Hosted Sync.** Register or sign in with `vault register` / `vault login` (with optional TOTP MFA) on our hosted multi-tenant cloud for instant automatic sync, or point `--remote` at a **Git** repository or **S3 / Cloudflare R2** bucket.
 - **First-Class Task Build Logs (`vault log`).** Append timestamped entries with any custom `--kind <label>` directly into a task note's `## Build Log` section (`vault log plans/my-task.md "..." [--kind <label>] [--section <heading>]`)—safe across concurrent multi-tab sessions with zero global state collisions.
 - **Partial Reads & 1-Call Context.** Fetch just the outline, one `## section`, frontmatter, a line range, or a full `vault context` bundle (target note + connected `[[wikilink]]` outlines and previews).
-- **Fast Hybrid Search & Content-Addressable Embedding Cache.** SQLite **FTS5** keyword + **local semantic embeddings** (`TaylorAI/bge-micro-v2` via Hugging Face Candle) + `[[wikilink]]` graph fused with RRF. Unchanged sections keep their cached embeddings across edits.
+- **Fast Multilingual Hybrid Search & Graph Discovery.** Combines SQLite **FTS5** (`unicode61` diacritic-folding + weighted BM25) + **zero-dependency multilingual stem/cognate/subword vectors** + 1-hop & 2-hop `[[wikilink]]` graph proximity fused with RRF. Works 100% offline.
 - **Built-in MCP Server (`vault mcp`).** Run `vault mcp` to expose the entire toolset over stdio JSON-RPC for Claude Desktop, Cursor, or any MCP client.
 
 ## Install
@@ -53,7 +53,7 @@ vault token create --name "agent-container"   # prints vlt_... API key
 ```bash
 vault setup --vault ~/Documents/obsidian-vault/Vault
 vault setup --remote git:git@github.com:you/vault.git   # optional automatic Git sync
-vault reindex            # first run downloads the embedding model (~one-time; or --no-embed)
+vault reindex            # builds FTS5 + multilingual vector & wikilink index instantly
 vault setup hooks        # optional: load the dashboard at Claude Code session start
 ```
 

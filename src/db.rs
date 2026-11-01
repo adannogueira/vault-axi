@@ -58,7 +58,7 @@ fn migrate(db: &Connection) -> rusqlite::Result<()> {
           heading_path,
           content='blocks',
           content_rowid='id',
-          tokenize='porter unicode61'
+          tokenize='porter unicode61 remove_diacritics 2'
         );
 
         CREATE TRIGGER IF NOT EXISTS blocks_ai AFTER INSERT ON blocks BEGIN
@@ -89,10 +89,42 @@ fn migrate(db: &Connection) -> rusqlite::Result<()> {
           path          TEXT PRIMARY KEY,
           remote_hash   TEXT NOT NULL,
           remote_mtime  INTEGER NOT NULL,
-          synced_at     INTEGER NOT NULL
+          synced_at     INTEGER NOT NULL,
+          base_content  TEXT NOT NULL DEFAULT ''
         );
         "#,
-    )
+    )?;
+
+    if get_meta(db, "index_engine").as_deref() != Some("multilingual_v3") {
+        let _ = db.execute_batch(
+            r#"
+            DROP TRIGGER IF EXISTS blocks_ai;
+            DROP TRIGGER IF EXISTS blocks_ad;
+            DROP TABLE IF EXISTS blocks_fts;
+            CREATE VIRTUAL TABLE blocks_fts USING fts5(
+              text,
+              heading_path,
+              content='blocks',
+              content_rowid='id',
+              tokenize='porter unicode61 remove_diacritics 2'
+            );
+            CREATE TRIGGER blocks_ai AFTER INSERT ON blocks BEGIN
+              INSERT INTO blocks_fts(rowid, text, heading_path)
+              VALUES (new.id, new.text, new.heading_path);
+            END;
+            CREATE TRIGGER blocks_ad AFTER DELETE ON blocks BEGIN
+              INSERT INTO blocks_fts(blocks_fts, rowid, text, heading_path)
+              VALUES ('delete', old.id, old.text, old.heading_path);
+            END;
+            INSERT INTO blocks_fts(blocks_fts) VALUES('rebuild');
+            DELETE FROM embedding_cache;
+            UPDATE blocks SET embedding = NULL;
+            "#,
+        );
+        set_meta(db, "index_engine", "multilingual_v3");
+    }
+
+    Ok(())
 }
 
 pub fn get_meta(db: &Connection, key: &str) -> Option<String> {

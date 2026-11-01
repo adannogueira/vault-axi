@@ -177,7 +177,7 @@ pub fn search_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
             json!("Embeddings unavailable — fell back to FTS5. Run `vault reindex`."),
         );
     }
-    if fts_empty && effective_mode != "fts" && top_sem_score < 0.62 {
+    if fts_empty && effective_mode != "fts" && top_sem_score < 0.24 {
         out.insert("relevance".to_string(), json!("low"));
     }
     out.insert("shown".to_string(), json!(results.len()));

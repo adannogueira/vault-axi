@@ -49,13 +49,14 @@ pub struct Hit {
 }
 
 /// Keyword search via FTS5. Returns hits best-first (higher score = better).
+/// Weights `heading_path` (column 1) 5x higher than body `text` (column 0).
 pub fn fts_search(db: &Connection, query: &str, limit: usize) -> Vec<Hit> {
     let match_expr = build_fts_query(query);
     if match_expr.is_empty() {
         return Vec::new();
     }
     let Ok(mut stmt) = db.prepare(
-        "SELECT rowid AS id, bm25(blocks_fts) AS rank FROM blocks_fts WHERE blocks_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+        "SELECT rowid AS id, bm25(blocks_fts, 1.0, 5.0) AS rank FROM blocks_fts WHERE blocks_fts MATCH ?1 ORDER BY rank LIMIT ?2",
     ) else {
         return Vec::new();
     };
@@ -70,9 +71,9 @@ pub fn fts_search(db: &Connection, query: &str, limit: usize) -> Vec<Hit> {
         .collect()
 }
 
-/// Minimum cosine similarity threshold for `bge-micro-v2` semantic search hits
-/// so completely unrelated queries do not return random noise notes.
-pub const MIN_SEMANTIC_SCORE: f64 = 0.55;
+/// Minimum cosine similarity threshold for zero-centered multilingual subword/stem vectors
+/// so completely unrelated queries (which score ~0.00..0.15) do not return noise notes.
+pub const MIN_SEMANTIC_SCORE: f64 = 0.20;
 
 /// Semantic search over stored block vectors. Returns None if embeddings unavailable.
 pub fn semantic_search(db: &Connection, query: &str, limit: usize) -> Option<Vec<Hit>> {
