@@ -3,7 +3,10 @@ use crate::index::embed::{embed, init_embedder, is_available, to_blob};
 use crate::markdown::blocks::to_blocks;
 use crate::markdown::frontmatter::read_frontmatter;
 use crate::markdown::links::{build_basename_index, parse_wiki_links, resolve_link_target};
-use crate::vault::{derive_title, file_stat, list_markdown_files, resolve_in_vault};
+use crate::vault::{
+    derive_title, file_stat, is_image_attachment, list_attachment_files, list_markdown_files,
+    resolve_attachment_target, resolve_in_vault,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -55,7 +58,37 @@ fn now_ms() -> i64 {
 pub fn reconcile(db: &mut Connection, vault_root: &str, opts: ReconcileOpts) -> ReconcileResult {
     let with_embeddings = opts.with_embeddings.unwrap_or(true);
     let paths = list_markdown_files(vault_root);
+    let attachments = list_attachment_files(vault_root);
     let basename_index = build_basename_index(&paths);
+
+    // Pre-scan image attachments so any newly added/updated image gets OCR'd and
+    // triggers re-indexing of markdown notes that reference it.
+    let mut newly_ocrd_images = false;
+    for att in &attachments {
+        if is_image_attachment(att) {
+            if let Ok(abs_att) = resolve_in_vault(vault_root, att) {
+                if let Ok(bytes) = fs::read(&abs_att) {
+                    let mut h = Sha1::new();
+                    h.update(&bytes);
+                    let fh: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+                    let in_cache: bool = db
+                        .query_row(
+                            "SELECT 1 FROM ocr_cache WHERE hash = ?1",
+                            params![fh],
+                            |_| Ok(true),
+                        )
+                        .optional()
+                        .ok()
+                        .flatten()
+                        .unwrap_or(false);
+                    if !in_cache {
+                        let _ = crate::ocr::extract_image_ocr(db, &abs_att);
+                        newly_ocrd_images = true;
+                    }
+                }
+            }
+        }
+    }
 
     let mut existing: HashMap<String, FileRow> = HashMap::new();
     if let Ok(mut stmt) = db.prepare("SELECT path, mtime_ms, size FROM files") {
@@ -90,6 +123,7 @@ pub fn reconcile(db: &mut Connection, vault_root: &str, opts: ReconcileOpts) -> 
         let st = file_stat(&abs);
         let prev = existing.get(rel_path);
         let changed = opts.force
+            || newly_ocrd_images
             || prev.is_none()
             || st.is_none()
             || prev.unwrap().mtime_ms != st.unwrap().mtime_ms
@@ -169,12 +203,59 @@ pub fn reconcile(db: &mut Connection, vault_root: &str, opts: ReconcileOpts) -> 
                 );
             }
 
-            for link in parse_wiki_links(&raw) {
+            let wiki_links = parse_wiki_links(&raw);
+            let mut attached_images: Vec<String> = Vec::new();
+            for link in &wiki_links {
                 let target = resolve_link_target(&link.target, &paths, &basename_index);
                 let _ = tx.execute(
                     "INSERT INTO links(src_path, target_raw, target_path, heading, alias) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![rel_path, link.raw, target, link.heading, link.alias],
                 );
+                if target.is_none() {
+                    if let Some(att_rel) = resolve_attachment_target(&link.raw, &attachments) {
+                        if is_image_attachment(&att_rel) && !attached_images.contains(&att_rel) {
+                            attached_images.push(att_rel);
+                        }
+                    }
+                }
+            }
+
+            // Also scan standard Markdown links `![alt](target)` for image attachments
+            for part in raw.split("](").skip(1) {
+                if let Some(close) = part.find(')') {
+                    let md_target = part[..close].split_whitespace().next().unwrap_or("");
+                    if let Some(att_rel) = resolve_attachment_target(md_target, &attachments) {
+                        if is_image_attachment(&att_rel) && !attached_images.contains(&att_rel) {
+                            attached_images.push(att_rel);
+                        }
+                    }
+                }
+            }
+
+            for att_rel in attached_images {
+                if let Ok(abs_att) = resolve_in_vault(vault_root, &att_rel) {
+                    if let Some(ocr_text) = crate::ocr::extract_image_ocr(&tx, &abs_att) {
+                        let trimmed = ocr_text.trim();
+                        if !trimmed.is_empty() {
+                            let block_text = format!("[Attachment: {att_rel}]\n{trimmed}");
+                            let text_hash = sha1_hex(&block_text);
+                            let cached_emb: Option<Vec<u8>> = tx
+                                .query_row(
+                                    "SELECT embedding FROM embedding_cache WHERE text_hash = ?1",
+                                    params![text_hash],
+                                    |r| r.get::<_, Vec<u8>>(0),
+                                )
+                                .optional()
+                                .ok()
+                                .flatten();
+                            let heading_path = format!("Attachment OCR ({att_rel})");
+                            let _ = tx.execute(
+                                "INSERT INTO blocks(path, heading_path, start_line, end_line, text, embedding) VALUES (?1, ?2, 1, 1, ?3, ?4)",
+                                params![rel_path, heading_path, block_text, cached_emb],
+                            );
+                        }
+                    }
+                }
             }
             let _ = tx.commit();
         }
@@ -1078,7 +1159,7 @@ mod tests {
 
         // MCP dispatch & tool definitions (including values starting with `--`)
         let tools = tool_definitions();
-        assert_eq!(tools.as_array().unwrap().len(), 19);
+        assert_eq!(tools.as_array().unwrap().len(), 25);
 
         let mcp_w = dispatch_mcp_tool(
             "vault_write",
@@ -1379,6 +1460,233 @@ mod tests {
 
         let ref_after = fs::read_to_string(dir.join("referrer.md")).unwrap();
         assert!(ref_after.contains("[[renamed]]"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_milestone_v2_capture_trash_history_attach_ocr_and_crypto() {
+        std::env::set_var("VAULT_AXI_NO_EMBED", "1");
+        std::env::set_var("VAULT_AXI_NO_SYNC", "1");
+        let dir = std::env::temp_dir().join(format!(
+            "vault_axi_milestone_v2_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let vault_str = dir.to_string_lossy().to_string();
+        let db = open_db_at(":memory:").unwrap();
+        let mut ctx = Ctx::with_vault_and_db(&vault_str, db);
+
+        // 1. Fast capture (`vault capture`) into daily note and custom `--to` note
+        let cap1 = crate::commands::capture::capture_command(
+            &[
+                "Remember to benchmark AES-256-GCM throughput".to_string(),
+                "--tag".to_string(),
+                "security".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(cap1["ok"], true);
+        let daily_file = cap1["file"].as_str().unwrap().to_string();
+        assert!(daily_file.starts_with("daily/"));
+        let daily_raw = fs::read_to_string(dir.join(&daily_file)).unwrap();
+        assert!(daily_raw.contains("## Captures"));
+        assert!(daily_raw.contains("Remember to benchmark AES-256-GCM throughput #security"));
+
+        let cap2 = crate::commands::capture::capture_command(
+            &[
+                "Second thought on same day".to_string(),
+                "--to".to_string(),
+                "inbox/quick.md".to_string(),
+                "--section".to_string(),
+                "Quick Notes".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(cap2["file"], "inbox/quick.md");
+        assert!(fs::read_to_string(dir.join("inbox/quick.md"))
+            .unwrap()
+            .contains("## Quick Notes"));
+
+        // 2. Edits history (`vault history`) and encryption at rest in `note_versions`
+        crate::commands::write::write_command(
+            &[
+                "specs/auth.md".to_string(),
+                "--title".to_string(),
+                "Auth Spec".to_string(),
+                "--content".to_string(),
+                "## Overview\nVersion one token LegacySecretTokenAlpha\n".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+
+        crate::commands::update::update_command(
+            &[
+                "specs/auth.md".to_string(),
+                "--section".to_string(),
+                "Overview".to_string(),
+                "--mode".to_string(),
+                "replace".to_string(),
+                "--content".to_string(),
+                "Version two token ModernScopedTokenBeta\n".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+
+        // Verify stored version content in SQLite is encrypted at rest (`enc:v1:...`)
+        let raw_db_ver: String = ctx
+            .db()
+            .unwrap()
+            .query_row(
+                "SELECT content FROM note_versions WHERE path = 'specs/auth.md' AND version_num = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(raw_db_ver.starts_with("enc:v1:"));
+
+        // Verify historical version 1 text ("LegacySecretTokenAlpha") does NOT pollute `vault search`
+        let srch_old = crate::commands::search::search_command(
+            &[
+                "LegacySecretTokenAlpha".to_string(),
+                "--mode".to_string(),
+                "fts".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert!(srch_old["results"].as_str().unwrap().starts_with("0 matches"));
+
+        let srch_curr = crate::commands::search::search_command(
+            &[
+                "ModernScopedTokenBeta".to_string(),
+                "--mode".to_string(),
+                "fts".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(srch_curr["shown"], 1);
+
+        // List versions, diff v1, and restore v1
+        let hist_list =
+            crate::commands::history::history_command(&["specs/auth.md".to_string()], &mut ctx)
+                .unwrap();
+        assert_eq!(hist_list["versionsCount"], 2);
+
+        let hist_diff = crate::commands::history::history_command(
+            &[
+                "specs/auth.md".to_string(),
+                "--diff".to_string(),
+                "1".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert!(hist_diff["diffAgainstCurrent"].is_object());
+
+        let hist_restore = crate::commands::history::history_command(
+            &[
+                "specs/auth.md".to_string(),
+                "--restore".to_string(),
+                "1".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(hist_restore["action"], "restored_version");
+        assert!(fs::read_to_string(dir.join("specs/auth.md"))
+            .unwrap()
+            .contains("LegacySecretTokenAlpha"));
+
+        // 3. Trash and restore (7-day soft delete + encrypted trash payload)
+        let del_res =
+            crate::commands::delete::delete_command(&["specs/auth.md".to_string()], &mut ctx)
+                .unwrap();
+        assert_eq!(del_res["trashed"], true);
+        assert!(!dir.join("specs/auth.md").exists());
+
+        let trash_ls = crate::commands::trash::trash_command(&[], &mut ctx).unwrap();
+        assert_eq!(trash_ls["count"], 1);
+
+        let rest_res =
+            crate::commands::trash::restore_command(&["specs/auth.md".to_string()], &mut ctx)
+                .unwrap();
+        assert_eq!(rest_res["action"], "restored");
+        assert!(dir.join("specs/auth.md").exists());
+
+        // 4. Attachments + Local Image OCR indexing + `.obsidian/` config sync exclusion from search
+        let ext_img = dir.join("temp_whiteboard.png");
+        fs::write(&ext_img, b"\x89PNG\r\n\x1a\nmock-image-bytes").unwrap();
+        std::env::set_var(
+            "VAULT_AXI_MOCK_OCR",
+            "DiagramArchitectureMicroserviceGateway99",
+        );
+
+        let att_res = crate::commands::attach::attach_command(
+            &[
+                "specs/auth.md".to_string(),
+                ext_img.to_string_lossy().to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(att_res["ok"], true);
+        assert_eq!(att_res["attachment"], "assets/temp_whiteboard.png");
+        assert_eq!(att_res["ocrExtracted"], true);
+        let _ = fs::remove_file(&ext_img);
+
+        let att_list = crate::commands::attach::attachments_command(
+            &["specs/auth.md".to_string()],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(att_list["count"], 1);
+
+        // Search finds `specs/auth.md` via the OCR text inside `assets/temp_whiteboard.png`!
+        let srch_ocr = crate::commands::search::search_command(
+            &[
+                "DiagramArchitectureMicroserviceGateway99".to_string(),
+                "--mode".to_string(),
+                "fts".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(srch_ocr["shown"], 1);
+        assert_eq!(srch_ocr["results"][0]["path"], "specs/auth.md");
+        std::env::remove_var("VAULT_AXI_MOCK_OCR");
+
+        // `.obsidian/` files are included in `list_all_syncable_files` for cloud sync,
+        // but excluded from `vault ls` and `vault search`!
+        fs::create_dir_all(dir.join(".obsidian")).unwrap();
+        fs::write(
+            dir.join(".obsidian/app.json"),
+            r#"{"vimMode": true, "secretKeyword": "ObsidianInternalConfigToken88"}"#,
+        )
+        .unwrap();
+
+        let syncable = crate::sync::list_all_syncable_files(&dir.to_string_lossy());
+        assert!(syncable.contains(&".obsidian/app.json".to_string()));
+        assert!(syncable.contains(&"assets/temp_whiteboard.png".to_string()));
+        assert!(syncable.contains(&"specs/auth.md".to_string()));
+
+        let srch_obs = crate::commands::search::search_command(
+            &[
+                "ObsidianInternalConfigToken88".to_string(),
+                "--mode".to_string(),
+                "fts".to_string(),
+            ],
+            &mut ctx,
+        )
+        .unwrap();
+        assert!(srch_obs["results"].as_str().unwrap().starts_with("0 matches"));
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1,9 +1,17 @@
 use crate::axi::AxiError;
+use crate::commands::history::record_edit_transition;
+use crate::commands::trash::move_file_to_trash;
 use crate::config::{
     env_api_key, load_config, save_config, RemoteBackendConfig, HOSTED_SUPABASE_ANON_KEY,
     HOSTED_SUPABASE_URL,
 };
-use crate::vault::{file_stat, list_markdown_files, resolve_in_vault};
+use crate::crypto::{
+    decode_binary_payload, decrypt_at_rest, encode_binary_payload, encrypt_at_rest,
+};
+use crate::vault::{
+    file_stat, list_attachment_files, list_markdown_files, list_obsidian_config_files,
+    resolve_in_vault,
+};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -218,6 +226,10 @@ fn make_conflict_copy_rel_path(rel_path: &str, ts_ms: i64) -> String {
     let ts_sec = (ts_ms / 1000).max(1);
     if let Some(stripped) = rel_path.strip_suffix(".md") {
         format!("{stripped}.conflict-{ts_sec}.md")
+    } else if let Some(dot_idx) = rel_path.rfind('.') {
+        let base = &rel_path[..dot_idx];
+        let ext = &rel_path[dot_idx..];
+        format!("{base}.conflict-{ts_sec}{ext}")
     } else {
         format!("{rel_path}.conflict-{ts_sec}.md")
     }
@@ -231,11 +243,63 @@ fn upsert_sync_state(
     synced_at: i64,
     base_content: &str,
 ) {
+    let enc_base = encrypt_at_rest(base_content);
     let _ = db.execute(
         "INSERT INTO sync_state(path, remote_hash, remote_mtime, synced_at, base_content) VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(path) DO UPDATE SET remote_hash=excluded.remote_hash, remote_mtime=excluded.remote_mtime, synced_at=excluded.synced_at, base_content=excluded.base_content",
-        params![path, remote_hash, remote_mtime, synced_at, base_content],
+        params![path, remote_hash, remote_mtime, synced_at, enc_base],
     );
+}
+
+/// Collect all syncable vault-relative paths: markdown notes, attachments, and `.obsidian/` config files.
+pub fn list_all_syncable_files(vault_root: &str) -> Vec<String> {
+    let mut all = list_markdown_files(vault_root);
+    all.extend(list_attachment_files(vault_root));
+    all.extend(list_obsidian_config_files(vault_root));
+    all.sort();
+    all.dedup();
+    all
+}
+
+/// Read a vault file into its logical sync payload (UTF-8 text for `.md` and text `.obsidian/` files,
+/// or `b64:v1:<base64>` for binary attachments).
+pub fn read_sync_payload(abs_p: &Path, rel_path: &str) -> Option<String> {
+    if rel_path.to_lowercase().ends_with(".md") {
+        fs::read_to_string(abs_p).ok()
+    } else if rel_path.starts_with(".obsidian/") {
+        if let Ok(text) = fs::read_to_string(abs_p) {
+            if !text.starts_with("b64:v1:") && !text.starts_with("enc:v1:") {
+                return Some(text);
+            }
+        }
+        let bytes = fs::read(abs_p).ok()?;
+        Some(encode_binary_payload(&bytes))
+    } else {
+        let bytes = fs::read(abs_p).ok()?;
+        Some(encode_binary_payload(&bytes))
+    }
+}
+
+/// Write a logical sync payload back to disk (decoding `b64:v1:` binary payloads into raw bytes).
+pub fn write_sync_payload(abs_p: &Path, payload: &str) -> std::io::Result<()> {
+    if let Some(parent) = abs_p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Some(bytes) = decode_binary_payload(payload) {
+        fs::write(abs_p, bytes)
+    } else {
+        fs::write(abs_p, payload)
+    }
+}
+
+fn report_sync_progress(action: &str, current: usize, total: usize, path: &str) {
+    if cfg!(test)
+        || std::env::var("VAULT_AXI_NO_SYNC").as_deref() == Ok("1")
+        || std::env::var("VAULT_AXI_QUIET").as_deref() == Ok("1")
+    {
+        return;
+    }
+    eprintln!("[{current}/{total}] {action} {path}...");
 }
 
 fn now_ms() -> i64 {
@@ -587,14 +651,18 @@ fn fetch_remote_note(
         "{clean_url}/rest/v1/vault_notes?vault_id=eq.{vault_id}&path=eq.{}&select=path,content,hash,mtime_ms,deleted",
         urlencoding_simple(path)
     );
-    let r = ureq::get(&fetch_url)
+    let mut req = ureq::get(&fetch_url)
         .set("apikey", anon_key)
-        .set("Authorization", &format!("Bearer {bearer}"))
-        .call()
-        .ok()?;
+        .set("Authorization", &format!("Bearer {bearer}"));
+    if let Some(env_key) = env_api_key() {
+        req = req.set("x-vault-api-key", &env_key);
+    }
+    let r = req.call().ok()?;
     let s = r.into_string().ok()?;
     let mut list: Vec<RemoteNoteFull> = serde_json::from_str(&s).ok()?;
-    list.pop()
+    let mut note = list.pop()?;
+    note.content = decrypt_at_rest(&note.content).ok()?;
+    Some(note)
 }
 
 /// Resolve a concurrent modification where both local (`local_content`) and remote (`full`)
@@ -617,10 +685,25 @@ fn resolve_concurrent_edit(
         let _ = fs::create_dir_all(parent);
     }
 
-    match merge_three_way(base_content, local_content, &full.content) {
+    let is_binary =
+        local_content.starts_with("b64:v1:") || full.content.starts_with("b64:v1:");
+    let outcome = if is_binary {
+        if local_content == full.content {
+            MergeOutcome::Clean(local_content.to_string())
+        } else {
+            MergeOutcome::Conflict
+        }
+    } else {
+        merge_three_way(base_content, local_content, &full.content)
+    };
+
+    match outcome {
         MergeOutcome::Clean(merged) => {
             let merged_hash = sha1_hex(&merged);
-            let _ = fs::write(abs_p, &merged);
+            if r_path.to_lowercase().ends_with(".md") {
+                record_edit_transition(db, r_path, Some(local_content), &merged, "sync-merge");
+            }
+            let _ = write_sync_payload(abs_p, &merged);
             if merged_hash == full.hash {
                 upsert_sync_state(db, r_path, &full.hash, full.mtime_ms, now, &full.content);
                 synced_state.insert(
@@ -654,7 +737,10 @@ fn resolve_concurrent_edit(
             );
         }
         MergeOutcome::AutoMerged(merged) => {
-            if fs::write(abs_p, &merged).is_ok() {
+            if write_sync_payload(abs_p, &merged).is_ok() {
+                if r_path.to_lowercase().ends_with(".md") {
+                    record_edit_transition(db, r_path, Some(local_content), &merged, "sync-merge");
+                }
                 // Set synced_state to the remote version so `do_push` sees `merged` as dirty
                 // relative to `full.hash` and pushes the merged result!
                 upsert_sync_state(db, r_path, &full.hash, full.mtime_ms, now, &full.content);
@@ -690,12 +776,18 @@ fn resolve_concurrent_edit(
             let conflict_rel = make_conflict_copy_rel_path(r_path, now);
             if let Ok(conflict_abs) = resolve_in_vault(vault_root, &conflict_rel) {
                 let conflict_p = Path::new(&conflict_abs);
-                if let Some(parent) = conflict_p.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                let _ = fs::write(conflict_p, local_content);
+                let _ = write_sync_payload(conflict_p, local_content);
             }
-            if fs::write(abs_p, &full.content).is_ok() {
+            if write_sync_payload(abs_p, &full.content).is_ok() {
+                if r_path.to_lowercase().ends_with(".md") {
+                    record_edit_transition(
+                        db,
+                        r_path,
+                        Some(local_content),
+                        &full.content,
+                        "sync-conflict",
+                    );
+                }
                 upsert_sync_state(db, r_path, &full.hash, full.mtime_ms, now, &full.content);
                 synced_state.insert(
                     r_path.to_string(),
@@ -759,9 +851,20 @@ fn try_refresh_hosted_token(refresh_token: &str) -> Option<(String, String)> {
 }
 
 /// Exchange a long-lived `vlt_...` API key for a fresh Supabase JWT session via the `token-exchange` Edge Function.
+#[allow(clippy::type_complexity)]
 fn exchange_api_key(
     api_key: &str,
-) -> Result<(String, Option<String>, Option<String>, Option<String>, String), String> {
+) -> Result<
+    (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+    ),
+    String,
+> {
     let url = format!("{HOSTED_SUPABASE_URL}/functions/v1/token-exchange");
     let payload = json!({
         "action": "exchange",
@@ -798,15 +901,21 @@ fn exchange_api_key(
         .and_then(|v| v.as_str())
         .unwrap_or("default")
         .to_string();
+    let scope = body
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("write")
+        .to_string();
 
-    save_hosted_session(
+    save_hosted_session_with_scope(
         Some(access_token.clone()),
         refresh_token.clone(),
         user_id.clone(),
         email.clone(),
         Some(&vault_id),
+        Some(&scope),
     );
-    Ok((access_token, refresh_token, user_id, email, vault_id))
+    Ok((access_token, refresh_token, user_id, email, vault_id, scope))
 }
 
 /// Delta sync with Hosted Cloud (`vault_notes` table protected by RLS `auth.uid() = user_id`).
@@ -826,11 +935,17 @@ fn sync_hosted_cloud(
     let mut bearer = access_token.unwrap_or(anon_key).to_string();
     let mut effective_user_id: Option<String> = user_id.map(|s| s.to_string());
     let mut effective_vault_id: String = vault_id.to_string();
+    let mut effective_scope: String = match load_config().remote {
+        Some(RemoteBackendConfig::Cloud {
+            scope: Some(sc), ..
+        }) => sc,
+        _ => "write".to_string(),
+    };
 
     // If `bearer` is a `vlt_...` API key (e.g. from VAULT_API_KEY in a headless container),
     // silently exchange it for a short-lived JWT session before querying PostgREST.
     if bearer.starts_with("vlt_") {
-        let (new_access, _, uid, _, vid) = exchange_api_key(&bearer).map_err(|msg| {
+        let (new_access, _, uid, _, vid, sc) = exchange_api_key(&bearer).map_err(|msg| {
             AxiError::new(
                 format!("VAULT_API_KEY authentication failed: {msg}"),
                 "AUTH_ERROR",
@@ -847,15 +962,30 @@ fn sync_hosted_cloud(
         if effective_vault_id == "default" && vid != "default" {
             effective_vault_id = vid;
         }
+        effective_scope = sc;
+    }
+
+    if do_push && !do_pull && effective_scope.eq_ignore_ascii_case("read") {
+        return Err(AxiError::new(
+            "API token has read-only scope ('read') and cannot push changes",
+            "PERMISSION_DENIED",
+            vec![
+                "Create a read-write token with `vault token create --scope write`".to_string(),
+                "Or run `vault sync --pull` to pull remote changes only.".to_string(),
+            ],
+        ));
     }
 
     let manifest_url = format!(
         "{clean_url}/rest/v1/vault_notes?vault_id=eq.{effective_vault_id}&select=path,hash,mtime_ms,deleted"
     );
-    let mut resp = ureq::get(&manifest_url)
+    let mut req = ureq::get(&manifest_url)
         .set("apikey", anon_key)
-        .set("Authorization", &format!("Bearer {bearer}"))
-        .call();
+        .set("Authorization", &format!("Bearer {bearer}"));
+    if let Some(env_key) = env_api_key() {
+        req = req.set("x-vault-api-key", &env_key);
+    }
+    let mut resp = req.call();
 
     // Automatically refresh expired JWT via refresh_token or VAULT_API_KEY if available
     if resp.is_err() {
@@ -869,21 +999,25 @@ fn sync_hosted_cloud(
         if !refreshed {
             if let Some(env_key) = env_api_key() {
                 if env_key.starts_with("vlt_") {
-                    if let Ok((new_access, _, uid, _, _)) = exchange_api_key(&env_key) {
+                    if let Ok((new_access, _, uid, _, _, sc)) = exchange_api_key(&env_key) {
                         bearer = new_access;
                         if uid.is_some() {
                             effective_user_id = uid;
                         }
+                        effective_scope = sc;
                         refreshed = true;
                     }
                 }
             }
         }
         if refreshed {
-            resp = ureq::get(&manifest_url)
+            let mut retry_req = ureq::get(&manifest_url)
                 .set("apikey", anon_key)
-                .set("Authorization", &format!("Bearer {bearer}"))
-                .call();
+                .set("Authorization", &format!("Bearer {bearer}"));
+            if let Some(env_key) = env_api_key() {
+                retry_req = retry_req.set("x-vault-api-key", &env_key);
+            }
+            resp = retry_req.call();
         }
     }
 
@@ -910,12 +1044,14 @@ fn sync_hosted_cloud(
         db.prepare("SELECT path, remote_hash, remote_mtime, COALESCE(base_content, '') FROM sync_state")
     {
         if let Ok(rows) = stmt.query_map([], |r| {
+            let raw_base: String = r.get(3)?;
+            let dec_base = decrypt_at_rest(&raw_base).unwrap_or(raw_base);
             Ok((
                 r.get::<_, String>(0)?,
                 SyncedEntry {
                     remote_hash: r.get::<_, String>(1)?,
                     remote_mtime: r.get::<_, i64>(2)?,
-                    base_content: r.get::<_, String>(3)?,
+                    base_content: dec_base,
                 },
             ))
         }) {
@@ -933,7 +1069,10 @@ fn sync_hosted_cloud(
 
     // Pull changed remote files (with 3-way merge / conflict copy when local is also dirty)
     if do_pull {
-        let remote_keys: Vec<String> = remote_map.keys().cloned().collect();
+        let mut remote_keys: Vec<String> = remote_map.keys().cloned().collect();
+        remote_keys.sort();
+        let total_remote = remote_keys.len().max(1);
+        let mut pull_idx = 0usize;
         for r_path in remote_keys {
             let Some(r_meta) = remote_map.get(&r_path).cloned() else {
                 continue;
@@ -942,7 +1081,7 @@ fn sync_hosted_cloud(
                 continue;
             };
             let abs_p = Path::new(&abs);
-            let local_content = fs::read_to_string(abs_p).ok();
+            let local_content = read_sync_payload(abs_p, &r_path);
             let local_hash = local_content.as_ref().map(|s| sha1_hex(s));
             let synced_entry = synced_state.get(&r_path).cloned();
 
@@ -966,6 +1105,7 @@ fn sync_hosted_cloud(
                             ),
                         });
                     } else {
+                        let _ = move_file_to_trash(db, &r_path, abs_p);
                         let _ = fs::remove_file(abs_p);
                         summary.deleted_local += 1;
                         let _ = db.execute("DELETE FROM sync_state WHERE path = ?1", params![&r_path]);
@@ -1003,6 +1143,8 @@ fn sync_hosted_cloud(
             };
 
             if remote_changed_since_sync {
+                pull_idx += 1;
+                report_sync_progress("Downloading", pull_idx, total_remote, &r_path);
                 let Some(full) = fetch_remote_note(
                     clean_url,
                     anon_key,
@@ -1021,10 +1163,16 @@ fn sync_hosted_cloud(
 
                 if !local_modified_since_sync {
                     // Clean fast-forward pull: local file was untouched since last sync
-                    if let Some(parent) = abs_p.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    if fs::write(abs_p, &full.content).is_ok() {
+                    if write_sync_payload(abs_p, &full.content).is_ok() {
+                        if r_path.to_lowercase().ends_with(".md") {
+                            record_edit_transition(
+                                db,
+                                &r_path,
+                                local_content.as_deref(),
+                                &full.content,
+                                "sync-pull",
+                            );
+                        }
                         upsert_sync_state(db, &r_path, &full.hash, full.mtime_ms, now, &full.content);
                         synced_state.insert(
                             r_path.clone(),
@@ -1060,17 +1208,20 @@ fn sync_hosted_cloud(
         }
     }
 
-    // Push local additions, edits, and deletions
-    if do_push {
-        let local_paths = list_markdown_files(vault_root);
+    // Push local additions, edits, and deletions (only if token scope allows write)
+    let can_push = do_push && !effective_scope.eq_ignore_ascii_case("read");
+    if can_push {
+        let local_paths = list_all_syncable_files(vault_root);
         let local_set: HashSet<String> = local_paths.iter().cloned().collect();
+        let total_local = local_paths.len().max(1);
+        let mut push_idx = 0usize;
 
         for l_path in &local_paths {
             let Ok(abs) = resolve_in_vault(vault_root, l_path) else {
                 continue;
             };
             let abs_p = Path::new(&abs);
-            let Ok(mut content) = fs::read_to_string(abs_p) else {
+            let Some(mut content) = read_sync_payload(abs_p, l_path) else {
                 continue;
             };
             let mut l_hash = sha1_hex(&content);
@@ -1117,7 +1268,7 @@ fn sync_hosted_cloud(
                                     &mut remote_map,
                                     &mut summary,
                                 );
-                                content = fs::read_to_string(abs_p).unwrap_or(content);
+                                content = read_sync_payload(abs_p, l_path).unwrap_or(content);
                                 l_hash = sha1_hex(&content);
                             }
                         }
@@ -1135,6 +1286,10 @@ fn sync_hosted_cloud(
             };
 
             if needs_upload {
+                push_idx += 1;
+                report_sync_progress("Uploading", push_idx, total_local, l_path);
+                let encrypted_content = encrypt_at_rest(&content);
+
                 // Safeguard 3: When updating an existing active remote note, use an optimistic
                 // conditional PATCH (`hash=eq.<expected_remote_hash>`) first to detect millisecond-level races.
                 let existing_active_hash = remote_map
@@ -1148,19 +1303,21 @@ fn sync_hosted_cloud(
                         urlencoding_simple(l_path)
                     );
                     let patch_payload = json!({
-                        "content": content,
+                        "content": encrypted_content,
                         "hash": l_hash,
                         "mtime_ms": l_mtime,
                         "deleted": false,
                         "updated_at": chrono::Utc::now().to_rfc3339()
                     });
-                    if let Ok(r) = ureq::request("PATCH", &patch_url)
+                    let mut patch_req = ureq::request("PATCH", &patch_url)
                         .set("apikey", anon_key)
                         .set("Authorization", &format!("Bearer {bearer}"))
                         .set("Content-Type", "application/json")
-                        .set("Prefer", "return=representation")
-                        .send_string(&patch_payload.to_string())
-                    {
+                        .set("Prefer", "return=representation");
+                    if let Some(env_key) = env_api_key() {
+                        patch_req = patch_req.set("x-vault-api-key", &env_key);
+                    }
+                    if let Ok(r) = patch_req.send_string(&patch_payload.to_string()) {
                         if r.status() < 300 {
                             let body = r.into_string().unwrap_or_else(|_| "[]".to_string());
                             let updated_rows: Vec<Value> =
@@ -1202,7 +1359,7 @@ fn sync_hosted_cloud(
                                     &mut remote_map,
                                     &mut summary,
                                 );
-                                content = fs::read_to_string(abs_p).unwrap_or(content);
+                                content = read_sync_payload(abs_p, l_path).unwrap_or(content);
                                 l_hash = sha1_hex(&content);
                                 if l_hash == full.hash {
                                     continue;
@@ -1212,12 +1369,13 @@ fn sync_hosted_cloud(
                     }
                 }
 
+                let encrypted_content_final = encrypt_at_rest(&content);
                 let upsert_url =
                     format!("{clean_url}/rest/v1/vault_notes?on_conflict=user_id,vault_id,path");
                 let mut payload = json!({
                     "vault_id": effective_vault_id,
                     "path": l_path,
-                    "content": content,
+                    "content": encrypted_content_final,
                     "hash": l_hash,
                     "mtime_ms": l_mtime,
                     "deleted": false,
@@ -1226,13 +1384,15 @@ fn sync_hosted_cloud(
                 if let Some(ref uid) = effective_user_id {
                     payload["user_id"] = json!(uid);
                 }
-                if let Ok(r) = ureq::post(&upsert_url)
+                let mut post_req = ureq::post(&upsert_url)
                     .set("apikey", anon_key)
                     .set("Authorization", &format!("Bearer {bearer}"))
                     .set("Content-Type", "application/json")
-                    .set("Prefer", "resolution=merge-duplicates")
-                    .send_string(&payload.to_string())
-                {
+                    .set("Prefer", "resolution=merge-duplicates");
+                if let Some(env_key) = env_api_key() {
+                    post_req = post_req.set("x-vault-api-key", &env_key);
+                }
+                if let Ok(r) = post_req.send_string(&payload.to_string()) {
                     if r.status() < 300 {
                         upsert_sync_state(db, l_path, &l_hash, l_mtime, now, &content);
                         synced_state.insert(
@@ -1268,10 +1428,7 @@ fn sync_hosted_cloud(
                         ) {
                             if let Ok(abs) = resolve_in_vault(vault_root, &synced_path) {
                                 let abs_p = Path::new(&abs);
-                                if let Some(parent) = abs_p.parent() {
-                                    let _ = fs::create_dir_all(parent);
-                                }
-                                if fs::write(abs_p, &full.content).is_ok() {
+                                if write_sync_payload(abs_p, &full.content).is_ok() {
                                     upsert_sync_state(
                                         db,
                                         &synced_path,
@@ -1311,12 +1468,15 @@ fn sync_hosted_cloud(
                 if let Some(ref uid) = effective_user_id {
                     payload["user_id"] = json!(uid);
                 }
-                let _ = ureq::post(&upsert_url)
+                let mut del_req = ureq::post(&upsert_url)
                     .set("apikey", anon_key)
                     .set("Authorization", &format!("Bearer {bearer}"))
                     .set("Content-Type", "application/json")
-                    .set("Prefer", "resolution=merge-duplicates")
-                    .send_string(&payload.to_string());
+                    .set("Prefer", "resolution=merge-duplicates");
+                if let Some(env_key) = env_api_key() {
+                    del_req = del_req.set("x-vault-api-key", &env_key);
+                }
+                let _ = del_req.send_string(&payload.to_string());
                 let _ =
                     db.execute("DELETE FROM sync_state WHERE path = ?1", params![&synced_path]);
                 summary.deleted_remote += 1;
@@ -1324,7 +1484,12 @@ fn sync_hosted_cloud(
         }
     }
 
-    summary.message = Some(if summary.conflicts.is_empty() {
+    summary.message = Some(if do_push && effective_scope.eq_ignore_ascii_case("read") {
+        format!(
+            "Vault Cloud sync complete (pulled {}, push skipped: read-only token)",
+            summary.pulled
+        )
+    } else if summary.conflicts.is_empty() {
         format!(
             "Vault Cloud sync complete (pulled {}, pushed {})",
             summary.pulled, summary.pushed
@@ -1375,25 +1540,25 @@ fn sync_s3_manifest(
     let now = now_ms();
 
     if do_pull {
+        let total_remote = remote_hashes.len().max(1);
+        let mut pull_idx = 0usize;
         for (r_path, r_hash) in &remote_hashes {
             let Ok(abs) = resolve_in_vault(vault_root, r_path) else {
                 continue;
             };
             let abs_p = Path::new(&abs);
-            let local_hash = fs::read_to_string(abs_p).ok().map(|s| sha1_hex(&s));
+            let local_hash = read_sync_payload(abs_p, r_path).map(|s| sha1_hex(&s));
             if local_hash.as_ref() != Some(r_hash) {
+                pull_idx += 1;
+                report_sync_progress("Downloading", pull_idx, total_remote, r_path);
                 let file_url = format!("{base}/{r_path}");
                 if let Ok(resp) = ureq::get(&file_url).call() {
-                    if let Ok(content) = resp.into_string() {
-                        if let Some(parent) = abs_p.parent() {
-                            let _ = fs::create_dir_all(parent);
-                        }
-                        if fs::write(abs_p, &content).is_ok() {
-                            let _ = db.execute(
-                                "INSERT INTO sync_state(path, remote_hash, remote_mtime, synced_at) VALUES (?1, ?2, ?3, ?4)
-                                 ON CONFLICT(path) DO UPDATE SET remote_hash=excluded.remote_hash, remote_mtime=excluded.remote_mtime, synced_at=excluded.synced_at",
-                                params![r_path, r_hash, now, now],
-                            );
+                    if let Ok(raw_content) = resp.into_string() {
+                        let Ok(content) = decrypt_at_rest(&raw_content) else {
+                            continue;
+                        };
+                        if write_sync_payload(abs_p, &content).is_ok() {
+                            upsert_sync_state(db, r_path, r_hash, now, now, &content);
                             summary.pulled += 1;
                         }
                     }
@@ -1404,22 +1569,30 @@ fn sync_s3_manifest(
 
     if do_push {
         let mut manifest_changed = false;
-        for l_path in list_markdown_files(vault_root) {
+        let local_files = list_all_syncable_files(vault_root);
+        let total_local = local_files.len().max(1);
+        let mut push_idx = 0usize;
+        for l_path in local_files {
             let Ok(abs) = resolve_in_vault(vault_root, &l_path) else {
                 continue;
             };
-            let Ok(content) = fs::read_to_string(&abs) else {
+            let abs_p = Path::new(&abs);
+            let Some(content) = read_sync_payload(abs_p, &l_path) else {
                 continue;
             };
             let l_hash = sha1_hex(&content);
             if remote_hashes.get(&l_path) != Some(&l_hash) {
+                push_idx += 1;
+                report_sync_progress("Uploading", push_idx, total_local, &l_path);
+                let enc_content = encrypt_at_rest(&content);
                 let file_url = format!("{base}/{l_path}");
                 if let Ok(r) = ureq::put(&file_url)
-                    .set("Content-Type", "text/markdown; charset=utf-8")
-                    .send_string(&content)
+                    .set("Content-Type", "text/plain; charset=utf-8")
+                    .send_string(&enc_content)
                 {
                     if r.status() < 300 {
                         remote_hashes.insert(l_path.clone(), l_hash.clone());
+                        upsert_sync_state(db, &l_path, &l_hash, now, now, &content);
                         manifest_changed = true;
                         summary.pushed += 1;
                     }
@@ -1853,10 +2026,11 @@ pub fn login_hosted(
     let mut final_user_id: Option<String> = None;
     let mut final_email: Option<String> = email.map(|s| s.to_string());
     let mut final_vault_id: String = vault_id.unwrap_or("default").to_string();
+    let mut final_scope: String = "write".to_string();
 
     if let Some(ref tok) = final_token.clone() {
         if tok.starts_with("vlt_") {
-            let (new_access, refr, uid, em, vid) = exchange_api_key(tok).map_err(|msg| {
+            let (new_access, refr, uid, em, vid, sc) = exchange_api_key(tok).map_err(|msg| {
                 AxiError::new(
                     format!("API key login failed: {msg}"),
                     "AUTH_ERROR",
@@ -1875,6 +2049,7 @@ pub fn login_hosted(
             if vault_id.is_none() {
                 final_vault_id = vid;
             }
+            final_scope = sc;
         }
     }
 
@@ -1935,12 +2110,13 @@ pub fn login_hosted(
         }
     }
 
-    let local_cache = save_hosted_session(
+    let local_cache = save_hosted_session_with_scope(
         final_token,
         final_refresh,
         final_user_id.clone(),
         final_email.clone(),
         Some(&final_vault_id),
+        Some(&final_scope),
     );
 
     Ok(json!({
@@ -1949,6 +2125,7 @@ pub fn login_hosted(
         "email": final_email,
         "userId": final_user_id,
         "vaultId": final_vault_id,
+        "scope": final_scope,
         "localVaultCache": local_cache,
         "autoSync": true,
         "next": ["vault sync", "vault ls", "vault token create --name agent"]
@@ -1960,6 +2137,7 @@ pub fn manage_api_tokens(
     subaction: &str,
     name: Option<&str>,
     vault_id: Option<&str>,
+    scope: Option<&str>,
     target: Option<&str>,
 ) -> Result<Value, AxiError> {
     let cfg = load_config();
@@ -1980,7 +2158,7 @@ pub fn manage_api_tokens(
     };
 
     if bearer.starts_with("vlt_") {
-        if let Ok((new_access, _, _, _, _)) = exchange_api_key(&bearer) {
+        if let Ok((new_access, _, _, _, _, _)) = exchange_api_key(&bearer) {
             bearer = new_access;
         }
     }
@@ -1990,12 +2168,21 @@ pub fn manage_api_tokens(
         .map(|s| s.to_string())
         .or(cfg_vault_id)
         .unwrap_or_else(|| "default".to_string());
+    let effective_scope = scope.unwrap_or("write").to_lowercase();
+    if effective_scope != "read" && effective_scope != "write" {
+        return Err(AxiError::new(
+            format!("Invalid token scope \"{effective_scope}\" (use 'read' or 'write')"),
+            "VALIDATION_ERROR",
+            vec!["Usage: vault token create [--name <label>] [--vault-id <id>] [--scope read|write] [--read-only]".to_string()],
+        ));
+    }
 
     let payload = match subaction {
         "create" => json!({
             "action": "create",
             "name": name.unwrap_or("agent"),
             "vault_id": effective_vault_id,
+            "scope": effective_scope,
         }),
         "list" => json!({ "action": "list" }),
         "revoke" => {
@@ -2019,7 +2206,7 @@ pub fn manage_api_tokens(
                 format!("Unknown token subcommand: {other} (use 'create', 'list', or 'revoke')"),
                 "VALIDATION_ERROR",
                 vec![
-                    "vault token create [--name <label>] [--vault-id <id>]".to_string(),
+                    "vault token create [--name <label>] [--vault-id <id>] [--scope read|write] [--read-only]".to_string(),
                     "vault token list".to_string(),
                     "vault token revoke <id-or-prefix>".to_string(),
                 ],
@@ -2060,12 +2247,17 @@ pub fn manage_api_tokens(
 
     if subaction == "create" {
         let api_key = body.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
+        let returned_scope = body
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&effective_scope);
         return Ok(json!({
             "ok": true,
             "action": "token_created",
             "id": body.get("id"),
             "name": body.get("name"),
-            "vaultId": body.get("vault_id"),
+            "vaultId": body.get("vault_id").unwrap_or(&json!(effective_vault_id)),
+            "scope": returned_scope,
             "keyPrefix": body.get("key_prefix"),
             "apiKey": api_key,
             "usage": format!("export VAULT_API_KEY=\"{api_key}\""),
@@ -2083,6 +2275,17 @@ fn save_hosted_session(
     email: Option<String>,
     vault_id: Option<&str>,
 ) -> Option<String> {
+    save_hosted_session_with_scope(access_token, refresh_token, user_id, email, vault_id, Some("write"))
+}
+
+fn save_hosted_session_with_scope(
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    user_id: Option<String>,
+    email: Option<String>,
+    vault_id: Option<&str>,
+    scope: Option<&str>,
+) -> Option<String> {
     let mut cfg = load_config();
     if cfg.vault_path.is_none() {
         let default_vault = crate::config::config_dir().join("cloud-vault");
@@ -2096,6 +2299,7 @@ fn save_hosted_session(
         user_id,
         email,
         vault_id: Some(vault_id.unwrap_or("default").to_string()),
+        scope: Some(scope.unwrap_or("write").to_string()),
     });
     save_config(&cfg);
     cfg.vault_path

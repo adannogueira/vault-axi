@@ -17,14 +17,32 @@ pub fn setup_command(args: &[String], _ctx: &mut Ctx) -> Result<Value, AxiError>
     let vault = flag_string(&parsed.flags, "vault");
     let remote = flag_string(&parsed.flags, "remote");
     let auto_sync_flag = parsed.flags.get("auto-sync").map(|_| flag_bool(&parsed.flags, "auto-sync"));
+    let auto_update_flag = parsed
+        .flags
+        .get("auto-update")
+        .map(|_| flag_bool(&parsed.flags, "auto-update"));
+    let capture_note = flag_string(&parsed.flags, "capture-note");
+    let capture_section = flag_string(&parsed.flags, "capture-section");
+    let encryption_key = flag_string(&parsed.flags, "encryption-key");
 
-    if vault.is_none() && !want_hooks && remote.is_none() && auto_sync_flag.is_none() {
+    if vault.is_none()
+        && !want_hooks
+        && remote.is_none()
+        && auto_sync_flag.is_none()
+        && auto_update_flag.is_none()
+        && capture_note.is_none()
+        && capture_section.is_none()
+        && encryption_key.is_none()
+    {
         let cfg = load_config();
         return Ok(json!({
             "ok": true,
             "help": "Nothing to do",
             "usage": [
                 "vault setup --vault <path>",
+                "vault setup --capture-note <path|daily> [--capture-section Captures]",
+                "vault setup --encryption-key <passphrase>",
+                "vault setup --auto-update true|false",
                 "vault setup --remote git:<repo-url> [--branch main]   # Self-hosted Git sync",
                 "vault setup --remote s3://<bucket>/<prefix> --endpoint <https://...>   # Self-hosted S3/R2 sync",
                 "vault register --email <e> --password <p>             # Zero-config Hosted Cloud",
@@ -32,7 +50,10 @@ pub fn setup_command(args: &[String], _ctx: &mut Ctx) -> Result<Value, AxiError>
                 "vault setup hooks   # SessionStart dashboard + the `vault` agent skill"
             ],
             "current": cfg.vault_path.unwrap_or_else(|| "(unset)".to_string()),
-            "autoSync": cfg.auto_sync.unwrap_or(true)
+            "autoSync": cfg.auto_sync.unwrap_or(true),
+            "autoUpdate": cfg.auto_update.unwrap_or(true),
+            "captureNote": cfg.capture_note.unwrap_or_else(|| "daily/YYYY-MM-DD.md".to_string()),
+            "encryptionConfigured": cfg.encryption_key.is_some()
         }));
     }
 
@@ -100,6 +121,45 @@ pub fn setup_command(args: &[String], _ctx: &mut Ctx) -> Result<Value, AxiError>
     if let Some(as_val) = auto_sync_flag {
         config.auto_sync = Some(as_val);
         out.insert("autoSync".to_string(), json!(as_val));
+    }
+
+    if let Some(au_val) = auto_update_flag {
+        config.auto_update = Some(au_val);
+        out.insert("autoUpdate".to_string(), json!(au_val));
+    }
+
+    if let Some(cn) = capture_note {
+        let trimmed = cn.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("daily") {
+            config.capture_note = None;
+            out.insert("captureNote".to_string(), json!("daily/YYYY-MM-DD.md"));
+        } else {
+            let norm = crate::vault::normalize_note_path(trimmed);
+            config.capture_note = Some(norm.clone());
+            out.insert("captureNote".to_string(), json!(norm));
+        }
+    }
+
+    if let Some(cs) = capture_section {
+        let trimmed = cs.trim().trim_start_matches('#').trim().to_string();
+        if trimmed.is_empty() {
+            config.capture_section = None;
+            out.insert("captureSection".to_string(), json!("Captures"));
+        } else {
+            config.capture_section = Some(trimmed.clone());
+            out.insert("captureSection".to_string(), json!(trimmed));
+        }
+    }
+
+    if let Some(ek) = encryption_key {
+        let trimmed = ek.trim().to_string();
+        if trimmed.is_empty() {
+            config.encryption_key = None;
+            out.insert("encryptionConfigured".to_string(), json!(false));
+        } else {
+            config.encryption_key = Some(trimmed);
+            out.insert("encryptionConfigured".to_string(), json!(true));
+        }
     }
 
     save_config(&config);

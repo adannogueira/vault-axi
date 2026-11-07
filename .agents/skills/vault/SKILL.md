@@ -31,6 +31,9 @@ vault path [note]                     # print vault root (no arg) or resolve <no
 You do NOT need external file tools or MCPs to create or edit notes:
 
 ```
+# Fast-capture a thought or snippet into today's daily note (daily/YYYY-MM-DD.md under ## Captures by default):
+vault capture "Quick thought or finding" [--to inbox/ideas.md] [--section "Captures"] [--tag work]
+
 # Create a note with title, frontmatter, and body in one call (pass --force to overwrite existing):
 vault write plans/my-plan.md --title "My Plan" --frontmatter status=draft --frontmatter tags="[axi, rust]" --from body.md
 vault write drafts/quick.md --title "Quick Idea" --content "Initial body" [--force] [--stdin]
@@ -45,27 +48,32 @@ vault update <file> --anchor "exact old text" --replace "new text"   # unique-ma
 # Supported ops: section (replace|append|prepend), anchor (old_str/new_str), frontmatter (key/value), insert (after-heading|before-heading|append|prepend)
 vault batch <file> --ops '[{"op":"section","heading":"Design","mode":"replace","content":"New design"},{"op":"frontmatter","key":"status","value":"active"}]'
 
-# Insert blocks or toggle checklist items:
+# Insert blocks, attach files/images (with local OCR indexing), or toggle checklist items:
 vault insert <file> --after-heading "Goals" --content "- new item"   # or --before-heading "<h>"
 vault insert <file> --append --from more.md                          # --append or --prepend to the doc
+vault attach <note> <file_path> [--folder assets] [--section "<h>"]  # copy image/doc into vault, embed ![[...]], and index image OCR
+vault attachments [<note>]                                           # list attachments in vault or linked from <note>
 vault check <file> "Acceptance criterion substring" [--all]          # check (- [x]) or --uncheck (- [ ]) matching task(s) in place
 vault check <file> [--list]                                          # list all checklist items with 1-based line numbers
 ```
 
-## Task Build Logs (`vault log`)
+## Task Build Logs (`vault log`) & Edit History (`vault history`)
 
-While implementing a task that has a corresponding vault file, log entries with automatic timestamps into the task's `## Build Log` section (`--kind <label>` accepts any free-form string; `--section "<h>"` overrides the target heading; creates the note/section if absent). Always pass the `<file>` explicitly so multiple concurrent agent sessions never collide:
+While implementing a task that has a corresponding vault file, log entries with automatic timestamps into the task's `## Build Log` section (`--kind <label>` accepts any free-form string; `--section "<h>"` overrides the target heading; creates the note/section if absent). Every note mutation also records an encrypted version snapshot in `vault history` without polluting search results:
 
 ```
 vault log plans/my-task.md "Chose bundled SQLite FTS5 for zero-dependency builds" --kind decision
 vault log plans/my-task.md "Found Windows file lock when running cargo test + build" --kind trap
-vault log plans/my-task.md "Switched endpoint format" --kind deviation --section "Build Log"
+vault history <file>                                  # list saved versions of <file>
+vault history <file> --version 2 [--full]             # view content of version 2
+vault history <file> --diff 2                         # diff version 2 against current note
+vault history <file> --restore 2                      # restore <file> to version 2
 ```
 
 ## Searching, Filtering & Navigating
 
 ```
-vault search "<query>" [--limit 8] [--full]            # hybrid: FTS5 keyword + semantic (RRF-fused)
+vault search "<query>" [--limit 8] [--full]            # hybrid: FTS5 keyword + semantic (RRF-fused; includes image OCR)
 vault search "<query>" --folder plans --status active --tag infra --since 7d # filter by folder/status/tag or --since <7d|24h|2w|YYYY-MM-DD>
 vault search "<query>" --mode semantic                 # meaning only; --mode fts for keyword only
 vault ls [dir] [--status active] [--tag axi] [--since 7d] [--limit 50] # list notes with metadata filters
@@ -74,19 +82,24 @@ vault links <file>                                     # outbound links (dangler
 vault doctor                                           # audit dangling links, orphans, and missing frontmatter
 ```
 
-## Organizing, Setup & Cloud Sync
+## Organizing, Trash, Setup & Cloud Sync
 
 ```
 vault move <old> <new> [--force]          # rename/move + rewrite every [[wikilink]] that pointed at it
-vault delete <file>                       # idempotent; warns which notes now have dangling links
-vault reindex [--force] [--no-embed]      # refresh FTS5 + embeddings index (search/graph/ls also auto-reconcile)
+vault delete <file> [--permanent]         # move note/attachment to 7-day trash (or delete permanently) and warn on backlinks
+vault trash [--purge]                     # list items recoverable in the 7-day trash (or empty trash with --purge)
+vault restore <file> [--to <new_path>]    # recover a deleted note or attachment from the 7-day trash
+vault reindex [--force] [--no-embed]      # refresh FTS5 + OCR + embeddings index (search/graph/ls also auto-reconcile)
 vault setup --vault <path>                # configure local Obsidian vault path
+vault setup --capture-note <path|daily> [--capture-section Captures] # configure default destination for `vault capture`
+vault setup --encryption-key <passphrase> # configure client-side AES-256-GCM encryption key for cloud & local DB at rest
 vault setup --remote git:<url> [--branch main] # configure Git sync (or s3://<bucket>/<prefix> --endpoint <url>)
-vault setup [--auto-sync true|false] [hooks]   # toggle auto-sync or install Claude Code SessionStart hook + skill
+vault setup [--auto-sync true|false] [--auto-update true|false] [hooks] # toggle auto-sync/auto-update or install SessionStart hook + skill
 vault register --email <e> [--password '<p>'] [--vault-id <id>] # create an account on Vault Cloud (prompts for password if omitted)
 vault login --email <e> [--password '<p>']    # sign in to Vault Cloud (--mfa-code, --mfa-enroll, --mfa-verify, --token, --vault-id)
-vault token [create|list|revoke <id>] [--name <label>] [--vault-id <id>] # manage headless container API keys (set VAULT_API_KEY=vlt_...)
-vault sync [--pull|--push]                # manual cloud sync (runs automatically on reads/writes when configured)
+vault token [create|list|revoke <id>] [--name <label>] [--vault-id <id>] [--scope read|write] [--read-only] # manage scoped API keys (VAULT_API_KEY=vlt_...)
+vault sync [--pull|--push]                # manual cloud sync with live progress (syncs notes, attachments & .obsidian/ config)
+vault self-update [--check]               # check for new GitHub release and self-update binary in place
 vault mcp                                 # start built-in stdio MCP server for Claude Desktop / Cursor
 ```
 

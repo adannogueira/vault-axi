@@ -20,6 +20,103 @@ pub fn list_markdown_files(vault_root: &str) -> Vec<String> {
     out
 }
 
+/// List all non-markdown attachment files under the vault (images, PDFs, audio, documents),
+/// skipping ignored/hidden directories and files over 25 MB.
+pub fn list_attachment_files(vault_root: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let root = Path::new(vault_root);
+    let ignored = ignored_dirs();
+    walk_attachments(root, root, &ignored, &mut out);
+    out.sort();
+    out
+}
+
+/// List portable `.obsidian/` configuration files so a user's Obsidian settings, hotkeys,
+/// snippets, themes, and plugins sync seamlessly across machines without polluting search.
+pub fn list_obsidian_config_files(vault_root: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let root = Path::new(vault_root);
+    let obs_dir = root.join(".obsidian");
+    if obs_dir.is_dir() {
+        walk_obsidian(&obs_dir, root, &mut out);
+        out.sort();
+    }
+    out
+}
+
+/// Check if a vault-relative path is an image attachment suitable for OCR.
+pub fn is_image_attachment(rel_path: &str) -> bool {
+    let lower = rel_path.to_ascii_lowercase();
+    matches!(
+        Path::new(&lower)
+            .extension()
+            .and_then(|e| e.to_str()),
+        Some("png" | "jpg" | "jpeg" | "webp" | "bmp" | "tiff" | "tif" | "gif")
+    )
+}
+
+fn walk_attachments(dir: &Path, root: &Path, ignored: &HashSet<&str>, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') {
+            continue;
+        }
+        let full = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_dir() {
+            if ignored.contains(name_str.as_ref()) {
+                continue;
+            }
+            walk_attachments(&full, root, ignored, out);
+        } else if ft.is_file() {
+            let lower = name_str.to_ascii_lowercase();
+            if lower.ends_with(".md") || lower.ends_with(".tmp") || lower.ends_with(".part") {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                if meta.len() <= 25 * 1024 * 1024 {
+                    out.push(to_rel(root, &full));
+                }
+            }
+        }
+    }
+}
+
+fn walk_obsidian(dir: &Path, root: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if matches!(
+            name_str.as_ref(),
+            "workspace.json" | "workspace-mobile.json" | ".DS_Store" | "cache"
+        ) {
+            continue;
+        }
+        let full = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_dir() {
+            walk_obsidian(&full, root, out);
+        } else if ft.is_file() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.len() <= 10 * 1024 * 1024 {
+                    out.push(to_rel(root, &full));
+                }
+            }
+        }
+    }
+}
+
 fn walk(dir: &Path, root: &Path, ignored: &HashSet<&str>, out: &mut Vec<String>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -130,6 +227,69 @@ pub fn normalize_note_path(rel_path: &str) -> String {
         p.push_str(".md");
     }
     p
+}
+
+/// Normalize any vault-relative path (markdown note, attachment, or `.obsidian/` file).
+/// Appends `.md` only if the basename has no file extension.
+pub fn normalize_any_vault_path(rel_path: &str) -> String {
+    let mut p = rel_path
+        .trim()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+        .replace('\\', "/");
+    while let Some(stripped) = p.strip_prefix("./").or_else(|| p.strip_prefix('/')) {
+        p = stripped.to_string();
+    }
+    while p.contains("//") {
+        p = p.replace("//", "/");
+    }
+    while p.contains("/./") {
+        p = p.replace("/./", "/");
+    }
+    if p.is_empty() || p == "." {
+        return String::new();
+    }
+    let base = match p.rfind('/') {
+        Some(idx) => &p[idx + 1..],
+        None => &p,
+    };
+    if !base.contains('.') {
+        p.push_str(".md");
+    }
+    p
+}
+
+/// Resolve an attachment link target (e.g. `assets/pic.png` or `pic.png`) against known attachments.
+pub fn resolve_attachment_target(target: &str, attachments: &[String]) -> Option<String> {
+    let clean = target
+        .trim()
+        .split('|')
+        .next()
+        .unwrap_or("")
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .replace('\\', "/");
+    let clean = clean.strip_prefix("./").unwrap_or(&clean).trim_start_matches('/');
+    if clean.is_empty() {
+        return None;
+    }
+    let lower = clean.to_lowercase();
+    if let Some(exact) = attachments.iter().find(|a| a.to_lowercase() == lower) {
+        return Some(exact.clone());
+    }
+    if !clean.contains('/') {
+        for att in attachments {
+            let base = match att.rfind('/') {
+                Some(idx) => &att[idx + 1..],
+                None => att.as_str(),
+            };
+            if base.to_lowercase() == lower {
+                return Some(att.clone());
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy)]

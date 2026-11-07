@@ -1,5 +1,6 @@
 use crate::args::{flag_bool, parse_args};
 use crate::axi::AxiError;
+use crate::commands::history::migrate_version_paths;
 use crate::context::Ctx;
 use crate::index::reconcile::ReconcileOpts;
 use crate::markdown::links::{rewrite_wiki_links, WikiLink};
@@ -131,6 +132,7 @@ pub fn move_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
     // Force-invalidate index entries for touched files and update link target_path
     // so sequential renames within the same millisecond never use stale link targets.
     if let Ok(db) = ctx.db() {
+        migrate_version_paths(db, &old_path, &new_path);
         let _ = db.execute(
             "UPDATE links SET target_path = ?1 WHERE target_path = ?2",
             params![new_path, old_path],

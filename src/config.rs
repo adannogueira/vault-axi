@@ -29,6 +29,8 @@ pub enum RemoteBackendConfig {
         email: Option<String>,
         #[serde(rename = "vaultId", skip_serializing_if = "Option::is_none")]
         vault_id: Option<String>,
+        #[serde(rename = "scope", skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
     },
     S3 {
         endpoint: String,
@@ -44,6 +46,16 @@ pub struct VaultConfig {
     pub vault_path: Option<String>,
     #[serde(rename = "autoSync", skip_serializing_if = "Option::is_none")]
     pub auto_sync: Option<bool>,
+    #[serde(rename = "autoUpdate", skip_serializing_if = "Option::is_none")]
+    pub auto_update: Option<bool>,
+    #[serde(rename = "captureNote", skip_serializing_if = "Option::is_none")]
+    pub capture_note: Option<String>,
+    #[serde(rename = "captureSection", skip_serializing_if = "Option::is_none")]
+    pub capture_section: Option<String>,
+    #[serde(rename = "encryptionKey", skip_serializing_if = "Option::is_none")]
+    pub encryption_key: Option<String>,
+    #[serde(rename = "localEncryptionKey", skip_serializing_if = "Option::is_none")]
+    pub local_encryption_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteBackendConfig>,
 }
@@ -123,6 +135,7 @@ pub fn load_config() -> VaultConfig {
                 user_id: None,
                 email: None,
                 vault_id: Some(vid),
+                scope: None,
             });
         }
     }

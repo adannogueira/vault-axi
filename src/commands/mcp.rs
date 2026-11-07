@@ -4,11 +4,29 @@
 
 use crate::axi::AxiError;
 use crate::commands::{
-    batch::batch_command, check::check_command, context_cmd::context_command,
-    delete::delete_command, doctor::doctor_command, home::home_command, insert::insert_command,
-    links::links_command, log::log_command, ls::ls_command, move_cmd::move_command,
-    path::path_command, read::read_command, reindex::reindex_command, related::related_command,
-    search::search_command, sync_cmd::sync_command, update::update_command, write::write_command,
+    attach::{attach_command, attachments_command},
+    batch::batch_command,
+    capture::capture_command,
+    check::check_command,
+    context_cmd::context_command,
+    delete::delete_command,
+    doctor::doctor_command,
+    history::history_command,
+    home::home_command,
+    insert::insert_command,
+    links::links_command,
+    log::log_command,
+    ls::ls_command,
+    move_cmd::move_command,
+    path::path_command,
+    read::read_command,
+    reindex::reindex_command,
+    related::related_command,
+    search::search_command,
+    sync_cmd::sync_command,
+    trash::{restore_command, trash_command},
+    update::update_command,
+    write::write_command,
 };
 use crate::context::Ctx;
 use serde_json::{json, Value};
@@ -366,7 +384,85 @@ pub fn dispatch_mcp_tool(name: &str, args: &Value, ctx: &mut Ctx) -> Result<Valu
             if let Some(f) = str_arg("file") {
                 cli_args.push(f);
             }
+            if bool_arg("permanent") {
+                cli_args.push("--permanent".to_string());
+            }
             delete_command(&cli_args, ctx)
+        }
+        "vault_capture" => {
+            if let Some(t) = str_arg("text").or_else(|| str_arg("content")) {
+                cli_args.push(format!("--content={t}"));
+            }
+            if let Some(to) = str_arg("to").or_else(|| str_arg("file")) {
+                cli_args.push(format!("--to={to}"));
+            }
+            if let Some(sec) = str_arg("section") {
+                cli_args.push(format!("--section={sec}"));
+            }
+            if let Some(tag) = str_arg("tag") {
+                cli_args.push(format!("--tag={tag}"));
+            }
+            capture_command(&cli_args, ctx)
+        }
+        "vault_history" => {
+            if let Some(f) = str_arg("file") {
+                cli_args.push(f);
+            }
+            if let Some(v) = int_arg("version") {
+                cli_args.push(format!("--version={v}"));
+            }
+            if let Some(d) = int_arg("diff") {
+                cli_args.push(format!("--diff={d}"));
+            }
+            if let Some(r) = int_arg("restore") {
+                cli_args.push(format!("--restore={r}"));
+            }
+            if bool_arg("full") {
+                cli_args.push("--full".to_string());
+            }
+            history_command(&cli_args, ctx)
+        }
+        "vault_trash" => {
+            if bool_arg("purge") {
+                cli_args.push("--purge".to_string());
+            }
+            trash_command(&cli_args, ctx)
+        }
+        "vault_restore" => {
+            if let Some(f) = str_arg("file") {
+                cli_args.push(f);
+            }
+            if let Some(to) = str_arg("to") {
+                cli_args.push(format!("--to={to}"));
+            }
+            if bool_arg("force") {
+                cli_args.push("--force".to_string());
+            }
+            restore_command(&cli_args, ctx)
+        }
+        "vault_attach" => {
+            if let Some(n) = str_arg("note").or_else(|| str_arg("file")) {
+                cli_args.push(n);
+            }
+            if let Some(a) = str_arg("attachment").or_else(|| str_arg("path")) {
+                cli_args.push(a);
+            }
+            if let Some(fld) = str_arg("folder") {
+                cli_args.push(format!("--folder={fld}"));
+            }
+            if let Some(sec) = str_arg("section") {
+                cli_args.push(format!("--section={sec}"));
+            }
+            if let Some(al) = str_arg("alias") {
+                cli_args.push(format!("--alias={al}"));
+            }
+            attach_command(&cli_args, ctx)
+        }
+        "vault_attachments" => {
+            if let Some(n) = str_arg("note").or_else(|| str_arg("file")) {
+                cli_args.push(n);
+            }
+            attachments_command(&cli_args, ctx)
         }
         "vault_reindex" => {
             if bool_arg("force") {
@@ -602,11 +698,91 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "vault_delete",
-            "description": "Delete a note and warn if incoming backlinks become dangling.",
+            "description": "Move a note or attachment to the 7-day trash (or delete permanently) and warn if incoming backlinks become dangling.",
             "inputSchema": {
                 "type": "object",
                 "required": ["file"],
-                "properties": { "file": { "type": "string" } }
+                "properties": {
+                    "file": { "type": "string" },
+                    "permanent": { "type": "boolean" }
+                }
+            }
+        },
+        {
+            "name": "vault_capture",
+            "description": "Fast-capture a thought or snippet into today's daily note (or configured capture note) without picking a destination file.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["text"],
+                "properties": {
+                    "text": { "type": "string", "description": "Captured text" },
+                    "to": { "type": "string", "description": "Optional override destination note path" },
+                    "section": { "type": "string", "description": "Optional heading (defaults to 'Captures')" },
+                    "tag": { "type": "string", "description": "Optional tag to append" }
+                }
+            }
+        },
+        {
+            "name": "vault_history",
+            "description": "List saved note versions, view/diff a specific version, or restore a previous version.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["file"],
+                "properties": {
+                    "file": { "type": "string" },
+                    "version": { "type": "integer", "description": "Inspect content of version N" },
+                    "diff": { "type": "integer", "description": "Diff version N against current note" },
+                    "restore": { "type": "integer", "description": "Restore note to version N" },
+                    "full": { "type": "boolean" }
+                }
+            }
+        },
+        {
+            "name": "vault_trash",
+            "description": "List deleted items in the 7-day trash (or permanently purge all trash).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "purge": { "type": "boolean" }
+                }
+            }
+        },
+        {
+            "name": "vault_restore",
+            "description": "Restore a deleted note or attachment from the 7-day trash.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["file"],
+                "properties": {
+                    "file": { "type": "string" },
+                    "to": { "type": "string" },
+                    "force": { "type": "boolean" }
+                }
+            }
+        },
+        {
+            "name": "vault_attach",
+            "description": "Attach an image or document to a note (with local OCR indexing for images).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["note", "attachment"],
+                "properties": {
+                    "note": { "type": "string" },
+                    "attachment": { "type": "string", "description": "Path to image or document file" },
+                    "folder": { "type": "string", "description": "Assets folder inside vault (default 'assets')" },
+                    "section": { "type": "string" },
+                    "alias": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "vault_attachments",
+            "description": "List attachments in the vault or linked from a specific note.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "note": { "type": "string" }
+                }
             }
         },
         {

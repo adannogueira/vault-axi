@@ -3,24 +3,46 @@ pub mod axi;
 pub mod commands;
 pub mod config;
 pub mod context;
+pub mod crypto;
 pub mod db;
 pub mod index;
 pub mod markdown;
+pub mod ocr;
 pub mod render;
 pub mod sync;
+pub mod updater;
 pub mod vault;
 
 use crate::axi::{print_error, print_toon, AxiError};
 use crate::commands::{
-    batch::batch_command, check::check_command, context_cmd::context_command,
-    delete::delete_command, doctor::doctor_command, home::home_command, insert::insert_command,
-    links::links_command, log::log_command, ls::ls_command, mcp::mcp_command,
-    move_cmd::move_command, path::path_command, read::read_command, reindex::reindex_command,
-    related::related_command, search::search_command, setup::setup_command,
+    attach::{attach_command, attachments_command},
+    batch::batch_command,
+    capture::capture_command,
+    check::check_command,
+    context_cmd::context_command,
+    delete::delete_command,
+    doctor::doctor_command,
+    history::history_command,
+    home::home_command,
+    insert::insert_command,
+    links::links_command,
+    log::log_command,
+    ls::ls_command,
+    mcp::mcp_command,
+    move_cmd::move_command,
+    path::path_command,
+    read::read_command,
+    reindex::reindex_command,
+    related::related_command,
+    search::search_command,
+    setup::setup_command,
     sync_cmd::{login_command, register_command, sync_command, token_command},
-    update::update_command, write::write_command,
+    trash::{restore_command, trash_command},
+    update::update_command,
+    write::write_command,
 };
 use crate::context::Ctx;
+use crate::updater::{auto_update_if_due, self_update_command};
 use std::io::{self, Write};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,6 +54,7 @@ Usage: vault <command> [args] [flags]
 
 Commands:
   (none)                 Dashboard: vault stats, recent notes, next steps
+  capture "<text>"       Fast-capture a thought/note into today's daily note (or configured note)
   read <file>            Read a note; --outline | --section <h> | --frontmatter | --lines a-b | --full
   context <file>         1-call context bundle: note + outlines/previews of connected [[wikilinks]]
   path [note]            Resolve a note's absolute path, or print the vault root
@@ -41,19 +64,25 @@ Commands:
   insert <file>          Insert a block; --after-heading <h> | --before-heading <h> | --append | --prepend
   log <file> "<entry>"   Append timestamped entry to a task's ## Build Log; [--kind <label>] [--section <h>]
   check <file> [query]   Toggle (- [x] / - [ ]) or --list markdown checklist items in place
+  attach <note> <file>   Attach an image or document to a note (with local OCR indexing for images)
+  attachments [note]     List vault attachments (or attachments embedded in <note>)
+  history <file>         View, diff, or restore previous note versions (--version N | --diff N | --restore N)
   search <query>         Hybrid FTS5 + semantic search; --mode hybrid|fts|semantic | --status <s> | --tag <t> | --since 7d
   related <file>         Notes related by [[links]] and meaning
   links <file>           Outbound links and backlinks
   ls [dir]               List notes with status/tags; --status <s> | --tag <t> | --since 7d | --limit N
   doctor                 Audit vault health: dangling links, orphan notes, and missing frontmatter
   move <old> <new>       Move/rename a note and rewrite [[wikilinks]] vault-wide
-  delete <file>          Delete a note (warns about incoming backlinks)
+  delete <file>          Move a note/attachment to 7-day trash (--permanent to delete immediately)
+  trash                  List deleted items in the 7-day trash (--purge to empty)
+  restore <file>         Restore a deleted note or attachment from the 7-day trash
   reindex                Refresh the search index; --force | --no-embed
   register               Create an account on Vault Cloud (--email <e> [--password '<p>'])
   login                  Sign in to Vault Cloud (--email <e> [--password '<p>'] [--mfa-code <code>])
-  token                  Manage headless/container API keys (create | list | revoke)
+  token                  Manage scoped API keys (create [--vault-id <id>] [--scope read|write] | list | revoke)
   sync                   Synchronize with cloud backend (Vault Cloud, Git, or S3); --pull | --push
-  setup                  Configure vault path, remote backend (git/s3), or 'hooks'
+  self-update            Check for a new release and update the vault binary (--check)
+  setup                  Configure vault path, capture note, encryption key, remote backend, or 'hooks'
   mcp                    Run built-in Model Context Protocol (MCP) server over stdio"#;
 
 fn get_command_help(command: &str) -> Option<&'static str> {
@@ -148,8 +177,36 @@ Audits vault health: lists all dangling [[wikilinks]], orphan notes, and notes m
 Moves/renames a note and rewrites every [[wikilink]] that pointed at it."#,
         ),
         "delete" => Some(
-            r#"vault delete <file>
-Deletes a note (idempotent) and warns which notes now have dangling links."#,
+            r#"vault delete <file> [--permanent]
+Moves a note or attachment to the 7-day trash (or deletes permanently with --permanent) and warns which notes now have dangling links."#,
+        ),
+        "trash" => Some(
+            r#"vault trash [--purge]
+Lists deleted notes and attachments in the 7-day trash (or permanently empties the trash with --purge)."#,
+        ),
+        "restore" => Some(
+            r#"vault restore <file> [--to <new_path>] [--force]
+Restores a deleted note or attachment from the 7-day trash."#,
+        ),
+        "capture" => Some(
+            r#"vault capture "<text>" [--to <note>] [--section <heading>] [--tag <tag>]
+Fast-captures a thought or snippet into today's daily note (`daily/YYYY-MM-DD.md` under `## Captures` by default, or the note configured via `vault setup --capture-note <path>`)."#,
+        ),
+        "history" => Some(
+            r#"vault history <file> [--version <N> | --diff <N> | --restore <N>] [--full]
+Lists saved versions of a note, inspects/diffs a specific version, or restores `<file>` to version N."#,
+        ),
+        "attach" => Some(
+            r#"vault attach <note> <file_path> [--folder assets] [--section <heading>] [--alias <label>]
+Copies an image or document into the vault (`assets/` by default), embeds `![[...]]` in `<note>`, and indexes local OCR text for images."#,
+        ),
+        "attachments" => Some(
+            r#"vault attachments [<note>]
+Lists all attachment files in the vault (or attachments linked from `<note>`), including image OCR status."#,
+        ),
+        "self-update" => Some(
+            r#"vault self-update [--check] [--force]
+Checks GitHub Releases (`adannogueira/vault-axi`) for a newer version and updates the `vault` binary in place."#,
         ),
         "reindex" => Some(
             r#"vault reindex [--force] [--no-embed]
@@ -168,19 +225,22 @@ and automatically configures local sync. Omit --password to be prompted interact
 Signs in to Vault Cloud and enables automatic background delta sync. Omit --password to be prompted interactively."#,
         ),
         "token" => Some(
-            r#"vault token [create | list | revoke <id-or-prefix>] [--name <label>] [--vault-id <id>]
-  create [--name <label>]   Generate a long-lived `vlt_...` API key for headless containers / CI / agents
+            r#"vault token [create | list | revoke <id-or-prefix>] [--name <label>] [--vault-id <id>] [--scope read|write] [--read-only]
+  create [--name <label>]   Generate a long-lived `vlt_...` API key scoped to a vault and permission mode (read or write)
   list                      List active API keys on your account
   revoke <id-or-prefix>     Revoke an API key immediately
 In a headless container, set `VAULT_API_KEY=vlt_...` and `vault` will silently authenticate on first use."#,
         ),
         "sync" => Some(
             r#"vault sync [--pull] [--push]
-Synchronizes notes with the configured cloud backend (Hosted Cloud, Git, or S3/R2)."#,
+Synchronizes notes, attachments, and `.obsidian/` config with the configured cloud backend (with live progress and AES-256-GCM encryption at rest)."#,
         ),
         "setup" => Some(
-            r#"vault setup [--vault <path>] [--remote <git-url|s3://...>] [--auto-sync true|false] [hooks]
+            r#"vault setup [--vault <path>] [--capture-note <path|daily>] [--encryption-key <key>] [--auto-update true|false] [--remote <git-url|s3://...>] [hooks]
   --vault <path>            Point at your local Obsidian vault
+  --capture-note <path>     Configure default destination note for `vault capture`
+  --encryption-key <key>    Configure client-side AES-256-GCM encryption passphrase
+  --auto-update true|false  Enable or disable automatic background self-updates
   --remote git:<repo-url>   Configure Git cloud backend
   --remote s3://<bucket>    Configure S3/R2 cloud backend (with --endpoint <https://...>)
   hooks                     Install Claude Code SessionStart dashboard hook + skill"#,
@@ -195,6 +255,7 @@ Add `"command": "vault", "args": ["mcp"]` to Claude Desktop or Cursor MCP settin
 }
 
 fn main() {
+    auto_update_if_due();
     let argv: Vec<String> = std::env::args().skip(1).collect();
 
     if argv.is_empty() {
@@ -248,6 +309,7 @@ fn main() {
 
     let mut ctx = Ctx::new();
     let res = match first {
+        "capture" => capture_command(rest, &mut ctx),
         "read" => read_command(rest, &mut ctx),
         "context" => context_command(rest, &mut ctx),
         "path" => path_command(rest, &mut ctx),
@@ -257,6 +319,9 @@ fn main() {
         "insert" => insert_command(rest, &mut ctx),
         "log" => log_command(rest, &mut ctx),
         "check" => check_command(rest, &mut ctx),
+        "attach" => attach_command(rest, &mut ctx),
+        "attachments" => attachments_command(rest, &mut ctx),
+        "history" => history_command(rest, &mut ctx),
         "search" => search_command(rest, &mut ctx),
         "related" => related_command(rest, &mut ctx),
         "links" => links_command(rest, &mut ctx),
@@ -264,11 +329,14 @@ fn main() {
         "doctor" => doctor_command(rest, &mut ctx),
         "move" => move_command(rest, &mut ctx),
         "delete" => delete_command(rest, &mut ctx),
+        "trash" => trash_command(rest, &mut ctx),
+        "restore" => restore_command(rest, &mut ctx),
         "reindex" => reindex_command(rest, &mut ctx),
         "register" => register_command(rest, &mut ctx),
         "login" => login_command(rest, &mut ctx),
         "token" => token_command(rest, &mut ctx),
         "sync" => sync_command(rest, &mut ctx),
+        "self-update" | "update-self" => self_update_command(rest, &mut ctx),
         "setup" => setup_command(rest, &mut ctx),
         _ => {
             let _ = DESCRIPTION;
@@ -300,9 +368,36 @@ mod tests {
     #[test]
     fn command_help_covers_all_documented_commands() {
         let cmds = [
-            "read", "context", "write", "path", "update", "batch", "insert", "log", "check",
-            "search", "related", "links", "ls", "doctor", "move", "delete", "reindex", "register",
-            "login", "token", "sync", "setup", "mcp",
+            "capture",
+            "read",
+            "context",
+            "write",
+            "path",
+            "update",
+            "batch",
+            "insert",
+            "log",
+            "check",
+            "attach",
+            "attachments",
+            "history",
+            "search",
+            "related",
+            "links",
+            "ls",
+            "doctor",
+            "move",
+            "delete",
+            "trash",
+            "restore",
+            "reindex",
+            "register",
+            "login",
+            "token",
+            "sync",
+            "self-update",
+            "setup",
+            "mcp",
         ];
         for c in cmds {
             let h = get_command_help(c);

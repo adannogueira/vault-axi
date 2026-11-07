@@ -1,5 +1,6 @@
 use crate::args::{flag_bool, parse_args};
 use crate::axi::AxiError;
+use crate::commands::history::record_edit_transition;
 use crate::context::Ctx;
 use crate::markdown::sections::{join_lines, split_lines};
 use crate::vault::{normalize_note_path, resolve_in_vault};
@@ -121,6 +122,9 @@ pub fn check_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
     if changed {
         fs::write(abs_path, &out)
             .map_err(|e| AxiError::new(format!("Write error: {e}"), "INTERNAL_ERROR", vec![]))?;
+        if let Ok(db) = ctx.db() {
+            record_edit_transition(db, &note_path, Some(&raw), &out, "check");
+        }
         ctx.sync_after_mutation()?;
     }
 

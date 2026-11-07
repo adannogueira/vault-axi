@@ -1,8 +1,11 @@
+pub mod attach;
 pub mod batch;
+pub mod capture;
 pub mod check;
 pub mod context_cmd;
 pub mod delete;
 pub mod doctor;
+pub mod history;
 pub mod home;
 pub mod insert;
 pub mod links;
@@ -17,5 +20,6 @@ pub mod related;
 pub mod search;
 pub mod setup;
 pub mod sync_cmd;
+pub mod trash;
 pub mod update;
 pub mod write;

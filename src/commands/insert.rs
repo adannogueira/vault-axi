@@ -1,5 +1,6 @@
 use crate::args::{flag_bool, flag_string, parse_args, resolve_content};
 use crate::axi::AxiError;
+use crate::commands::history::record_edit_transition;
 use crate::context::Ctx;
 use crate::markdown::sections::{
     append_to_doc, insert_at_heading, prepend_to_doc, HeadingAnchor, SectionError, SectionErrorKind,
@@ -78,6 +79,9 @@ pub fn insert_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
     }
     fs::write(abs_path, &out)
         .map_err(|e| AxiError::new(format!("Write error: {e}"), "INTERNAL_ERROR", vec![]))?;
+    if let Ok(db) = ctx.db() {
+        record_edit_transition(db, &note_path, Some(&raw), &out, "insert");
+    }
     ctx.sync_after_mutation()?;
     let mut resp = json!({
         "ok": true,

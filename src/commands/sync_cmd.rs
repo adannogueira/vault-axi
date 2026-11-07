@@ -278,6 +278,11 @@ pub fn token_command(args: &[String], _ctx: &mut Ctx) -> Result<Value, AxiError>
         }
     });
     let vault_id = flag_string(&parsed.flags, "vault-id");
+    let scope = if flag_bool(&parsed.flags, "read-only") || flag_bool(&parsed.flags, "readonly") {
+        Some("read".to_string())
+    } else {
+        flag_string(&parsed.flags, "scope")
+    };
     let target = flag_string(&parsed.flags, "revoke")
         .or_else(|| flag_string(&parsed.flags, "id"))
         .or_else(|| {
@@ -292,6 +297,7 @@ pub fn token_command(args: &[String], _ctx: &mut Ctx) -> Result<Value, AxiError>
         subaction,
         name.as_deref(),
         vault_id.as_deref(),
+        scope.as_deref(),
         target.as_deref(),
     )
 }

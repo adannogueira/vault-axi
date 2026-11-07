@@ -1,5 +1,6 @@
 use crate::args::{flag_string, parse_args, resolve_content};
 use crate::axi::AxiError;
+use crate::commands::history::record_edit_transition;
 use crate::context::Ctx;
 use crate::markdown::sections::{
     append_to_doc, edit_section, parse_doc, resolve_section, SectionMode,
@@ -81,6 +82,9 @@ pub fn log_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
         );
         fs::write(abs_path, &initial)
             .map_err(|e| AxiError::new(format!("Write error: {e}"), "INTERNAL_ERROR", vec![]))?;
+        if let Ok(db) = ctx.db() {
+            record_edit_transition(db, &note_path, None, &initial, "log");
+        }
     } else {
         let raw = fs::read_to_string(abs_path)
             .map_err(|e| AxiError::new(format!("Read error: {e}"), "INTERNAL_ERROR", vec![]))?;
@@ -94,6 +98,9 @@ pub fn log_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
         };
         fs::write(abs_path, &updated)
             .map_err(|e| AxiError::new(format!("Write error: {e}"), "INTERNAL_ERROR", vec![]))?;
+        if let Ok(db) = ctx.db() {
+            record_edit_transition(db, &note_path, Some(&raw), &updated, "log");
+        }
     }
 
     ctx.sync_after_mutation()?;

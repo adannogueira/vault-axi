@@ -1,5 +1,6 @@
 use crate::args::{flag_bool, flag_string, parse_args, resolve_content, FlagValue};
 use crate::axi::AxiError;
+use crate::commands::history::record_edit_transition;
 use crate::context::Ctx;
 use crate::markdown::frontmatter::{coerce_value, set_frontmatter_field};
 use crate::vault::{normalize_note_path, resolve_in_vault};
@@ -78,11 +79,19 @@ pub fn write_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
         content.push('\n');
     }
 
+    let old_content = if existed {
+        fs::read_to_string(abs_path).ok()
+    } else {
+        None
+    };
     if let Some(parent) = abs_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
     fs::write(abs_path, &content)
         .map_err(|e| AxiError::new(format!("Write error: {e}"), "INTERNAL_ERROR", vec![]))?;
+    if let Ok(db) = ctx.db() {
+        record_edit_transition(db, &note_path, old_content.as_deref(), &content, "write");
+    }
     ctx.sync_after_mutation()?;
 
     let mut out = json!({

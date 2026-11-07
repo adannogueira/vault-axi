@@ -1,16 +1,18 @@
 use crate::axi::AxiError;
 use crate::context::Ctx;
 use crate::index::reconcile::ReconcileOpts;
+use crate::vault::{list_attachment_files, resolve_attachment_target};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
 pub fn doctor_command(_args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
-    let _ = ctx.require_vault()?;
+    let root = ctx.require_vault()?;
     ctx.sync(ReconcileOpts {
         force: false,
         with_embeddings: Some(false),
     })?;
     let db = ctx.db()?;
+    let attachments = list_attachment_files(&root);
 
     let mut all_files: Vec<(String, Option<String>)> = Vec::new();
     if let Ok(mut stmt) = db.prepare("SELECT path, frontmatter FROM files ORDER BY path") {
@@ -29,6 +31,9 @@ pub fn doctor_command(_args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         }) {
             for (src, raw_target) in rows.flatten() {
+                if resolve_attachment_target(&raw_target, &attachments).is_some() {
+                    continue;
+                }
                 dangling_links.push(json!({
                     "from": src,
                     "danglingTarget": raw_target

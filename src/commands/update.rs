@@ -1,5 +1,6 @@
 use crate::args::{flag_string, parse_args, resolve_content, FlagValue};
 use crate::axi::AxiError;
+use crate::commands::history::record_edit_transition;
 use crate::context::Ctx;
 use crate::markdown::frontmatter::{
     coerce_value, set_frontmatter_field, unset_frontmatter_field,
@@ -112,6 +113,9 @@ pub fn update_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
 
     fs::write(abs_path, &out)
         .map_err(|e| AxiError::new(format!("Write error: {e}"), "INTERNAL_ERROR", vec![]))?;
+    if let Ok(db) = ctx.db() {
+        record_edit_transition(db, &note_path, Some(&raw), &out, "update");
+    }
     ctx.sync_after_mutation()?;
 
     resp.insert("changed".to_string(), json!(true));

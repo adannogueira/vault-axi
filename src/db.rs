@@ -92,6 +92,33 @@ fn migrate(db: &Connection) -> rusqlite::Result<()> {
           synced_at     INTEGER NOT NULL,
           base_content  TEXT NOT NULL DEFAULT ''
         );
+
+        CREATE TABLE IF NOT EXISTS trash (
+          path          TEXT PRIMARY KEY,
+          content       TEXT NOT NULL,
+          is_binary     INTEGER NOT NULL DEFAULT 0,
+          mtime_ms      INTEGER NOT NULL,
+          deleted_at    INTEGER NOT NULL,
+          expires_at    INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS note_versions (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          path          TEXT NOT NULL,
+          version_num   INTEGER NOT NULL,
+          hash          TEXT NOT NULL,
+          size          INTEGER NOT NULL,
+          content       TEXT NOT NULL,
+          created_at    INTEGER NOT NULL,
+          source        TEXT NOT NULL DEFAULT 'local'
+        );
+        CREATE INDEX IF NOT EXISTS idx_note_versions_path ON note_versions(path, version_num DESC);
+
+        CREATE TABLE IF NOT EXISTS ocr_cache (
+          hash          TEXT PRIMARY KEY,
+          text          TEXT NOT NULL,
+          updated_at    INTEGER NOT NULL
+        );
         "#,
     )?;
 
