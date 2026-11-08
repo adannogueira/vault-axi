@@ -143,10 +143,147 @@ pub fn decrypt_with_key(stored: &str, key_bytes: &[u8; 32]) -> Result<String, St
         .map_err(|e| format!("Decrypted payload is not valid UTF-8: {e}"))
 }
 
+/// Short 16-hex-character fingerprint of the currently active encryption key.
+/// Used to detect when remote or local rows need re-encryption after a key change.
+pub fn active_key_fingerprint() -> String {
+    let key = resolve_active_key();
+    let full = sha256_hex(&key);
+    full[..16].to_string()
+}
+
 /// Encrypt a string at rest using the active vault encryption key.
 pub fn encrypt_at_rest(plaintext: &str) -> String {
     let key = resolve_active_key();
     encrypt_with_key(plaintext, &key)
+}
+
+/// Re-encrypt all rows in local SQLite (`sync_state`, `note_versions`, `trash`) that are either
+/// plaintext or encrypted with an older key, migrating them to `new_key`.
+/// Returns the total number of local rows re-encrypted.
+pub fn reencrypt_local_db(
+    db: &rusqlite::Connection,
+    old_key: Option<&[u8; 32]>,
+    new_key: &[u8; 32],
+) -> usize {
+    let mut updated = 0usize;
+
+    let decrypt_any = |raw: &str| -> Option<String> {
+        if !raw.starts_with(ENC_PREFIX) {
+            return Some(raw.to_string());
+        }
+        if let Some(ok) = old_key {
+            if let Ok(plain) = decrypt_with_key(raw, ok) {
+                return Some(plain);
+            }
+        }
+        decrypt_at_rest(raw).ok()
+    };
+
+    // 1. sync_state.base_content
+    if let Ok(mut stmt) =
+        db.prepare("SELECT path, COALESCE(base_content, '') FROM sync_state")
+    {
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        for (path, raw) in rows {
+            if raw.is_empty() {
+                continue;
+            }
+            let already_on_new =
+                raw.starts_with(ENC_PREFIX) && decrypt_with_key(&raw, new_key).is_ok();
+            if !already_on_new {
+                if let Some(plain) = decrypt_any(&raw) {
+                    let reenc = encrypt_with_key(&plain, new_key);
+                    if db
+                        .execute(
+                            "UPDATE sync_state SET base_content = ?1 WHERE path = ?2",
+                            rusqlite::params![reenc, path],
+                        )
+                        .is_ok()
+                    {
+                        updated += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. note_versions.content
+    if let Ok(mut stmt) = db.prepare("SELECT id, content FROM note_versions") {
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        for (id, raw) in rows {
+            if raw.is_empty() {
+                continue;
+            }
+            let already_on_new =
+                raw.starts_with(ENC_PREFIX) && decrypt_with_key(&raw, new_key).is_ok();
+            if !already_on_new {
+                if let Some(plain) = decrypt_any(&raw) {
+                    let reenc = encrypt_with_key(&plain, new_key);
+                    if db
+                        .execute(
+                            "UPDATE note_versions SET content = ?1 WHERE id = ?2",
+                            rusqlite::params![reenc, id],
+                        )
+                        .is_ok()
+                    {
+                        updated += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. trash.content
+    if let Ok(mut stmt) = db.prepare("SELECT id, content FROM trash") {
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        for (id, raw) in rows {
+            if raw.is_empty() {
+                continue;
+            }
+            let already_on_new =
+                raw.starts_with(ENC_PREFIX) && decrypt_with_key(&raw, new_key).is_ok();
+            if !already_on_new {
+                if let Some(plain) = decrypt_any(&raw) {
+                    let reenc = encrypt_with_key(&plain, new_key);
+                    if db
+                        .execute(
+                            "UPDATE trash SET content = ?1 WHERE id = ?2",
+                            rusqlite::params![reenc, id],
+                        )
+                        .is_ok()
+                    {
+                        updated += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    updated
+}
+
+/// Ensure all rows in local SQLite (`sync_state`, `note_versions`, `trash`) are encrypted with the active key.
+pub fn ensure_local_db_encrypted(db: &rusqlite::Connection) -> usize {
+    let key = resolve_active_key();
+    reencrypt_local_db(db, None, &key)
 }
 
 /// Decrypt a string stored at rest. Falls back to fallback keys if a custom key was recently toggled.

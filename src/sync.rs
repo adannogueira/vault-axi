@@ -628,6 +628,8 @@ struct RemoteNoteMeta {
     mtime_ms: i64,
     #[serde(default)]
     deleted: bool,
+    #[serde(default)]
+    enc_key_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -663,6 +665,32 @@ fn fetch_remote_note(
     let mut note = list.pop()?;
     note.content = decrypt_at_rest(&note.content).ok()?;
     Some(note)
+}
+
+fn fetch_raw_remote_content(
+    clean_url: &str,
+    anon_key: &str,
+    bearer: &str,
+    vault_id: &str,
+    path: &str,
+) -> Option<String> {
+    let fetch_url = format!(
+        "{clean_url}/rest/v1/vault_notes?vault_id=eq.{vault_id}&path=eq.{}&select=content",
+        urlencoding_simple(path)
+    );
+    let mut req = ureq::get(&fetch_url)
+        .set("apikey", anon_key)
+        .set("Authorization", &format!("Bearer {bearer}"));
+    if let Some(env_key) = env_api_key() {
+        req = req.set("x-vault-api-key", &env_key);
+    }
+    let r = req.call().ok()?;
+    let s = r.into_string().ok()?;
+    let mut list: Vec<Value> = serde_json::from_str(&s).ok()?;
+    let item = list.pop()?;
+    item.get("content")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Resolve a concurrent modification where both local (`local_content`) and remote (`full`)
@@ -733,6 +761,7 @@ fn resolve_concurrent_edit(
                     hash: full.hash.clone(),
                     mtime_ms: full.mtime_ms,
                     deleted: false,
+                    enc_key_id: crate::crypto::active_key_fingerprint(),
                 },
             );
         }
@@ -759,6 +788,7 @@ fn resolve_concurrent_edit(
                         hash: full.hash.clone(),
                         mtime_ms: full.mtime_ms,
                         deleted: false,
+                        enc_key_id: crate::crypto::active_key_fingerprint(),
                     },
                 );
                 summary.pulled += 1;
@@ -804,6 +834,7 @@ fn resolve_concurrent_edit(
                         hash: full.hash.clone(),
                         mtime_ms: full.mtime_ms,
                         deleted: false,
+                        enc_key_id: crate::crypto::active_key_fingerprint(),
                     },
                 );
                 summary.pulled += 1;
@@ -976,68 +1007,142 @@ fn sync_hosted_cloud(
         ));
     }
 
-    let manifest_url = format!(
-        "{clean_url}/rest/v1/vault_notes?vault_id=eq.{effective_vault_id}&select=path,hash,mtime_ms,deleted"
-    );
-    let mut req = ureq::get(&manifest_url)
-        .set("apikey", anon_key)
-        .set("Authorization", &format!("Bearer {bearer}"));
-    if let Some(env_key) = env_api_key() {
-        req = req.set("x-vault-api-key", &env_key);
-    }
-    let mut resp = req.call();
+    let _ = crate::crypto::ensure_local_db_encrypted(db);
+    let current_key_id = crate::crypto::active_key_fingerprint();
 
-    // Automatically refresh expired JWT via refresh_token or VAULT_API_KEY if available
-    if resp.is_err() {
-        let mut refreshed = false;
-        if let Some(rt) = refresh_token {
-            if let Some((new_access, _)) = try_refresh_hosted_token(rt) {
-                bearer = new_access;
-                refreshed = true;
+    // Fetch the entire remote manifest in pages of 1000 (PostgREST caps single responses at 1000 rows).
+    let mut remote_manifest: Vec<RemoteNoteMeta> = Vec::new();
+    let mut page_offset = 0usize;
+    let page_size = 1000usize;
+    let mut select_cols = "path,hash,mtime_ms,deleted,enc_key_id";
+
+    loop {
+        let manifest_url = format!(
+            "{clean_url}/rest/v1/vault_notes?vault_id=eq.{effective_vault_id}&select={select_cols}&order=path.asc&limit={page_size}&offset={page_offset}"
+        );
+        let mut req = ureq::get(&manifest_url)
+            .set("apikey", anon_key)
+            .set("Authorization", &format!("Bearer {bearer}"));
+        if let Some(env_key) = env_api_key() {
+            req = req.set("x-vault-api-key", &env_key);
+        }
+        let mut resp = req.call();
+
+        // If a self-hosted table lacks `enc_key_id`, fall back to the 4 base columns
+        if let Err(ureq::Error::Status(400, _)) = resp {
+            if select_cols.contains("enc_key_id") {
+                select_cols = "path,hash,mtime_ms,deleted";
+                let fallback_url = format!(
+                    "{clean_url}/rest/v1/vault_notes?vault_id=eq.{effective_vault_id}&select={select_cols}&order=path.asc&limit={page_size}&offset={page_offset}"
+                );
+                let mut fb_req = ureq::get(&fallback_url)
+                    .set("apikey", anon_key)
+                    .set("Authorization", &format!("Bearer {bearer}"));
+                if let Some(env_key) = env_api_key() {
+                    fb_req = fb_req.set("x-vault-api-key", &env_key);
+                }
+                resp = fb_req.call();
             }
         }
-        if !refreshed {
-            if let Some(env_key) = env_api_key() {
-                if env_key.starts_with("vlt_") {
-                    if let Ok((new_access, _, uid, _, _, sc)) = exchange_api_key(&env_key) {
-                        bearer = new_access;
-                        if uid.is_some() {
-                            effective_user_id = uid;
+
+        // Automatically refresh expired JWT via refresh_token or VAULT_API_KEY if available
+        if resp.is_err() && page_offset == 0 {
+            let mut refreshed = false;
+            if let Some(rt) = refresh_token {
+                if let Some((new_access, _)) = try_refresh_hosted_token(rt) {
+                    bearer = new_access;
+                    refreshed = true;
+                }
+            }
+            if !refreshed {
+                if let Some(env_key) = env_api_key() {
+                    if env_key.starts_with("vlt_") {
+                        if let Ok((new_access, _, uid, _, _, sc)) = exchange_api_key(&env_key) {
+                            bearer = new_access;
+                            if uid.is_some() {
+                                effective_user_id = uid;
+                            }
+                            effective_scope = sc;
+                            refreshed = true;
                         }
-                        effective_scope = sc;
-                        refreshed = true;
                     }
                 }
             }
-        }
-        if refreshed {
-            let mut retry_req = ureq::get(&manifest_url)
-                .set("apikey", anon_key)
-                .set("Authorization", &format!("Bearer {bearer}"));
-            if let Some(env_key) = env_api_key() {
-                retry_req = retry_req.set("x-vault-api-key", &env_key);
+            if refreshed {
+                let retry_url = format!(
+                    "{clean_url}/rest/v1/vault_notes?vault_id=eq.{effective_vault_id}&select={select_cols}&order=path.asc&limit={page_size}&offset={page_offset}"
+                );
+                let mut retry_req = ureq::get(&retry_url)
+                    .set("apikey", anon_key)
+                    .set("Authorization", &format!("Bearer {bearer}"));
+                if let Some(env_key) = env_api_key() {
+                    retry_req = retry_req.set("x-vault-api-key", &env_key);
+                }
+                resp = retry_req.call();
             }
-            resp = retry_req.call();
         }
+
+        let resp = resp.map_err(|e| {
+            AxiError::new(
+                format!("Hosted cloud sync request failed: {e}"),
+                "SYNC_ERROR",
+                vec![
+                    "Check your network connection or run `vault login --email <email> --password <password>`"
+                        .to_string(),
+                ],
+            )
+        })?;
+
+        let body_str = resp.into_string().unwrap_or_else(|_| "[]".to_string());
+        let page: Vec<RemoteNoteMeta> = serde_json::from_str(&body_str).unwrap_or_default();
+        let count = page.len();
+        remote_manifest.extend(page);
+        if count < page_size {
+            break;
+        }
+        page_offset += count;
     }
 
-    let resp = resp.map_err(|e| {
-        AxiError::new(
-            format!("Hosted cloud sync request failed: {e}"),
-            "SYNC_ERROR",
-            vec![
-                "Check your network connection or run `vault login --email <email> --password <password>`"
-                    .to_string(),
-            ],
-        )
-    })?;
-
-    let body_str = resp.into_string().unwrap_or_else(|_| "[]".to_string());
-    let remote_manifest: Vec<RemoteNoteMeta> = serde_json::from_str(&body_str).unwrap_or_default();
     let mut remote_map: HashMap<String, RemoteNoteMeta> = remote_manifest
         .into_iter()
         .map(|m| (m.path.clone(), m))
         .collect();
+
+    // If any remote rows have `enc_key_id == "enc-v1"` (encrypted before key fingerprinting was added),
+    // probe one such active row to see if it already decrypts with the active encryption key.
+    if let Some(sample_path) = remote_map
+        .values()
+        .find(|m| !m.deleted && m.enc_key_id == "enc-v1")
+        .map(|m| m.path.clone())
+    {
+        if let Some(raw_ct) =
+            fetch_raw_remote_content(clean_url, anon_key, &bearer, &effective_vault_id, &sample_path)
+        {
+            let active_key = crate::crypto::resolve_active_key();
+            if raw_ct.starts_with(crate::crypto::ENC_PREFIX)
+                && crate::crypto::decrypt_with_key(&raw_ct, &active_key).is_ok()
+            {
+                // Stamp all `enc-v1` rows in this vault with `current_key_id` so they don't need re-uploading
+                let stamp_url = format!(
+                    "{clean_url}/rest/v1/vault_notes?vault_id=eq.{effective_vault_id}&enc_key_id=eq.enc-v1"
+                );
+                let stamp_payload = json!({ "enc_key_id": current_key_id });
+                let mut stamp_req = ureq::request("PATCH", &stamp_url)
+                    .set("apikey", anon_key)
+                    .set("Authorization", &format!("Bearer {bearer}"))
+                    .set("Content-Type", "application/json");
+                if let Some(env_key) = env_api_key() {
+                    stamp_req = stamp_req.set("x-vault-api-key", &env_key);
+                }
+                let _ = stamp_req.send_string(&stamp_payload.to_string());
+                for rm in remote_map.values_mut() {
+                    if rm.enc_key_id == "enc-v1" {
+                        rm.enc_key_id = current_key_id.clone();
+                    }
+                }
+            }
+        }
+    }
 
     let mut synced_state: HashMap<String, SyncedEntry> = HashMap::new();
     if let Ok(mut stmt) =
@@ -1071,19 +1176,20 @@ fn sync_hosted_cloud(
     if do_pull {
         let mut remote_keys: Vec<String> = remote_map.keys().cloned().collect();
         remote_keys.sort();
-        let total_remote = remote_keys.len().max(1);
-        let mut pull_idx = 0usize;
-        for r_path in remote_keys {
-            let Some(r_meta) = remote_map.get(&r_path).cloned() else {
+
+        // Pre-count how many remote files actually need downloading so progress ends at N/N
+        let mut to_download_paths: Vec<String> = Vec::new();
+        for r_path in &remote_keys {
+            let Some(r_meta) = remote_map.get(r_path).cloned() else {
                 continue;
             };
-            let Ok(abs) = resolve_in_vault(vault_root, &r_path) else {
+            let Ok(abs) = resolve_in_vault(vault_root, r_path) else {
                 continue;
             };
             let abs_p = Path::new(&abs);
-            let local_content = read_sync_payload(abs_p, &r_path);
+            let local_content = read_sync_payload(abs_p, r_path);
             let local_hash = local_content.as_ref().map(|s| sha1_hex(s));
-            let synced_entry = synced_state.get(&r_path).cloned();
+            let synced_entry = synced_state.get(r_path).cloned();
 
             if r_meta.deleted {
                 if let Some(ref lh) = local_hash {
@@ -1094,8 +1200,8 @@ fn sync_hosted_cloud(
                     if local_modified {
                         // Local user modified a note that was deleted on another device:
                         // keep the local note, clear sync_state so do_push re-uploads it, and warn.
-                        let _ = db.execute("DELETE FROM sync_state WHERE path = ?1", params![&r_path]);
-                        synced_state.remove(&r_path);
+                        let _ = db.execute("DELETE FROM sync_state WHERE path = ?1", params![r_path]);
+                        synced_state.remove(r_path);
                         summary.conflicts.push(ConflictInfo {
                             path: r_path.clone(),
                             resolution: "kept_local_edit_over_remote_delete".to_string(),
@@ -1105,15 +1211,15 @@ fn sync_hosted_cloud(
                             ),
                         });
                     } else {
-                        let _ = move_file_to_trash(db, &r_path, abs_p);
+                        let _ = move_file_to_trash(db, r_path, abs_p);
                         let _ = fs::remove_file(abs_p);
                         summary.deleted_local += 1;
-                        let _ = db.execute("DELETE FROM sync_state WHERE path = ?1", params![&r_path]);
-                        synced_state.remove(&r_path);
+                        let _ = db.execute("DELETE FROM sync_state WHERE path = ?1", params![r_path]);
+                        synced_state.remove(r_path);
                     }
                 } else {
-                    let _ = db.execute("DELETE FROM sync_state WHERE path = ?1", params![&r_path]);
-                    synced_state.remove(&r_path);
+                    let _ = db.execute("DELETE FROM sync_state WHERE path = ?1", params![r_path]);
+                    synced_state.remove(r_path);
                 }
                 continue;
             }
@@ -1123,7 +1229,7 @@ fn sync_hosted_cloud(
                 if synced_entry.as_ref().map(|s| s.remote_hash.as_str()) != Some(r_meta.hash.as_str())
                 {
                     if let Some(ref lc) = local_content {
-                        upsert_sync_state(db, &r_path, &r_meta.hash, r_meta.mtime_ms, now, lc);
+                        upsert_sync_state(db, r_path, &r_meta.hash, r_meta.mtime_ms, now, lc);
                         synced_state.insert(
                             r_path.clone(),
                             SyncedEntry {
@@ -1143,67 +1249,79 @@ fn sync_hosted_cloud(
             };
 
             if remote_changed_since_sync {
-                pull_idx += 1;
-                report_sync_progress("Downloading", pull_idx, total_remote, &r_path);
-                let Some(full) = fetch_remote_note(
-                    clean_url,
-                    anon_key,
-                    &bearer,
-                    &effective_vault_id,
-                    &r_path,
-                ) else {
-                    continue;
-                };
+                to_download_paths.push(r_path.clone());
+            }
+        }
 
-                let local_modified_since_sync = match (&local_hash, &synced_entry) {
-                    (None, _) => false,
-                    (Some(lh), Some(st)) => lh != &st.remote_hash,
-                    (Some(_), None) => true,
-                };
+        let total_to_download = to_download_paths.len().max(1);
+        for (idx, r_path) in to_download_paths.into_iter().enumerate() {
+            report_sync_progress("Downloading", idx + 1, total_to_download, &r_path);
+            let Ok(abs) = resolve_in_vault(vault_root, &r_path) else {
+                continue;
+            };
+            let abs_p = Path::new(&abs);
+            let local_content = read_sync_payload(abs_p, &r_path);
+            let local_hash = local_content.as_ref().map(|s| sha1_hex(s));
+            let synced_entry = synced_state.get(&r_path).cloned();
 
-                if !local_modified_since_sync {
-                    // Clean fast-forward pull: local file was untouched since last sync
-                    if write_sync_payload(abs_p, &full.content).is_ok() {
-                        if r_path.to_lowercase().ends_with(".md") {
-                            record_edit_transition(
-                                db,
-                                &r_path,
-                                local_content.as_deref(),
-                                &full.content,
-                                "sync-pull",
-                            );
-                        }
-                        upsert_sync_state(db, &r_path, &full.hash, full.mtime_ms, now, &full.content);
-                        synced_state.insert(
-                            r_path.clone(),
-                            SyncedEntry {
-                                remote_hash: full.hash.clone(),
-                                remote_mtime: full.mtime_ms,
-                                base_content: full.content.clone(),
-                            },
+            let Some(full) = fetch_remote_note(
+                clean_url,
+                anon_key,
+                &bearer,
+                &effective_vault_id,
+                &r_path,
+            ) else {
+                continue;
+            };
+
+            let local_modified_since_sync = match (&local_hash, &synced_entry) {
+                (None, _) => false,
+                (Some(lh), Some(st)) => lh != &st.remote_hash,
+                (Some(_), None) => true,
+            };
+
+            if !local_modified_since_sync {
+                // Clean fast-forward pull: local file was untouched since last sync
+                if write_sync_payload(abs_p, &full.content).is_ok() {
+                    if r_path.to_lowercase().ends_with(".md") {
+                        record_edit_transition(
+                            db,
+                            &r_path,
+                            local_content.as_deref(),
+                            &full.content,
+                            "sync-pull",
                         );
-                        summary.pulled += 1;
                     }
-                } else if let Some(ref lc) = local_content {
-                    // Both local and remote changed since last sync -> 3-way merge or conflict copy!
-                    let base_str = synced_entry
-                        .as_ref()
-                        .map(|s| s.base_content.as_str())
-                        .unwrap_or("");
-                    resolve_concurrent_edit(
-                        db,
-                        vault_root,
-                        &r_path,
-                        abs_p,
-                        lc,
-                        &full,
-                        base_str,
-                        now,
-                        &mut synced_state,
-                        &mut remote_map,
-                        &mut summary,
+                    upsert_sync_state(db, &r_path, &full.hash, full.mtime_ms, now, &full.content);
+                    synced_state.insert(
+                        r_path.clone(),
+                        SyncedEntry {
+                            remote_hash: full.hash.clone(),
+                            remote_mtime: full.mtime_ms,
+                            base_content: full.content.clone(),
+                        },
                     );
+                    summary.pulled += 1;
                 }
+            } else if let Some(ref lc) = local_content {
+                // Both local and remote changed since last sync -> 3-way merge or conflict copy!
+                let base_str = synced_entry
+                    .as_ref()
+                    .map(|s| s.base_content.as_str())
+                    .unwrap_or("");
+                resolve_concurrent_edit(
+                    db,
+                    vault_root,
+                    &r_path,
+                    abs_p,
+                    lc,
+                    &full,
+                    base_str,
+                    now,
+                    &mut synced_state,
+                    &mut remote_map,
+                    &mut summary,
+                );
             }
         }
     }
@@ -1213,8 +1331,18 @@ fn sync_hosted_cloud(
     if can_push {
         let local_paths = list_all_syncable_files(vault_root);
         let local_set: HashSet<String> = local_paths.iter().cloned().collect();
-        let total_local = local_paths.len().max(1);
-        let mut push_idx = 0usize;
+
+        struct PendingUpload {
+            l_path: String,
+            abs_p: std::path::PathBuf,
+            content: String,
+            l_hash: String,
+            l_mtime: i64,
+            expected_remote_hash: Option<String>,
+            can_batch_upsert: bool,
+        }
+
+        let mut upload_queue: Vec<PendingUpload> = Vec::new();
 
         for l_path in &local_paths {
             let Ok(abs) = resolve_in_vault(vault_root, l_path) else {
@@ -1280,110 +1408,80 @@ fn sync_hosted_cloud(
                 None => true,
                 Some(st) => st.remote_hash != l_hash,
             };
+            let remote_key_mismatch = match remote_map.get(l_path) {
+                Some(rm) => !rm.deleted && rm.enc_key_id != current_key_id,
+                None => false,
+            };
             let needs_upload = match remote_map.get(l_path) {
                 None => true,
-                Some(rm) => is_still_dirty && (rm.deleted || rm.hash != l_hash),
+                Some(rm) => {
+                    remote_key_mismatch || (is_still_dirty && (rm.deleted || rm.hash != l_hash))
+                }
             };
 
             if needs_upload {
-                push_idx += 1;
-                report_sync_progress("Uploading", push_idx, total_local, l_path);
-                let encrypted_content = encrypt_at_rest(&content);
-
-                // Safeguard 3: When updating an existing active remote note, use an optimistic
-                // conditional PATCH (`hash=eq.<expected_remote_hash>`) first to detect millisecond-level races.
                 let existing_active_hash = remote_map
                     .get(l_path)
                     .filter(|rm| !rm.deleted)
                     .map(|rm| rm.hash.clone());
+                let is_pure_key_or_new = match existing_active_hash.as_deref() {
+                    None => true,
+                    Some(eh) => eh == l_hash,
+                };
+                let can_batch_upsert = is_pure_key_or_new && content.len() <= 48_000;
+                upload_queue.push(PendingUpload {
+                    l_path: l_path.clone(),
+                    abs_p: abs_p.to_path_buf(),
+                    content,
+                    l_hash,
+                    l_mtime,
+                    expected_remote_hash: existing_active_hash,
+                    can_batch_upsert,
+                });
+            }
+        }
 
-                if let Some(expected_r_hash) = existing_active_hash {
-                    let patch_url = format!(
-                        "{clean_url}/rest/v1/vault_notes?vault_id=eq.{effective_vault_id}&path=eq.{}&hash=eq.{expected_r_hash}&select=path,hash",
-                        urlencoding_simple(l_path)
-                    );
-                    let patch_payload = json!({
+        let total_to_upload = upload_queue.len().max(1);
+        let mut push_idx = 0usize;
+        let mut q_idx = 0usize;
+
+        while q_idx < upload_queue.len() {
+            // Fast path: batch consecutive small new / re-encrypted files (up to 20 files or ~256 KB)
+            if upload_queue[q_idx].can_batch_upsert {
+                let batch_start = q_idx;
+                let mut batch_bytes = 0usize;
+                let mut batch_rows: Vec<Value> = Vec::new();
+
+                while q_idx < upload_queue.len()
+                    && upload_queue[q_idx].can_batch_upsert
+                    && batch_rows.len() < 20
+                    && (batch_bytes + upload_queue[q_idx].content.len() <= 256_000
+                        || batch_rows.is_empty())
+                {
+                    let item = &upload_queue[q_idx];
+                    push_idx += 1;
+                    report_sync_progress("Uploading", push_idx, total_to_upload, &item.l_path);
+                    let encrypted_content = encrypt_at_rest(&item.content);
+                    batch_bytes += encrypted_content.len();
+                    let mut row = json!({
+                        "vault_id": effective_vault_id,
+                        "path": item.l_path,
                         "content": encrypted_content,
-                        "hash": l_hash,
-                        "mtime_ms": l_mtime,
+                        "hash": item.l_hash,
+                        "mtime_ms": item.l_mtime,
                         "deleted": false,
+                        "enc_key_id": current_key_id,
                         "updated_at": chrono::Utc::now().to_rfc3339()
                     });
-                    let mut patch_req = ureq::request("PATCH", &patch_url)
-                        .set("apikey", anon_key)
-                        .set("Authorization", &format!("Bearer {bearer}"))
-                        .set("Content-Type", "application/json")
-                        .set("Prefer", "return=representation");
-                    if let Some(env_key) = env_api_key() {
-                        patch_req = patch_req.set("x-vault-api-key", &env_key);
+                    if let Some(ref uid) = effective_user_id {
+                        row["user_id"] = json!(uid);
                     }
-                    if let Ok(r) = patch_req.send_string(&patch_payload.to_string()) {
-                        if r.status() < 300 {
-                            let body = r.into_string().unwrap_or_else(|_| "[]".to_string());
-                            let updated_rows: Vec<Value> =
-                                serde_json::from_str(&body).unwrap_or_default();
-                            if !updated_rows.is_empty() {
-                                upsert_sync_state(db, l_path, &l_hash, l_mtime, now, &content);
-                                synced_state.insert(
-                                    l_path.clone(),
-                                    SyncedEntry {
-                                        remote_hash: l_hash,
-                                        remote_mtime: l_mtime,
-                                        base_content: content,
-                                    },
-                                );
-                                summary.pushed += 1;
-                                continue;
-                            } else if let Some(full) = fetch_remote_note(
-                                clean_url,
-                                anon_key,
-                                &bearer,
-                                &effective_vault_id,
-                                l_path,
-                            ) {
-                                // Another device updated the row in the milliseconds since manifest fetch!
-                                let base_str = synced_state
-                                    .get(l_path)
-                                    .map(|s| s.base_content.clone())
-                                    .unwrap_or_default();
-                                resolve_concurrent_edit(
-                                    db,
-                                    vault_root,
-                                    l_path,
-                                    abs_p,
-                                    &content,
-                                    &full,
-                                    &base_str,
-                                    now,
-                                    &mut synced_state,
-                                    &mut remote_map,
-                                    &mut summary,
-                                );
-                                content = read_sync_payload(abs_p, l_path).unwrap_or(content);
-                                l_hash = sha1_hex(&content);
-                                if l_hash == full.hash {
-                                    continue;
-                                }
-                            }
-                        }
-                    }
+                    batch_rows.push(row);
+                    q_idx += 1;
                 }
 
-                let encrypted_content_final = encrypt_at_rest(&content);
                 let upsert_url =
                     format!("{clean_url}/rest/v1/vault_notes?on_conflict=user_id,vault_id,path");
-                let mut payload = json!({
-                    "vault_id": effective_vault_id,
-                    "path": l_path,
-                    "content": encrypted_content_final,
-                    "hash": l_hash,
-                    "mtime_ms": l_mtime,
-                    "deleted": false,
-                    "updated_at": chrono::Utc::now().to_rfc3339()
-                });
-                if let Some(ref uid) = effective_user_id {
-                    payload["user_id"] = json!(uid);
-                }
                 let mut post_req = ureq::post(&upsert_url)
                     .set("apikey", anon_key)
                     .set("Authorization", &format!("Bearer {bearer}"))
@@ -1392,19 +1490,198 @@ fn sync_hosted_cloud(
                 if let Some(env_key) = env_api_key() {
                     post_req = post_req.set("x-vault-api-key", &env_key);
                 }
-                if let Ok(r) = post_req.send_string(&payload.to_string()) {
+
+                let mut batch_ok = false;
+                if let Ok(r) = post_req.send_string(&Value::Array(batch_rows.clone()).to_string()) {
                     if r.status() < 300 {
-                        upsert_sync_state(db, l_path, &l_hash, l_mtime, now, &content);
+                        batch_ok = true;
+                    }
+                }
+                if !batch_ok {
+                    // Refresh token if needed and retry individual items in the batch
+                    if let Some(rt) = refresh_token {
+                        if let Some((new_access, _)) = try_refresh_hosted_token(rt) {
+                            bearer = new_access;
+                        }
+                    }
+                    for (offset, row_val) in batch_rows.into_iter().enumerate() {
+                        let item = &upload_queue[batch_start + offset];
+                        let mut single_req = ureq::post(&upsert_url)
+                            .set("apikey", anon_key)
+                            .set("Authorization", &format!("Bearer {bearer}"))
+                            .set("Content-Type", "application/json")
+                            .set("Prefer", "resolution=merge-duplicates");
+                        if let Some(env_key) = env_api_key() {
+                            single_req = single_req.set("x-vault-api-key", &env_key);
+                        }
+                        if let Ok(r) = single_req.send_string(&row_val.to_string()) {
+                            if r.status() < 300 {
+                                upsert_sync_state(
+                                    db,
+                                    &item.l_path,
+                                    &item.l_hash,
+                                    item.l_mtime,
+                                    now,
+                                    &item.content,
+                                );
+                                synced_state.insert(
+                                    item.l_path.clone(),
+                                    SyncedEntry {
+                                        remote_hash: item.l_hash.clone(),
+                                        remote_mtime: item.l_mtime,
+                                        base_content: item.content.clone(),
+                                    },
+                                );
+                                summary.pushed += 1;
+                            }
+                        }
+                    }
+                } else {
+                    for item in &upload_queue[batch_start..q_idx] {
+                        upsert_sync_state(
+                            db,
+                            &item.l_path,
+                            &item.l_hash,
+                            item.l_mtime,
+                            now,
+                            &item.content,
+                        );
                         synced_state.insert(
-                            l_path.clone(),
+                            item.l_path.clone(),
                             SyncedEntry {
-                                remote_hash: l_hash,
-                                remote_mtime: l_mtime,
-                                base_content: content,
+                                remote_hash: item.l_hash.clone(),
+                                remote_mtime: item.l_mtime,
+                                base_content: item.content.clone(),
                             },
                         );
                         summary.pushed += 1;
                     }
+                }
+                continue;
+            }
+
+            // Standard single-item path (content edit on existing remote row or large binary attachment)
+            let item = &upload_queue[q_idx];
+            q_idx += 1;
+            push_idx += 1;
+            let l_path = &item.l_path;
+            let abs_p = item.abs_p.as_path();
+            let mut content = item.content.clone();
+            let mut l_hash = item.l_hash.clone();
+            let l_mtime = item.l_mtime;
+
+            report_sync_progress("Uploading", push_idx, total_to_upload, l_path);
+            let encrypted_content = encrypt_at_rest(&content);
+
+            if let Some(ref expected_r_hash) = item.expected_remote_hash {
+                let patch_url = format!(
+                    "{clean_url}/rest/v1/vault_notes?vault_id=eq.{effective_vault_id}&path=eq.{}&hash=eq.{expected_r_hash}&select=path,hash",
+                    urlencoding_simple(l_path)
+                );
+                let patch_payload = json!({
+                    "content": encrypted_content,
+                    "hash": l_hash,
+                    "mtime_ms": l_mtime,
+                    "deleted": false,
+                    "enc_key_id": current_key_id,
+                    "updated_at": chrono::Utc::now().to_rfc3339()
+                });
+                let mut patch_req = ureq::request("PATCH", &patch_url)
+                    .set("apikey", anon_key)
+                    .set("Authorization", &format!("Bearer {bearer}"))
+                    .set("Content-Type", "application/json")
+                    .set("Prefer", "return=representation");
+                if let Some(env_key) = env_api_key() {
+                    patch_req = patch_req.set("x-vault-api-key", &env_key);
+                }
+                if let Ok(r) = patch_req.send_string(&patch_payload.to_string()) {
+                    if r.status() < 300 {
+                        let body = r.into_string().unwrap_or_else(|_| "[]".to_string());
+                        let updated_rows: Vec<Value> =
+                            serde_json::from_str(&body).unwrap_or_default();
+                        if !updated_rows.is_empty() {
+                            upsert_sync_state(db, l_path, &l_hash, l_mtime, now, &content);
+                            synced_state.insert(
+                                l_path.clone(),
+                                SyncedEntry {
+                                    remote_hash: l_hash,
+                                    remote_mtime: l_mtime,
+                                    base_content: content,
+                                },
+                            );
+                            summary.pushed += 1;
+                            continue;
+                        } else if let Some(full) = fetch_remote_note(
+                            clean_url,
+                            anon_key,
+                            &bearer,
+                            &effective_vault_id,
+                            l_path,
+                        ) {
+                            // Another device updated the row in the milliseconds since manifest fetch!
+                            let base_str = synced_state
+                                .get(l_path)
+                                .map(|s| s.base_content.clone())
+                                .unwrap_or_default();
+                            resolve_concurrent_edit(
+                                db,
+                                vault_root,
+                                l_path,
+                                abs_p,
+                                &content,
+                                &full,
+                                &base_str,
+                                now,
+                                &mut synced_state,
+                                &mut remote_map,
+                                &mut summary,
+                            );
+                            content = read_sync_payload(abs_p, l_path).unwrap_or(content);
+                            l_hash = sha1_hex(&content);
+                            if l_hash == full.hash {
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let encrypted_content_final = encrypt_at_rest(&content);
+            let upsert_url =
+                format!("{clean_url}/rest/v1/vault_notes?on_conflict=user_id,vault_id,path");
+            let mut payload = json!({
+                "vault_id": effective_vault_id,
+                "path": l_path,
+                "content": encrypted_content_final,
+                "hash": l_hash,
+                "mtime_ms": l_mtime,
+                "deleted": false,
+                "enc_key_id": current_key_id,
+                "updated_at": chrono::Utc::now().to_rfc3339()
+            });
+            if let Some(ref uid) = effective_user_id {
+                payload["user_id"] = json!(uid);
+            }
+            let mut post_req = ureq::post(&upsert_url)
+                .set("apikey", anon_key)
+                .set("Authorization", &format!("Bearer {bearer}"))
+                .set("Content-Type", "application/json")
+                .set("Prefer", "resolution=merge-duplicates");
+            if let Some(env_key) = env_api_key() {
+                post_req = post_req.set("x-vault-api-key", &env_key);
+            }
+            if let Ok(r) = post_req.send_string(&payload.to_string()) {
+                if r.status() < 300 {
+                    upsert_sync_state(db, l_path, &l_hash, l_mtime, now, &content);
+                    synced_state.insert(
+                        l_path.clone(),
+                        SyncedEntry {
+                            remote_hash: l_hash,
+                            remote_mtime: l_mtime,
+                            base_content: content,
+                        },
+                    );
+                    summary.pushed += 1;
                 }
             }
         }
@@ -1533,6 +1810,8 @@ fn sync_s3_manifest(
         Err(_) => HashMap::new(),
     };
 
+    let _ = crate::crypto::ensure_local_db_encrypted(db);
+    let current_key_id = crate::crypto::active_key_fingerprint();
     let mut summary = SyncSummary {
         backend: "s3".to_string(),
         ..Default::default()
@@ -1540,27 +1819,35 @@ fn sync_s3_manifest(
     let now = now_ms();
 
     if do_pull {
-        let total_remote = remote_hashes.len().max(1);
-        let mut pull_idx = 0usize;
-        for (r_path, r_hash) in &remote_hashes {
+        let mut to_pull: Vec<(String, String)> = Vec::new();
+        for (r_path, r_entry) in &remote_hashes {
+            let r_hash = r_entry.split(':').next().unwrap_or(r_entry);
             let Ok(abs) = resolve_in_vault(vault_root, r_path) else {
                 continue;
             };
             let abs_p = Path::new(&abs);
             let local_hash = read_sync_payload(abs_p, r_path).map(|s| sha1_hex(&s));
-            if local_hash.as_ref() != Some(r_hash) {
-                pull_idx += 1;
-                report_sync_progress("Downloading", pull_idx, total_remote, r_path);
-                let file_url = format!("{base}/{r_path}");
-                if let Ok(resp) = ureq::get(&file_url).call() {
-                    if let Ok(raw_content) = resp.into_string() {
-                        let Ok(content) = decrypt_at_rest(&raw_content) else {
-                            continue;
-                        };
-                        if write_sync_payload(abs_p, &content).is_ok() {
-                            upsert_sync_state(db, r_path, r_hash, now, now, &content);
-                            summary.pulled += 1;
-                        }
+            if local_hash.as_deref() != Some(r_hash) {
+                to_pull.push((r_path.clone(), r_hash.to_string()));
+            }
+        }
+        to_pull.sort_by(|a, b| a.0.cmp(&b.0));
+        let total_to_pull = to_pull.len().max(1);
+        for (idx, (r_path, r_hash)) in to_pull.into_iter().enumerate() {
+            let Ok(abs) = resolve_in_vault(vault_root, &r_path) else {
+                continue;
+            };
+            let abs_p = Path::new(&abs);
+            report_sync_progress("Downloading", idx + 1, total_to_pull, &r_path);
+            let file_url = format!("{base}/{r_path}");
+            if let Ok(resp) = ureq::get(&file_url).call() {
+                if let Ok(raw_content) = resp.into_string() {
+                    let Ok(content) = decrypt_at_rest(&raw_content) else {
+                        continue;
+                    };
+                    if write_sync_payload(abs_p, &content).is_ok() {
+                        upsert_sync_state(db, &r_path, &r_hash, now, now, &content);
+                        summary.pulled += 1;
                     }
                 }
             }
@@ -1570,8 +1857,7 @@ fn sync_s3_manifest(
     if do_push {
         let mut manifest_changed = false;
         let local_files = list_all_syncable_files(vault_root);
-        let total_local = local_files.len().max(1);
-        let mut push_idx = 0usize;
+        let mut to_push: Vec<(String, String, String)> = Vec::new();
         for l_path in local_files {
             let Ok(abs) = resolve_in_vault(vault_root, &l_path) else {
                 continue;
@@ -1581,21 +1867,29 @@ fn sync_s3_manifest(
                 continue;
             };
             let l_hash = sha1_hex(&content);
-            if remote_hashes.get(&l_path) != Some(&l_hash) {
-                push_idx += 1;
-                report_sync_progress("Uploading", push_idx, total_local, &l_path);
-                let enc_content = encrypt_at_rest(&content);
-                let file_url = format!("{base}/{l_path}");
-                if let Ok(r) = ureq::put(&file_url)
-                    .set("Content-Type", "text/plain; charset=utf-8")
-                    .send_string(&enc_content)
-                {
-                    if r.status() < 300 {
-                        remote_hashes.insert(l_path.clone(), l_hash.clone());
-                        upsert_sync_state(db, &l_path, &l_hash, now, now, &content);
-                        manifest_changed = true;
-                        summary.pushed += 1;
-                    }
+            let expected_entry = format!("{l_hash}:{current_key_id}");
+            let matches_remote = match remote_hashes.get(&l_path) {
+                Some(existing) => existing == &expected_entry || existing == &l_hash,
+                None => false,
+            };
+            if !matches_remote {
+                to_push.push((l_path, content, l_hash));
+            }
+        }
+        let total_to_push = to_push.len().max(1);
+        for (idx, (l_path, content, l_hash)) in to_push.into_iter().enumerate() {
+            report_sync_progress("Uploading", idx + 1, total_to_push, &l_path);
+            let enc_content = encrypt_at_rest(&content);
+            let file_url = format!("{base}/{l_path}");
+            if let Ok(r) = ureq::put(&file_url)
+                .set("Content-Type", "text/plain; charset=utf-8")
+                .send_string(&enc_content)
+            {
+                if r.status() < 300 {
+                    remote_hashes.insert(l_path.clone(), format!("{l_hash}:{current_key_id}"));
+                    upsert_sync_state(db, &l_path, &l_hash, now, now, &content);
+                    manifest_changed = true;
+                    summary.pushed += 1;
                 }
             }
         }

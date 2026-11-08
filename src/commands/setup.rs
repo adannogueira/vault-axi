@@ -10,7 +10,7 @@ use std::path::Path;
 
 const EMBEDDED_SKILL_MD: &str = include_str!("../../.agents/skills/vault/SKILL.md");
 
-pub fn setup_command(args: &[String], _ctx: &mut Ctx) -> Result<Value, AxiError> {
+pub fn setup_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
     let parsed = parse_args(args);
     let want_hooks = parsed.positionals.first().map(|s| s.as_str()) == Some("hooks")
         || flag_bool(&parsed.flags, "hooks");
@@ -23,7 +23,8 @@ pub fn setup_command(args: &[String], _ctx: &mut Ctx) -> Result<Value, AxiError>
         .map(|_| flag_bool(&parsed.flags, "auto-update"));
     let capture_note = flag_string(&parsed.flags, "capture-note");
     let capture_section = flag_string(&parsed.flags, "capture-section");
-    let encryption_key = flag_string(&parsed.flags, "encryption-key");
+    let encryption_key = flag_string(&parsed.flags, "encryption-key")
+        .or_else(|| flag_string(&parsed.flags, "encryption-passphrase"));
 
     if vault.is_none()
         && !want_hooks
@@ -151,6 +152,9 @@ pub fn setup_command(args: &[String], _ctx: &mut Ctx) -> Result<Value, AxiError>
         }
     }
 
+    let old_key = encryption_key
+        .as_ref()
+        .map(|_| crate::crypto::resolve_active_key());
     if let Some(ek) = encryption_key {
         let trimmed = ek.trim().to_string();
         if trimmed.is_empty() {
@@ -163,6 +167,14 @@ pub fn setup_command(args: &[String], _ctx: &mut Ctx) -> Result<Value, AxiError>
     }
 
     save_config(&config);
+    if let Some(prev_key) = old_key {
+        let new_key = crate::crypto::resolve_active_key();
+        if let Ok(db) = ctx.db() {
+            crate::sync::ensure_sync_table(db);
+            let reencrypted = crate::crypto::reencrypt_local_db(db, Some(&prev_key), &new_key);
+            out.insert("localRowsReencrypted".to_string(), json!(reencrypted));
+        }
+    }
     out.insert(
         "config".to_string(),
         json!(config_path().to_string_lossy().to_string()),
