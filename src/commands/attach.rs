@@ -36,6 +36,8 @@ pub fn attach_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
     let note_abs = resolve_in_vault(&root, &note_path)
         .map_err(|e| AxiError::new(e, "VALIDATION_ERROR", vec![]))?;
 
+    ctx.pull_before_mutation()?;
+
     let folder = flag_string(&parsed.flags, "folder")
         .unwrap_or_else(|| "assets".to_string())
         .trim_matches('/')
@@ -151,6 +153,7 @@ pub fn attach_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
         force: true,
         with_embeddings: Some(false),
     });
+    ctx.sync_after_mutation()?;
 
     let ocr_preview = ocr_text.as_deref().and_then(|t| {
         let trimmed = t.trim();
@@ -161,7 +164,7 @@ pub fn attach_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
         }
     });
 
-    Ok(json!({
+    let mut out = json!({
         "ok": true,
         "note": note_path,
         "attachment": dest_rel,
@@ -169,7 +172,9 @@ pub fn attach_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
         "isImage": is_image,
         "ocrExtracted": ocr_preview.is_some(),
         "ocrPreview": ocr_preview
-    }))
+    });
+    ctx.attach_sync_warnings(&mut out);
+    Ok(out)
 }
 
 pub fn attachments_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {

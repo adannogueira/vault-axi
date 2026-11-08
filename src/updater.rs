@@ -43,23 +43,23 @@ fn update_state_path() -> PathBuf {
 pub fn platform_asset_name() -> &'static str {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
-        "vault-x86_64-pc-windows-msvc.exe"
+        "vault-windows-x86_64.exe"
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        "vault-aarch64-apple-darwin"
+        "vault-macos-aarch64"
     }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
-        "vault-x86_64-apple-darwin"
+        "vault-macos-x86_64"
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        "vault-x86_64-unknown-linux-gnu"
+        "vault-linux-x86_64"
     }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
-        "vault-aarch64-unknown-linux-gnu"
+        "vault-linux-aarch64"
     }
     #[cfg(not(any(
         all(target_os = "windows", target_arch = "x86_64"),
@@ -70,6 +70,42 @@ pub fn platform_asset_name() -> &'static str {
     )))]
     {
         "vault"
+    }
+}
+
+fn platform_asset_candidates() -> &'static [&'static str] {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        &[
+            "vault-windows-x86_64.exe",
+            "vault-x86_64-pc-windows-msvc.exe",
+        ]
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        &["vault-macos-aarch64", "vault-aarch64-apple-darwin"]
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        &["vault-macos-x86_64", "vault-x86_64-apple-darwin"]
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        &["vault-linux-x86_64", "vault-x86_64-unknown-linux-gnu"]
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        &["vault-linux-aarch64", "vault-aarch64-unknown-linux-gnu"]
+    }
+    #[cfg(not(any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64")
+    )))]
+    {
+        &["vault"]
     }
 }
 
@@ -119,37 +155,48 @@ pub fn fetch_latest_release(api_url_override: Option<&str>) -> Result<ReleaseInf
         .to_string();
     let version = tag_name.trim_start_matches(['v', 'V']).to_string();
 
-    let wanted_asset = platform_asset_name();
-    let wanted_sha = format!("{wanted_asset}.sha256");
-
+    let candidates = platform_asset_candidates();
+    let mut matched_asset = platform_asset_name().to_string();
     let mut download_url: Option<String> = None;
     let mut sha256_url: Option<String> = None;
 
     if let Some(assets) = body.get("assets").and_then(|a| a.as_array()) {
-        for asset in assets {
-            let name = asset.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            let b_url = asset
-                .get("browser_download_url")
-                .and_then(|u| u.as_str())
-                .unwrap_or("");
-            if name == wanted_asset && !b_url.is_empty() {
-                download_url = Some(b_url.to_string());
-            } else if name == wanted_sha && !b_url.is_empty() {
-                sha256_url = Some(b_url.to_string());
+        for &cand in candidates {
+            let cand_sha = format!("{cand}.sha256");
+            let mut found_bin: Option<String> = None;
+            let mut found_sha: Option<String> = None;
+            for asset in assets {
+                let name = asset.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let b_url = asset
+                    .get("browser_download_url")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("");
+                if name == cand && !b_url.is_empty() {
+                    found_bin = Some(b_url.to_string());
+                } else if name == cand_sha && !b_url.is_empty() {
+                    found_sha = Some(b_url.to_string());
+                }
+            }
+            if let Some(dl) = found_bin {
+                matched_asset = cand.to_string();
+                download_url = Some(dl);
+                sha256_url = found_sha;
+                break;
             }
         }
     }
 
     let Some(dl_url) = download_url else {
         return Err(format!(
-            "No binary asset '{wanted_asset}' found in release {tag_name}"
+            "No binary asset '{}' found in release {tag_name}",
+            platform_asset_name()
         ));
     };
 
     Ok(ReleaseInfo {
         tag_name,
         version,
-        asset_name: wanted_asset.to_string(),
+        asset_name: matched_asset,
         download_url: dl_url,
         sha256_url,
     })
@@ -200,7 +247,11 @@ pub fn download_and_replace_binary(
     }
 
     let new_path = target_exe.with_extension("new_bin");
-    let old_path = target_exe.with_extension("old_bin");
+    let mut old_path = target_exe.with_extension("old_bin");
+    if old_path.exists() && fs::remove_file(&old_path).is_err() {
+        old_path = target_exe.with_extension(format!("old_bin.{}", std::process::id()));
+        let _ = fs::remove_file(&old_path);
+    }
 
     fs::write(&new_path, &bytes)
         .map_err(|e| format!("Failed to write staged binary: {e}"))?;
@@ -215,7 +266,6 @@ pub fn download_and_replace_binary(
         }
     }
 
-    let _ = fs::remove_file(&old_path);
     if target_exe.exists() {
         fs::rename(target_exe, &old_path)
             .map_err(|e| format!("Failed to move current binary aside: {e}"))?;
@@ -229,15 +279,29 @@ pub fn download_and_replace_binary(
     Ok(())
 }
 
-/// Clean up any leftover `.old_bin` from a previous self-update and perform a background check
-/// at most once every 24 hours when `auto_update` is enabled.
-pub fn auto_update_if_due() {
+pub fn cleanup_old_binaries() {
     if let Ok(exe) = std::env::current_exe() {
         let old_path = exe.with_extension("old_bin");
         if old_path.exists() {
             let _ = fs::remove_file(old_path);
         }
+        if let Some(parent) = exe.parent() {
+            if let Ok(entries) = fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.contains(".old_bin.") {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Clean up any leftover `.old_bin` from a previous self-update and perform a background check
+/// at most once every 24 hours when `auto_update` is enabled.
+pub fn auto_update_if_due() {
+    cleanup_old_binaries();
 
     if cfg!(test)
         || std::env::var("VAULT_AXI_NO_UPDATE").as_deref() == Ok("1")

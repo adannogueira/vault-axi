@@ -96,6 +96,7 @@ pub fn store_text_in_trash(db: &Connection, rel_path: &str, content: &str, delet
 /// `vault trash [--purge]` — list deleted notes recoverable within the 7-day window, or purge trash.
 pub fn trash_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
     let _ = ctx.require_vault()?;
+    let _ = ctx.pull_if_due();
     let parsed = parse_args(args);
     let purge_all = flag_bool(&parsed.flags, "purge");
 

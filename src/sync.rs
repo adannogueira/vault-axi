@@ -265,7 +265,12 @@ pub fn list_all_syncable_files(vault_root: &str) -> Vec<String> {
 /// or `b64:v1:<base64>` for binary attachments).
 pub fn read_sync_payload(abs_p: &Path, rel_path: &str) -> Option<String> {
     if rel_path.to_lowercase().ends_with(".md") {
-        fs::read_to_string(abs_p).ok()
+        if let Ok(s) = fs::read_to_string(abs_p) {
+            Some(s)
+        } else {
+            let bytes = fs::read(abs_p).ok()?;
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        }
     } else if rel_path.starts_with(".obsidian/") {
         if let Ok(text) = fs::read_to_string(abs_p) {
             if !text.starts_with("b64:v1:") && !text.starts_with("enc:v1:") {
@@ -651,7 +656,7 @@ fn fetch_remote_note(
 ) -> Option<RemoteNoteFull> {
     let fetch_url = format!(
         "{clean_url}/rest/v1/vault_notes?vault_id=eq.{vault_id}&path=eq.{}&select=path,content,hash,mtime_ms,deleted",
-        urlencoding_simple(path)
+        postgrest_eq_val(path)
     );
     let mut req = ureq::get(&fetch_url)
         .set("apikey", anon_key)
@@ -676,7 +681,7 @@ fn fetch_raw_remote_content(
 ) -> Option<String> {
     let fetch_url = format!(
         "{clean_url}/rest/v1/vault_notes?vault_id=eq.{vault_id}&path=eq.{}&select=content",
-        urlencoding_simple(path)
+        postgrest_eq_val(path)
     );
     let mut req = ureq::get(&fetch_url)
         .set("apikey", anon_key)
@@ -1576,7 +1581,7 @@ fn sync_hosted_cloud(
             if let Some(ref expected_r_hash) = item.expected_remote_hash {
                 let patch_url = format!(
                     "{clean_url}/rest/v1/vault_notes?vault_id=eq.{effective_vault_id}&path=eq.{}&hash=eq.{expected_r_hash}&select=path,hash",
-                    urlencoding_simple(l_path)
+                    postgrest_eq_val(l_path)
                 );
                 let patch_payload = json!({
                     "content": encrypted_content,
@@ -1920,6 +1925,17 @@ fn urlencoding_simple(s: &str) -> String {
         }
     }
     out
+}
+
+/// Format and URL-encode a value for PostgREST `col=eq.<val>` filters so characters like
+/// parentheses, commas, or quotes in file paths (e.g. `Note (conflict ...).md`) don't break parsing.
+fn postgrest_eq_val(s: &str) -> String {
+    if s.chars().any(|c| matches!(c, ',' | '(' | ')' | '"' | '\\')) {
+        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        urlencoding_simple(&format!("\"{escaped}\""))
+    } else {
+        urlencoding_simple(s)
+    }
 }
 
 fn extract_auth_error(err: ureq::Error) -> String {

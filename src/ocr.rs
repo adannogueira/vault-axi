@@ -63,7 +63,7 @@ pub fn extract_image_ocr(db: &Connection, abs_path: &str) -> Option<String> {
         return None;
     }
 
-    let extracted = run_local_ocr(path).unwrap_or_default();
+    let extracted = run_local_ocr(path)?;
     let clean = extracted
         .lines()
         .map(|l| l.trim())
@@ -94,9 +94,7 @@ fn run_local_ocr(path: &Path) -> Option<String> {
     {
         if out.status.success() {
             let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !text.is_empty() {
-                return Some(text);
-            }
+            return Some(text);
         }
     }
 
@@ -107,18 +105,22 @@ fn run_local_ocr(path: &Path) -> Option<String> {
         let ps_script = format!(
             "$ErrorActionPreference = 'Stop'; \
              Add-Type -AssemblyName System.Runtime.WindowsRuntime; \
-             $null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]; \
              $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]; \
              $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType = WindowsRuntime]; \
+             $null = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Foundation, ContentType = WindowsRuntime]; \
              $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' }})[0]; \
              Function Await($WinRtTask, $ResultType) {{ $asTask = $asTaskGeneric.MakeGenericMethod($ResultType); $netTask = $asTask.Invoke($null, @($WinRtTask)); $netTask.Wait(-1) | Out-Null; $netTask.Result }}; \
-             $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync('{escaped}')) ([Windows.Storage.StorageFile]); \
-             $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream]); \
-             $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder]); \
-             $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap]); \
-             $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages(); \
-             $res = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult]); \
-             Write-Output $res.Text"
+             $fs = [System.IO.File]::OpenRead('{escaped}'); \
+             try {{ \
+                 $stream = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($fs); \
+                 $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder]); \
+                 $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap]); \
+                 $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages(); \
+                 $res = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult]); \
+                 Write-Output $res.Text \
+             }} finally {{ \
+                 $fs.Dispose() \
+             }}"
         );
         if let Ok(out) = Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
@@ -126,9 +128,7 @@ fn run_local_ocr(path: &Path) -> Option<String> {
         {
             if out.status.success() {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !text.is_empty() {
-                    return Some(text);
-                }
+                return Some(text);
             }
         }
     }

@@ -246,15 +246,15 @@ pub fn reencrypt_local_db(
     }
 
     // 3. trash.content
-    if let Ok(mut stmt) = db.prepare("SELECT id, content FROM trash") {
-        let rows: Vec<(i64, String)> = stmt
+    if let Ok(mut stmt) = db.prepare("SELECT path, content FROM trash") {
+        let rows: Vec<(String, String)> = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .ok()
             .into_iter()
             .flatten()
             .flatten()
             .collect();
-        for (id, raw) in rows {
+        for (path, raw) in rows {
             if raw.is_empty() {
                 continue;
             }
@@ -265,8 +265,8 @@ pub fn reencrypt_local_db(
                     let reenc = encrypt_with_key(&plain, new_key);
                     if db
                         .execute(
-                            "UPDATE trash SET content = ?1 WHERE id = ?2",
-                            rusqlite::params![reenc, id],
+                            "UPDATE trash SET content = ?1 WHERE path = ?2",
+                            rusqlite::params![reenc, path],
                         )
                         .is_ok()
                     {
@@ -296,8 +296,26 @@ pub fn decrypt_at_rest(stored: &str) -> Result<String, String> {
         return Ok(plain);
     }
 
-    // Fallback check against default account/local key if user recently changed keys
+    // Fallback check against previous local_encryption_key or default account/local key if user recently changed keys
     let cfg = load_config();
+    if let Some(ref prev_local) = cfg.local_encryption_key {
+        let trimmed = prev_local.trim();
+        if !trimmed.is_empty() {
+            if let Ok(decoded) = B64.decode(trimmed) {
+                if decoded.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&decoded);
+                    if let Ok(plain) = decrypt_with_key(stored, &arr) {
+                        return Ok(plain);
+                    }
+                }
+            }
+            let prev_derived = derive_key_bytes(trimmed);
+            if let Ok(plain) = decrypt_with_key(stored, &prev_derived) {
+                return Ok(plain);
+            }
+        }
+    }
     if let Some(RemoteBackendConfig::Cloud {
         ref user_id,
         ref vault_id,

@@ -76,6 +76,26 @@ jobs:
         with:
           tool: cross
 
+      - name: Stamp release version into Cargo.toml
+        shell: bash
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            RAW_TAG="${GITHUB_REF#refs/tags/}"
+          elif [ -n "${{ inputs.tag_name }}" ]; then
+            RAW_TAG="${{ inputs.tag_name }}"
+          elif [ "${{ github.event_name }}" = "release" ]; then
+            RAW_TAG="${{ github.event.release.tag_name }}"
+          else
+            RAW_TAG=""
+          fi
+          CLEAN_VER="${RAW_TAG#v}"
+          CLEAN_VER="${CLEAN_VER#V}"
+          if [ -n "${CLEAN_VER}" ]; then
+            sed -i.bak "s/^version = \".*\"/version = \"${CLEAN_VER}\"/" Cargo.toml
+            rm -f Cargo.toml.bak
+            echo "Stamped Cargo.toml version = ${CLEAN_VER}"
+          fi
+
       - name: Build binary
         shell: bash
         run: |

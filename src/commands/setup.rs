@@ -156,6 +156,11 @@ pub fn setup_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
         .as_ref()
         .map(|_| crate::crypto::resolve_active_key());
     if let Some(ek) = encryption_key {
+        if let Some(prev_ek) = config.encryption_key.take() {
+            if !prev_ek.trim().is_empty() {
+                config.local_encryption_key = Some(prev_ek);
+            }
+        }
         let trimmed = ek.trim().to_string();
         if trimmed.is_empty() {
             config.encryption_key = None;

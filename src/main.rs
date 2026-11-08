@@ -255,10 +255,11 @@ Add `"command": "vault", "args": ["mcp"]` to Claude Desktop or Cursor MCP settin
 }
 
 fn main() {
-    auto_update_if_due();
+    crate::updater::cleanup_old_binaries();
     let argv: Vec<String> = std::env::args().skip(1).collect();
 
     if argv.is_empty() {
+        auto_update_if_due();
         let mut ctx = Ctx::new();
         match home_command(&[], &mut ctx) {
             Ok(val) => {
@@ -305,6 +306,10 @@ fn main() {
             std::process::exit(err.exit_code());
         }
         std::process::exit(0);
+    }
+
+    if first != "self-update" && first != "update-self" {
+        auto_update_if_due();
     }
 
     let mut ctx = Ctx::new();
