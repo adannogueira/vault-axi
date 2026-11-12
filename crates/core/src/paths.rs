@@ -1,5 +1,13 @@
 //! Vault path rules shared by every client.
 
+/// Vault paths under this prefix belong to vault-axi itself (e.g. the keyring) and are never
+/// synced as files.
+pub const RESERVED_PREFIX: &str = ".vault-axi/";
+
+pub fn is_reserved(rel_path: &str) -> bool {
+    rel_path.starts_with(RESERVED_PREFIX)
+}
+
 /// Name of the copy that keeps the local side of an unmergeable concurrent edit,
 /// e.g. `plans/a.md` -> `plans/a.conflict-1700000000.md`.
 pub fn conflict_copy_path(rel_path: &str, ts_ms: i64) -> String {
@@ -17,6 +25,13 @@ pub fn conflict_copy_path(rel_path: &str, ts_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_paths() {
+        assert!(is_reserved(crate::crypto::keyring::KEYRING_PATH));
+        assert!(!is_reserved("notes/.vault-axi/x.md"));
+        assert!(!is_reserved(".vault-axi-notes/x.md"));
+    }
 
     #[test]
     fn conflict_copy_names() {

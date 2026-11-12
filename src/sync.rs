@@ -5,7 +5,10 @@ use crate::config::{
     env_api_key, load_config, save_config, RemoteBackendConfig, HOSTED_SUPABASE_ANON_KEY,
     HOSTED_SUPABASE_URL,
 };
-use crate::crypto::{decrypt_at_rest, encrypt_at_rest};
+use crate::crypto::{
+    invalid_keyring_error, prepare_sync_keychain, reencrypt_local_db, KeyCache, KeyringStore,
+    StoredKeyring, LOCAL_CONTEXT,
+};
 use crate::vault::{
     file_stat, list_attachment_files, list_markdown_files, list_obsidian_config_files,
     resolve_in_vault,
@@ -18,10 +21,11 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-use vault_axi_core::crypto::v1;
+use vault_axi_core::crypto::keyring::{Keyring, KEYRING_PATH};
+use vault_axi_core::crypto::Keychain;
 use vault_axi_core::hash::sha1_hex;
 use vault_axi_core::merge::{merge_three_way, MergeOutcome};
-use vault_axi_core::paths::conflict_copy_path;
+use vault_axi_core::paths::{self, conflict_copy_path};
 use vault_axi_core::payload;
 
 const SYNC_COOLDOWN_MS: i64 = 15_000;
@@ -48,6 +52,7 @@ pub struct SyncSummary {
 }
 
 fn upsert_sync_state(
+    kc: &Keychain,
     db: &Connection,
     path: &str,
     remote_hash: &str,
@@ -55,7 +60,7 @@ fn upsert_sync_state(
     synced_at: i64,
     base_content: &str,
 ) {
-    let enc_base = encrypt_at_rest(base_content);
+    let enc_base = kc.encrypt(base_content, LOCAL_CONTEXT);
     let _ = db.execute(
         "INSERT INTO sync_state(path, remote_hash, remote_mtime, synced_at, base_content) VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(path) DO UPDATE SET remote_hash=excluded.remote_hash, remote_mtime=excluded.remote_mtime, synced_at=excluded.synced_at, base_content=excluded.base_content",
@@ -435,6 +440,7 @@ struct RemoteNoteFull {
 }
 
 fn fetch_remote_note(
+    kc: &Keychain,
     clean_url: &str,
     anon_key: &str,
     bearer: &str,
@@ -455,7 +461,7 @@ fn fetch_remote_note(
     let s = r.into_string().ok()?;
     let mut list: Vec<RemoteNoteFull> = serde_json::from_str(&s).ok()?;
     let mut note = list.pop()?;
-    note.content = decrypt_at_rest(&note.content).ok()?;
+    note.content = kc.decrypt(&note.content, path).ok()?;
     Some(note)
 }
 
@@ -489,6 +495,7 @@ fn fetch_raw_remote_content(
 /// changed relative to `base_content`.
 #[allow(clippy::too_many_arguments)]
 fn resolve_concurrent_edit(
+    kc: &Keychain,
     db: &Connection,
     vault_root: &str,
     r_path: &str,
@@ -524,7 +531,15 @@ fn resolve_concurrent_edit(
             }
             let _ = write_sync_payload(abs_p, &merged);
             if merged_hash == full.hash {
-                upsert_sync_state(db, r_path, &full.hash, full.mtime_ms, now, &full.content);
+                upsert_sync_state(
+                    kc,
+                    db,
+                    r_path,
+                    &full.hash,
+                    full.mtime_ms,
+                    now,
+                    &full.content,
+                );
                 synced_state.insert(
                     r_path.to_string(),
                     SyncedEntry {
@@ -552,7 +567,7 @@ fn resolve_concurrent_edit(
                     hash: full.hash.clone(),
                     mtime_ms: full.mtime_ms,
                     deleted: false,
-                    enc_key_id: crate::crypto::active_key_fingerprint(),
+                    enc_key_id: kc.active_key_id(),
                 },
             );
         }
@@ -563,7 +578,15 @@ fn resolve_concurrent_edit(
                 }
                 // Set synced_state to the remote version so `do_push` sees `merged` as dirty
                 // relative to `full.hash` and pushes the merged result!
-                upsert_sync_state(db, r_path, &full.hash, full.mtime_ms, now, &full.content);
+                upsert_sync_state(
+                    kc,
+                    db,
+                    r_path,
+                    &full.hash,
+                    full.mtime_ms,
+                    now,
+                    &full.content,
+                );
                 synced_state.insert(
                     r_path.to_string(),
                     SyncedEntry {
@@ -579,7 +602,7 @@ fn resolve_concurrent_edit(
                         hash: full.hash.clone(),
                         mtime_ms: full.mtime_ms,
                         deleted: false,
-                        enc_key_id: crate::crypto::active_key_fingerprint(),
+                        enc_key_id: kc.active_key_id(),
                     },
                 );
                 summary.pulled += 1;
@@ -609,7 +632,15 @@ fn resolve_concurrent_edit(
                         "sync-conflict",
                     );
                 }
-                upsert_sync_state(db, r_path, &full.hash, full.mtime_ms, now, &full.content);
+                upsert_sync_state(
+                    kc,
+                    db,
+                    r_path,
+                    &full.hash,
+                    full.mtime_ms,
+                    now,
+                    &full.content,
+                );
                 synced_state.insert(
                     r_path.to_string(),
                     SyncedEntry {
@@ -625,7 +656,7 @@ fn resolve_concurrent_edit(
                         hash: full.hash.clone(),
                         mtime_ms: full.mtime_ms,
                         deleted: false,
-                        enc_key_id: crate::crypto::active_key_fingerprint(),
+                        enc_key_id: kc.active_key_id(),
                     },
                 );
                 summary.pulled += 1;
@@ -740,6 +771,236 @@ fn exchange_api_key(
     Ok((access_token, refresh_token, user_id, email, vault_id, scope))
 }
 
+fn cloud_request(method: &str, url: &str, bearer: &str) -> ureq::Request {
+    let mut req = ureq::request(method, url)
+        .set("apikey", HOSTED_SUPABASE_ANON_KEY)
+        .set("Authorization", &format!("Bearer {bearer}"));
+    if let Some(env_key) = env_api_key() {
+        req = req.set("x-vault-api-key", &env_key);
+    }
+    req
+}
+
+fn http_error(context: &str, e: ureq::Error) -> AxiError {
+    AxiError::new(format!("{context}: {e}"), "SYNC_ERROR", vec![])
+}
+
+/// The keyring lives in `vault_notes` as a plaintext row at the reserved [`KEYRING_PATH`].
+struct CloudKeyringStore<'a> {
+    bearer: &'a str,
+    vault_id: &'a str,
+    user_id: Option<&'a str>,
+}
+
+impl CloudKeyringStore<'_> {
+    fn row_url(&self) -> String {
+        format!(
+            "{HOSTED_SUPABASE_URL}/rest/v1/vault_notes?vault_id=eq.{}&path=eq.{}",
+            self.vault_id,
+            postgrest_eq_val(KEYRING_PATH)
+        )
+    }
+
+    fn row(&self, keyring: &Keyring) -> (Value, String) {
+        let json = keyring.to_json();
+        let hash = sha1_hex(&json);
+        let mut row = json!({
+            "vault_id": self.vault_id,
+            "path": KEYRING_PATH,
+            "content": json,
+            "hash": hash,
+            "mtime_ms": now_ms(),
+            "deleted": false,
+            "enc_key_id": "keyring",
+            "updated_at": chrono::Utc::now().to_rfc3339()
+        });
+        if let Some(uid) = self.user_id {
+            row["user_id"] = json!(uid);
+        }
+        (row, hash)
+    }
+}
+
+impl KeyringStore for CloudKeyringStore<'_> {
+    fn fetch_keyring(&mut self) -> Result<Option<StoredKeyring>, AxiError> {
+        let url = format!("{}&select=content,hash,deleted", self.row_url());
+        let body = cloud_request("GET", &url, self.bearer)
+            .call()
+            .map_err(|e| http_error("Fetching the vault keyring failed", e))?
+            .into_string()
+            .map_err(|e| AxiError::new(e.to_string(), "SYNC_ERROR", vec![]))?;
+        let rows: Vec<Value> = serde_json::from_str(&body).unwrap_or_default();
+        let Some(row) = rows.into_iter().find(|r| r["deleted"] != json!(true)) else {
+            return Ok(None);
+        };
+        let keyring = Keyring::from_json(row["content"].as_str().unwrap_or_default())
+            .map_err(|e| invalid_keyring_error(&e.to_string()))?;
+        Ok(Some(StoredKeyring {
+            keyring,
+            version: row["hash"].as_str().unwrap_or_default().to_string(),
+        }))
+    }
+
+    fn create_keyring(&mut self, keyring: &Keyring) -> Result<bool, AxiError> {
+        let (row, _) = self.row(keyring);
+        let url = format!("{HOSTED_SUPABASE_URL}/rest/v1/vault_notes");
+        match cloud_request("POST", &url, self.bearer)
+            .set("Content-Type", "application/json")
+            .send_string(&row.to_string())
+        {
+            Ok(_) => Ok(true),
+            Err(ureq::Error::Status(409, _)) => Ok(false),
+            Err(e) => Err(http_error("Creating the vault keyring failed", e)),
+        }
+    }
+
+    fn replace_keyring(&mut self, version: &str, next: &Keyring) -> Result<(), AxiError> {
+        let (row, _) = self.row(next);
+        let url = format!("{}&hash=eq.{version}", self.row_url());
+        let body = cloud_request("PATCH", &url, self.bearer)
+            .set("Content-Type", "application/json")
+            .set("Prefer", "return=representation")
+            .send_string(&row.to_string())
+            .map_err(|e| http_error("Updating the vault keyring failed", e))?
+            .into_string()
+            .unwrap_or_default();
+        let updated: Vec<Value> = serde_json::from_str(&body).unwrap_or_default();
+        if updated.is_empty() {
+            return Err(keyring_changed_error());
+        }
+        Ok(())
+    }
+}
+
+fn keyring_changed_error() -> AxiError {
+    AxiError::new(
+        "The vault keyring changed on another device while updating it",
+        "KEYRING_CHANGED",
+        vec!["Run the command again".to_string()],
+    )
+}
+
+/// The keyring lives next to the manifest at `<prefix>/.vault-axi/keyring.json`, created with
+/// `If-None-Match: *` and replaced with `If-Match: <etag>`.
+struct S3KeyringStore<'a> {
+    base: &'a str,
+}
+
+impl S3KeyringStore<'_> {
+    fn url(&self) -> String {
+        format!("{}/{KEYRING_PATH}", self.base)
+    }
+}
+
+impl KeyringStore for S3KeyringStore<'_> {
+    fn fetch_keyring(&mut self) -> Result<Option<StoredKeyring>, AxiError> {
+        let resp = match ureq::get(&self.url()).call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(404 | 403, _)) => return Ok(None),
+            Err(e) => return Err(http_error("Fetching the vault keyring failed", e)),
+        };
+        let version = resp.header("ETag").unwrap_or_default().to_string();
+        let body = resp
+            .into_string()
+            .map_err(|e| AxiError::new(e.to_string(), "SYNC_ERROR", vec![]))?;
+        let keyring =
+            Keyring::from_json(&body).map_err(|e| invalid_keyring_error(&e.to_string()))?;
+        Ok(Some(StoredKeyring { keyring, version }))
+    }
+
+    fn create_keyring(&mut self, keyring: &Keyring) -> Result<bool, AxiError> {
+        match ureq::put(&self.url())
+            .set("Content-Type", "application/json")
+            .set("If-None-Match", "*")
+            .send_string(&keyring.to_json())
+        {
+            Ok(_) => Ok(true),
+            Err(ureq::Error::Status(412 | 409, _)) => Ok(false),
+            Err(e) => Err(http_error("Creating the vault keyring failed", e)),
+        }
+    }
+
+    fn replace_keyring(&mut self, version: &str, next: &Keyring) -> Result<(), AxiError> {
+        match ureq::put(&self.url())
+            .set("Content-Type", "application/json")
+            .set("If-Match", version)
+            .send_string(&next.to_json())
+        {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(412, _)) => Err(keyring_changed_error()),
+            Err(e) => Err(http_error("Updating the vault keyring failed", e)),
+        }
+    }
+}
+
+/// Re-wrap the configured remote's keyring around `data_key` under `new_passphrase`.
+pub fn rewrap_keyring(
+    cfg: &crate::config::VaultConfig,
+    data_key: &vault_axi_core::crypto::DataKey,
+    new_passphrase: &str,
+) -> Result<bool, AxiError> {
+    match &cfg.remote {
+        Some(RemoteBackendConfig::Cloud {
+            access_token,
+            refresh_token,
+            user_id,
+            vault_id,
+            ..
+        }) => {
+            let mut bearer = access_token.clone().or_else(env_api_key).ok_or_else(|| {
+                AxiError::new(
+                    "Not signed in to the hosted cloud",
+                    "AUTH_ERROR",
+                    vec!["Run `vault login` first".to_string()],
+                )
+            })?;
+            let mut uid = user_id.clone();
+            if bearer.starts_with("vlt_") {
+                let (access, _, exchanged_uid, ..) = exchange_api_key(&bearer)
+                    .map_err(|e| AxiError::new(e, "AUTH_ERROR", vec![]))?;
+                bearer = access;
+                uid = exchanged_uid.or(uid);
+            } else if let Some((access, _)) =
+                refresh_token.as_deref().and_then(try_refresh_hosted_token)
+            {
+                bearer = access;
+            }
+            crate::crypto::rewrap_remote_keyring(
+                &mut CloudKeyringStore {
+                    bearer: &bearer,
+                    vault_id: vault_id.as_deref().unwrap_or("default"),
+                    user_id: uid.as_deref(),
+                },
+                data_key,
+                new_passphrase,
+            )
+        }
+        Some(RemoteBackendConfig::S3 {
+            endpoint,
+            bucket,
+            prefix,
+        }) => {
+            let base = s3_base_url(endpoint, bucket, prefix.as_deref().unwrap_or(""));
+            crate::crypto::rewrap_remote_keyring(
+                &mut S3KeyringStore { base: &base },
+                data_key,
+                new_passphrase,
+            )
+        }
+        _ => Ok(false),
+    }
+}
+
+fn s3_base_url(endpoint: &str, bucket: &str, prefix: &str) -> String {
+    let clean_ep = endpoint.trim_end_matches('/');
+    let clean_prefix = prefix.trim_matches('/');
+    if clean_prefix.is_empty() {
+        format!("{clean_ep}/{bucket}")
+    } else {
+        format!("{clean_ep}/{bucket}/{clean_prefix}")
+    }
+}
+
 /// Delta sync with Hosted Cloud (`vault_notes` table protected by RLS `auth.uid() = user_id`).
 #[allow(clippy::too_many_arguments)]
 fn sync_hosted_cloud(
@@ -797,9 +1058,6 @@ fn sync_hosted_cloud(
             ],
         ));
     }
-
-    let _ = crate::crypto::ensure_local_db_encrypted(db);
-    let current_key_id = crate::crypto::active_key_fingerprint();
 
     // Fetch the entire remote manifest in pages of 1000 (PostgREST caps single responses at 1000 rows).
     let mut remote_manifest: Vec<RemoteNoteMeta> = Vec::new();
@@ -896,8 +1154,22 @@ fn sync_hosted_cloud(
 
     let mut remote_map: HashMap<String, RemoteNoteMeta> = remote_manifest
         .into_iter()
+        .filter(|m| !paths::is_reserved(&m.path))
         .map(|m| (m.path.clone(), m))
         .collect();
+
+    let keychain = prepare_sync_keychain(
+        &load_config(),
+        &KeyCache::default(),
+        &mut CloudKeyringStore {
+            bearer: &bearer,
+            vault_id: &effective_vault_id,
+            user_id: effective_user_id.as_deref(),
+        },
+    )?;
+    let kc = &keychain;
+    reencrypt_local_db(db, kc);
+    let current_key_id = kc.active_key_id();
 
     // If any remote rows have `enc_key_id == "enc-v1"` (encrypted before key fingerprinting was added),
     // probe one such active row to see if it already decrypts with the active encryption key.
@@ -913,8 +1185,7 @@ fn sync_hosted_cloud(
             &effective_vault_id,
             &sample_path,
         ) {
-            let active_key = crate::crypto::resolve_active_key();
-            if v1::is_v1(&raw_ct) && crate::crypto::decrypt_with_key(&raw_ct, &active_key).is_ok() {
+            if kc.is_current(&raw_ct, &sample_path) {
                 // Stamp all `enc-v1` rows in this vault with `current_key_id` so they don't need re-uploading
                 let stamp_url = format!(
                     "{clean_url}/rest/v1/vault_notes?vault_id=eq.{effective_vault_id}&enc_key_id=eq.enc-v1"
@@ -943,7 +1214,7 @@ fn sync_hosted_cloud(
     ) {
         if let Ok(rows) = stmt.query_map([], |r| {
             let raw_base: String = r.get(3)?;
-            let dec_base = decrypt_at_rest(&raw_base).unwrap_or(raw_base);
+            let dec_base = kc.decrypt(&raw_base, LOCAL_CONTEXT).unwrap_or(raw_base);
             Ok((
                 r.get::<_, String>(0)?,
                 SyncedEntry {
@@ -1025,7 +1296,7 @@ fn sync_hosted_cloud(
                     != Some(r_meta.hash.as_str())
                 {
                     if let Some(ref lc) = local_content {
-                        upsert_sync_state(db, r_path, &r_meta.hash, r_meta.mtime_ms, now, lc);
+                        upsert_sync_state(kc, db, r_path, &r_meta.hash, r_meta.mtime_ms, now, lc);
                         synced_state.insert(
                             r_path.clone(),
                             SyncedEntry {
@@ -1060,9 +1331,14 @@ fn sync_hosted_cloud(
             let local_hash = local_content.as_ref().map(|s| sha1_hex(s));
             let synced_entry = synced_state.get(&r_path).cloned();
 
-            let Some(full) =
-                fetch_remote_note(clean_url, anon_key, &bearer, &effective_vault_id, &r_path)
-            else {
+            let Some(full) = fetch_remote_note(
+                kc,
+                clean_url,
+                anon_key,
+                &bearer,
+                &effective_vault_id,
+                &r_path,
+            ) else {
                 continue;
             };
 
@@ -1084,7 +1360,15 @@ fn sync_hosted_cloud(
                             "sync-pull",
                         );
                     }
-                    upsert_sync_state(db, &r_path, &full.hash, full.mtime_ms, now, &full.content);
+                    upsert_sync_state(
+                        kc,
+                        db,
+                        &r_path,
+                        &full.hash,
+                        full.mtime_ms,
+                        now,
+                        &full.content,
+                    );
                     synced_state.insert(
                         r_path.clone(),
                         SyncedEntry {
@@ -1102,6 +1386,7 @@ fn sync_hosted_cloud(
                     .map(|s| s.base_content.as_str())
                     .unwrap_or("");
                 resolve_concurrent_edit(
+                    kc,
                     db,
                     vault_root,
                     &r_path,
@@ -1165,6 +1450,7 @@ fn sync_hosted_cloud(
                         };
                         if base_moved {
                             if let Some(full) = fetch_remote_note(
+                                kc,
                                 clean_url,
                                 anon_key,
                                 &bearer,
@@ -1176,6 +1462,7 @@ fn sync_hosted_cloud(
                                     .map(|s| s.base_content.clone())
                                     .unwrap_or_default();
                                 resolve_concurrent_edit(
+                                    kc,
                                     db,
                                     vault_root,
                                     l_path,
@@ -1253,7 +1540,7 @@ fn sync_hosted_cloud(
                     let item = &upload_queue[q_idx];
                     push_idx += 1;
                     report_sync_progress("Uploading", push_idx, total_to_upload, &item.l_path);
-                    let encrypted_content = encrypt_at_rest(&item.content);
+                    let encrypted_content = kc.encrypt(&item.content, &item.l_path);
                     batch_bytes += encrypted_content.len();
                     let mut row = json!({
                         "vault_id": effective_vault_id,
@@ -1309,6 +1596,7 @@ fn sync_hosted_cloud(
                         if let Ok(r) = single_req.send_string(&row_val.to_string()) {
                             if r.status() < 300 {
                                 upsert_sync_state(
+                                    kc,
                                     db,
                                     &item.l_path,
                                     &item.l_hash,
@@ -1331,6 +1619,7 @@ fn sync_hosted_cloud(
                 } else {
                     for item in &upload_queue[batch_start..q_idx] {
                         upsert_sync_state(
+                            kc,
                             db,
                             &item.l_path,
                             &item.l_hash,
@@ -1363,7 +1652,7 @@ fn sync_hosted_cloud(
             let l_mtime = item.l_mtime;
 
             report_sync_progress("Uploading", push_idx, total_to_upload, l_path);
-            let encrypted_content = encrypt_at_rest(&content);
+            let encrypted_content = kc.encrypt(&content, l_path);
 
             if let Some(ref expected_r_hash) = item.expected_remote_hash {
                 let patch_url = format!(
@@ -1392,7 +1681,7 @@ fn sync_hosted_cloud(
                         let updated_rows: Vec<Value> =
                             serde_json::from_str(&body).unwrap_or_default();
                         if !updated_rows.is_empty() {
-                            upsert_sync_state(db, l_path, &l_hash, l_mtime, now, &content);
+                            upsert_sync_state(kc, db, l_path, &l_hash, l_mtime, now, &content);
                             synced_state.insert(
                                 l_path.clone(),
                                 SyncedEntry {
@@ -1404,6 +1693,7 @@ fn sync_hosted_cloud(
                             summary.pushed += 1;
                             continue;
                         } else if let Some(full) = fetch_remote_note(
+                            kc,
                             clean_url,
                             anon_key,
                             &bearer,
@@ -1416,6 +1706,7 @@ fn sync_hosted_cloud(
                                 .map(|s| s.base_content.clone())
                                 .unwrap_or_default();
                             resolve_concurrent_edit(
+                                kc,
                                 db,
                                 vault_root,
                                 l_path,
@@ -1438,7 +1729,7 @@ fn sync_hosted_cloud(
                 }
             }
 
-            let encrypted_content_final = encrypt_at_rest(&content);
+            let encrypted_content_final = kc.encrypt(&content, l_path);
             let upsert_url =
                 format!("{clean_url}/rest/v1/vault_notes?on_conflict=user_id,vault_id,path");
             let mut payload = json!({
@@ -1464,7 +1755,7 @@ fn sync_hosted_cloud(
             }
             if let Ok(r) = post_req.send_string(&payload.to_string()) {
                 if r.status() < 300 {
-                    upsert_sync_state(db, l_path, &l_hash, l_mtime, now, &content);
+                    upsert_sync_state(kc, db, l_path, &l_hash, l_mtime, now, &content);
                     synced_state.insert(
                         l_path.clone(),
                         SyncedEntry {
@@ -1489,6 +1780,7 @@ fn sync_hosted_cloud(
                 if let Some(rm) = remote_map.get(&synced_path) {
                     if !rm.deleted && rm.hash != last_remote_hash {
                         if let Some(full) = fetch_remote_note(
+                            kc,
                             clean_url,
                             anon_key,
                             &bearer,
@@ -1499,6 +1791,7 @@ fn sync_hosted_cloud(
                                 let abs_p = Path::new(&abs);
                                 if write_sync_payload(abs_p, &full.content).is_ok() {
                                     upsert_sync_state(
+                                        kc,
                                         db,
                                         &synced_path,
                                         &full.hash,
@@ -1586,13 +1879,7 @@ fn sync_s3_manifest(
     do_pull: bool,
     do_push: bool,
 ) -> Result<SyncSummary, AxiError> {
-    let clean_ep = endpoint.trim_end_matches('/');
-    let clean_prefix = prefix.trim_matches('/');
-    let base = if clean_prefix.is_empty() {
-        format!("{clean_ep}/{bucket}")
-    } else {
-        format!("{clean_ep}/{bucket}/{clean_prefix}")
-    };
+    let base = s3_base_url(endpoint, bucket, prefix);
 
     let manifest_url = format!("{base}/.vault-manifest.json");
     let mut remote_hashes: HashMap<String, String> = match ureq::get(&manifest_url).call() {
@@ -1604,8 +1891,14 @@ fn sync_s3_manifest(
         Err(_) => HashMap::new(),
     };
 
-    let _ = crate::crypto::ensure_local_db_encrypted(db);
-    let current_key_id = crate::crypto::active_key_fingerprint();
+    let keychain = prepare_sync_keychain(
+        &load_config(),
+        &KeyCache::default(),
+        &mut S3KeyringStore { base: &base },
+    )?;
+    let kc = &keychain;
+    reencrypt_local_db(db, kc);
+    let current_key_id = kc.active_key_id();
     let mut summary = SyncSummary {
         backend: "s3".to_string(),
         ..Default::default()
@@ -1636,11 +1929,11 @@ fn sync_s3_manifest(
             let file_url = format!("{base}/{r_path}");
             if let Ok(resp) = ureq::get(&file_url).call() {
                 if let Ok(raw_content) = resp.into_string() {
-                    let Ok(content) = decrypt_at_rest(&raw_content) else {
+                    let Ok(content) = kc.decrypt(&raw_content, &r_path) else {
                         continue;
                     };
                     if write_sync_payload(abs_p, &content).is_ok() {
-                        upsert_sync_state(db, &r_path, &r_hash, now, now, &content);
+                        upsert_sync_state(kc, db, &r_path, &r_hash, now, now, &content);
                         summary.pulled += 1;
                     }
                 }
@@ -1673,7 +1966,7 @@ fn sync_s3_manifest(
         let total_to_push = to_push.len().max(1);
         for (idx, (l_path, content, l_hash)) in to_push.into_iter().enumerate() {
             report_sync_progress("Uploading", idx + 1, total_to_push, &l_path);
-            let enc_content = encrypt_at_rest(&content);
+            let enc_content = kc.encrypt(&content, &l_path);
             let file_url = format!("{base}/{l_path}");
             if let Ok(r) = ureq::put(&file_url)
                 .set("Content-Type", "text/plain; charset=utf-8")
@@ -1681,7 +1974,7 @@ fn sync_s3_manifest(
             {
                 if r.status() < 300 {
                     remote_hashes.insert(l_path.clone(), format!("{l_hash}:{current_key_id}"));
-                    upsert_sync_state(db, &l_path, &l_hash, now, now, &content);
+                    upsert_sync_state(kc, db, &l_path, &l_hash, now, now, &content);
                     manifest_changed = true;
                     summary.pushed += 1;
                 }
@@ -2697,8 +2990,10 @@ mod tests {
         let mut synced_state = HashMap::new();
         let mut remote_map = HashMap::new();
         let mut summary = SyncSummary::default();
+        let kc = &Keychain::new(vault_axi_core::crypto::v1::derive_key("test"));
 
         resolve_concurrent_edit(
+            kc,
             &db,
             &root,
             note_rel,

@@ -109,6 +109,16 @@ impl Keyring {
         Ok((keyring, data_key))
     }
 
+    /// Create a keyring around an existing data key (e.g. to restore a lost remote keyring).
+    pub fn create_for(
+        data_key: &DataKey,
+        passphrase: &str,
+        kdf: KdfParams,
+        created_at: &str,
+    ) -> Result<Self, CryptoError> {
+        Self::wrap(data_key, passphrase, kdf, created_at)
+    }
+
     fn wrap(
         data_key: &DataKey,
         passphrase: &str,
@@ -217,6 +227,14 @@ mod tests {
         assert_ne!(kr2.kdf.salt, kr.kdf.salt);
         assert_eq!(kr2.unlock("new").unwrap(), dk);
         assert_eq!(kr2.unlock("old"), Err(CryptoError::WrongKey));
+    }
+
+    #[test]
+    fn create_for_wraps_an_existing_key() {
+        let dk = DataKey::new("k2_0123456789abcdef".into(), [9; 32]);
+        let kr = Keyring::create_for(&dk, "p", fast(), "t").unwrap();
+        assert_eq!(kr.key_id, dk.id());
+        assert_eq!(kr.unlock("p").unwrap(), dk);
     }
 
     #[test]

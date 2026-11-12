@@ -1259,7 +1259,7 @@ mod tests {
         let vault_dir = home_dir.join("my-vault");
         let _ = fs::remove_dir_all(&home_dir);
         fs::create_dir_all(&home_dir).unwrap();
-        std::env::set_var("VAULT_AXI_HOME", &home_dir);
+        let _home = crate::test_support::HomeGuard::new(&home_dir);
 
         let mut ctx = Ctx::with_vault(vault_dir.to_string_lossy().to_string());
 
@@ -1332,7 +1332,6 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(&home_dir);
-        std::env::remove_var("VAULT_AXI_HOME");
     }
     #[test]
     fn reconcile_indexes_resolves_links_and_prunes() {
@@ -1551,6 +1550,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        let _home = crate::test_support::HomeGuard::new(&dir.join(".home"));
         let vault_str = dir.to_string_lossy().to_string();
         let db = open_db_at(":memory:").unwrap();
         let mut ctx = Ctx::with_vault_and_db(&vault_str, db);

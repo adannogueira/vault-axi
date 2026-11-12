@@ -200,7 +200,7 @@ Each phase touches ≤5 files where possible, ends green (`cargo fmt --check`, `
 | 0 | Freeze v1 fixtures from current code + tests | done |
 | 1 | Cargo workspace + `core` crate: move v1 crypto (RustCrypto), payload, merge, conflict naming; CLI depends on core | done |
 | 2 | Core crypto v2: keyring, Argon2id, v2 envelope with path AAD, `Keychain` | done |
-| 3 | CLI on `Keychain`: keyring fetch/create (cloud + S3), DEK cache, migration, setup rewrap, `doctor` encryption status | pending |
+| 3 | CLI on `Keychain`: keyring fetch/create (cloud + S3), DEK cache, migration, setup rewrap, `doctor` encryption status | done (sync-level migration test lands with the phase 4 in-memory transport) |
 | 4 | Core `paths` + `plan`; refactor `sync_hosted_cloud` onto the planner (parity tests) | pending |
 | 5 | S3 onto the planner, manifest v2, conditional writes | pending |
 | 6 | `core-wasm` bindings + build; node test harness against fixtures | pending |

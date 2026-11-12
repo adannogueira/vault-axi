@@ -78,6 +78,10 @@ pub fn doctor_command(_args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
         "orphanCount": orphans.len(),
         "orphanNotes": orphans,
         "missingFrontmatterCount": missing_frontmatter.len(),
-        "missingFrontmatter": missing_frontmatter
+        "missingFrontmatter": missing_frontmatter,
+        "encryption": crate::crypto::encryption_status(
+            &crate::config::load_config(),
+            &crate::crypto::KeyCache::default()
+        )
     }))
 }

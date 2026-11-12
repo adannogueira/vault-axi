@@ -1,7 +1,7 @@
 use crate::args::{flag_bool, flag_int, flag_string, parse_args};
 use crate::axi::AxiError;
 use crate::context::Ctx;
-use crate::crypto::{decrypt_at_rest, encrypt_at_rest};
+use crate::crypto::{crypto_error, keychain, LOCAL_CONTEXT};
 use crate::render::truncate_text;
 use crate::vault::{normalize_note_path, resolve_in_vault};
 use chrono::{TimeZone, Utc};
@@ -58,7 +58,7 @@ pub fn record_note_version(db: &Connection, note_path: &str, content: &str, sour
     }
 
     let next_ver = latest.map(|(v, _)| v + 1).unwrap_or(1);
-    let enc_content = encrypt_at_rest(content);
+    let enc_content = keychain().encrypt(content, LOCAL_CONTEXT);
     let size = content.len() as i64;
     let _ = db.execute(
         "INSERT INTO note_versions(path, version_num, hash, size, content, created_at, source)
@@ -201,8 +201,9 @@ pub fn history_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
             ));
         };
 
-        let restored_text =
-            decrypt_at_rest(&enc_content).map_err(|e| AxiError::new(e, "CRYPTO_ERROR", vec![]))?;
+        let restored_text = keychain()
+            .decrypt(&enc_content, LOCAL_CONTEXT)
+            .map_err(crypto_error)?;
 
         ctx.pull_before_mutation()?;
         let abs_p = Path::new(&abs);
@@ -277,8 +278,9 @@ pub fn history_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
             ));
         };
 
-        let ver_text =
-            decrypt_at_rest(&enc_content).map_err(|e| AxiError::new(e, "CRYPTO_ERROR", vec![]))?;
+        let ver_text = keychain()
+            .decrypt(&enc_content, LOCAL_CONTEXT)
+            .map_err(crypto_error)?;
 
         let (shown_text, truncated) = if full {
             (ver_text.clone(), false)

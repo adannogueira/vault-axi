@@ -12,6 +12,15 @@ pub struct Keychain {
     v1_fallbacks: Vec<Zeroizing<Key>>,
 }
 
+impl std::fmt::Debug for Keychain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keychain")
+            .field("data_key", &self.data_key)
+            .field("v1_keys", &(1 + self.v1_fallbacks.len()))
+            .finish()
+    }
+}
+
 impl Keychain {
     pub fn new(v1_active: Key) -> Self {
         Self {

@@ -2,7 +2,7 @@ use crate::args::{flag_bool, flag_string, parse_args};
 use crate::axi::AxiError;
 use crate::commands::history::record_note_version;
 use crate::context::Ctx;
-use crate::crypto::{decrypt_at_rest, encrypt_at_rest};
+use crate::crypto::{crypto_error, keychain, LOCAL_CONTEXT};
 use crate::vault::{file_stat, normalize_any_vault_path, normalize_note_path, resolve_in_vault};
 use chrono::{TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -56,7 +56,7 @@ pub fn move_file_to_trash(db: &Connection, rel_path: &str, abs_path: &Path) -> O
         Err(_) => (encode_binary(&bytes), 1i64),
     };
 
-    let enc = encrypt_at_rest(&raw_payload);
+    let enc = keychain().encrypt(&raw_payload, LOCAL_CONTEXT);
     let _ = db.execute(
         "INSERT INTO trash(path, content, is_binary, mtime_ms, deleted_at, expires_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -84,7 +84,7 @@ pub fn store_text_in_trash(db: &Connection, rel_path: &str, content: &str, delet
     if expires_at <= now {
         return;
     }
-    let enc = encrypt_at_rest(content);
+    let enc = keychain().encrypt(content, LOCAL_CONTEXT);
     let _ = db.execute(
         "INSERT INTO trash(path, content, is_binary, mtime_ms, deleted_at, expires_at)
          VALUES (?1, ?2, 0, ?3, ?4, ?5)
@@ -231,8 +231,9 @@ pub fn restore_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
         ));
     }
 
-    let decrypted =
-        decrypt_at_rest(&enc_content).map_err(|e| AxiError::new(e, "CRYPTO_ERROR", vec![]))?;
+    let decrypted = keychain()
+        .decrypt(&enc_content, LOCAL_CONTEXT)
+        .map_err(crypto_error)?;
 
     if let Some(parent) = dest_p.parent() {
         let _ = fs::create_dir_all(parent);
