@@ -142,13 +142,12 @@ pub fn resolve(path, base, local, remote) -> Resolution; // Clean | AutoMerged |
 
 The CLI and the plugin execute actions with their own I/O (sqlite + fs + ureq vs IndexedDB + `app.vault.adapter` + `requestUrl`). Every rule currently documented in `sync_hosted_cloud` (delete-vs-edit, restore-over-delete, conditional PATCH with refetch on 0 rows, batching of new/re-encrypted rows ≤48 KB) is ported as a planner rule with a table-driven test.
 
-**S3 moves onto the same planner.** Today S3 has no 3-way merge and no deletion propagation. Manifest v2:
+**S3 moves onto the same planner.** Before this change S3 had no 3-way merge and didn't propagate deletions, and the last manifest write won. Now:
 
-```json
-{ "version": 2, "entries": { "<path>": { "hash": "", "keyId": "", "deleted": false, "mtime": 0 } } }
-```
-
-v1 manifests (`{"path": "hash:keyid"}`) are still read. Manifest writes use `If-Match: <etag>`. On 412 → re-read the manifest and re-plan.
+- Manifest v2: `{ "version": 2, "entries": { "<path>": { "hash", "keyId", "deleted", "mtime", "object" } } }`. v1 manifests (`{"path": "hash:keyid"}`, objects at their plain path) are still read and upgraded on the next commit.
+- Objects are content-addressed: `.vault-axi/objects/<sha256(path)[..32]>/<hash>.<keyId>`. Concurrent writers never overwrite each other's data.
+- The manifest is committed with `If-Match: <etag>` (`If-None-Match: *` when creating). A 412 means another device committed first; the engine retries the whole run (up to 3 attempts) against the new manifest.
+- Objects the committed manifest no longer references are deleted after the commit.
 
 ### Syncable path rules (shared)
 
@@ -201,8 +200,8 @@ Each phase touches ≤5 files where possible, ends green (`cargo fmt --check`, `
 | 1 | Cargo workspace + `core` crate: move v1 crypto (RustCrypto), payload, merge, conflict naming; CLI depends on core | done |
 | 2 | Core crypto v2: keyring, Argon2id, v2 envelope with path AAD, `Keychain` | done |
 | 3 | CLI on `Keychain`: keyring fetch/create (cloud + S3), DEK cache, migration, setup rewrap, `doctor` encryption status | done (sync-level migration test lands with the phase 4 in-memory transport) |
-| 4 | Core `paths` + `plan`; refactor `sync_hosted_cloud` onto the planner (parity tests) | pending |
-| 5 | S3 onto the planner, manifest v2, conditional writes | pending |
+| 4 | Core `paths` + `plan`; refactor `sync_hosted_cloud` onto the planner (parity tests) | done |
+| 5 | S3 onto the planner, manifest v2, conditional writes | done |
 | 6 | `core-wasm` bindings + build; node test harness against fixtures | pending |
 | 7 | Plugin scaffold: manifest, settings, secrets storage, auth (cloud + S3), unlock modal | pending |
 | 8 | Plugin sync engine: transports, IndexedDB state, executor, triggers, status/notices | pending |
