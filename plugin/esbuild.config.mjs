@@ -11,7 +11,10 @@ const context = await esbuild.context({
   target: "es2022",
   platform: "browser",
   // The core is shipped inside main.js: Obsidian plugins are a single script.
+  alias: { "vault-axi-core-wasm": "./wasm/core_bg.wasm" },
   loader: { ".wasm": "binary" },
+  // wasm-bindgen's async loader (unused: the plugin calls initSync) references import.meta.url.
+  define: { "import.meta.url": '"about:blank"' },
   sourcemap: production ? false : "inline",
   minify: production,
   treeShaking: true,
