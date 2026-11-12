@@ -28,3 +28,10 @@ toon-format = "0.4"
 vault-axi-core = { path = "crates/core" }
 ureq = { version = "2.12", features = ["json"] }
 
+
+# Argon2id at 64 MiB is unusably slow unoptimized; keep debug builds and tests responsive.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

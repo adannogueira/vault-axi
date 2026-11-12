@@ -23,6 +23,11 @@ pub fn encrypt(plaintext: &str, key: &Key) -> String {
     format!("{PREFIX}{}:{}", B64.encode(nonce), B64.encode(ct))
 }
 
+/// Short public id of a v1 key (first 16 hex chars of its SHA-256), stored as `enc_key_id`.
+pub fn fingerprint(key: &Key) -> String {
+    crate::hash::sha256_hex(key)[..16].to_string()
+}
+
 pub fn is_v1(stored: &str) -> bool {
     stored.starts_with(PREFIX)
 }

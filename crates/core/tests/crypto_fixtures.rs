@@ -26,3 +26,28 @@ fn frozen_v1_payloads_decrypt() {
         assert_eq!(plain, case["plaintext"].as_str().unwrap(), "{name}");
     }
 }
+
+/// Keyring and payloads produced by the first v2 implementation. They must unlock and decrypt forever.
+#[test]
+fn frozen_v2_keyring_and_payloads_decrypt() {
+    use vault_axi_core::crypto::keyring::Keyring;
+    use vault_axi_core::crypto::{CryptoError, Keychain};
+
+    let doc: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/crypto-v2.json")).unwrap();
+    let keyring = Keyring::from_json(&doc["keyring"].to_string()).unwrap();
+    let data_key = keyring.unlock(doc["passphrase"].as_str().unwrap()).unwrap();
+    assert_eq!(keyring.unlock("wrong"), Err(CryptoError::WrongKey));
+
+    let keychain = Keychain::new(v1::derive_key("unrelated")).with_data_key(data_key);
+    for case in doc["cases"].as_array().unwrap() {
+        let path = case["path"].as_str().unwrap();
+        let ct = case["ciphertext"].as_str().unwrap();
+        assert_eq!(
+            keychain.decrypt(ct, path).unwrap(),
+            case["plaintext"].as_str().unwrap(),
+            "{path}"
+        );
+        assert!(keychain.is_current(ct, path));
+    }
+}
