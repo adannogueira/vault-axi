@@ -92,7 +92,7 @@ vault restore <file> [--to <new_path>]    # recover a deleted note or attachment
 vault reindex [--force] [--no-embed]      # refresh FTS5 + OCR + embeddings index (search/graph/ls also auto-reconcile)
 vault setup --vault <path>                # configure local Obsidian vault path
 vault setup --capture-note <path|daily> [--capture-section Captures] # configure default destination for `vault capture`
-vault setup --encryption-key <passphrase> # configure client-side AES-256-GCM encryption key for cloud & local DB at rest
+vault setup --encryption-key <passphrase> # end-to-end encrypt synced data (Argon2id-wrapped vault key); changing it re-wraps the key
 vault setup --remote git:<url> [--branch main] # configure Git sync (or s3://<bucket>/<prefix> --endpoint <url>)
 vault setup [--auto-sync true|false] [--auto-update true|false] [hooks] # toggle auto-sync/auto-update or install SessionStart hook + skill
 vault register --email <e> [--password '<p>'] [--vault-id <id>] # create an account on Vault Cloud (prompts for password if omitted)

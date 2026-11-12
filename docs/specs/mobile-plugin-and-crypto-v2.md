@@ -1,6 +1,6 @@
 ---
 date: 2026-11-12
-status: draft
+status: active
 ---
 
 # Mobile sync plugin + crypto v2
@@ -185,10 +185,19 @@ Search index, embeddings, OCR, history/versions UI. Version history recorded dur
 - **Plugin:** `vitest` + `tsc --noEmit` + `eslint`. Engine tests run the real WASM against an in-memory transport and adapter.
 - **End to end:** CLI vault and Obsidian desktop with `app.emulateMobile(true)` on the same cloud vault: create/edit/delete/conflict both ways, v1→v2 migration mid-flight. Android device/emulator if available.
 
+## Changes during implementation
+
+- The keyring decision matrix (`resolve_vault_key`) and the S3 manifest format (`s3_manifest`) moved into core, so the CLI and plugin share them instead of re-implementing them.
+- S3 objects are content-addressed (see the S3 section); the manifest is the only mutable object.
+- Local DB rows bind a fixed `local-db` context instead of their path, because history rows are re-pathed when a note moves.
+- `VAULT_AXI_CLOUD_URL` overrides the hosted-cloud endpoint (self-hosting, interop tests).
+- The plugin requires a passphrase for S3: legacy S3 vaults without one used a key derived from the desktop vault path, which a phone cannot reproduce.
+- The plugin uses `window.localStorage` (namespaced by a per-install id) for secrets: `App.loadLocalStorage` isn't in the 1.7 typings.
+
 ## Open questions
 
-- Hosted Supabase RLS / triggers: confirm a row at `.vault-axi/keyring.json` is allowed and that a non-upsert `POST` returns 409 on the `(user_id, vault_id, path)` unique key. Verified in phase 3 against the live project.
-- Does the hosted `vault_notes.content` column have a size limit that v2 overhead (keyId in prefix) could cross? Overhead is ~25 bytes, so unlikely.
+- **Not yet verified against the live hosted project:** that RLS and any triggers on `vault_notes` allow the reserved `.vault-axi/keyring.json` row, and that a plain `POST` returns 409 on the `(user_id, vault_id, path)` unique key. Every protocol test runs against fakes.
+- The plugin has been exercised in Node against a stubbed Obsidian API, not yet inside the Obsidian app on a phone.
 
 ## Phases
 
@@ -199,11 +208,11 @@ Each phase touches ≤5 files where possible, ends green (`cargo fmt --check`, `
 | 0 | Freeze v1 fixtures from current code + tests | done |
 | 1 | Cargo workspace + `core` crate: move v1 crypto (RustCrypto), payload, merge, conflict naming; CLI depends on core | done |
 | 2 | Core crypto v2: keyring, Argon2id, v2 envelope with path AAD, `Keychain` | done |
-| 3 | CLI on `Keychain`: keyring fetch/create (cloud + S3), DEK cache, migration, setup rewrap, `doctor` encryption status | done (sync-level migration test lands with the phase 4 in-memory transport) |
+| 3 | CLI on `Keychain`: keyring fetch/create (cloud + S3), DEK cache, migration, setup rewrap, `doctor` encryption status | done |
 | 4 | Core `paths` + `plan`; refactor `sync_hosted_cloud` onto the planner (parity tests) | done |
 | 5 | S3 onto the planner, manifest v2, conditional writes | done |
-| 6 | `core-wasm` bindings + build; node test harness against fixtures | pending |
-| 7 | Plugin scaffold: manifest, settings, secrets storage, auth (cloud + S3), unlock modal | pending |
-| 8 | Plugin sync engine: transports, IndexedDB state, executor, triggers, status/notices | pending |
-| 9 | CI (wasm build, plugin lint/test, clippy) + release assets (`main.js`, `manifest.json`, `styles.css`) + README | pending |
-| 10 | End-to-end verification CLI ↔ plugin, migration mid-flight | pending |
+| 6 | `core-wasm` bindings + build; node test harness against fixtures | done |
+| 7 | Plugin scaffold: manifest, settings, secrets storage, auth (cloud + S3), unlock modal | done |
+| 8 | Plugin sync engine: transports, IndexedDB state, executor, triggers, status/notices | done |
+| 9 | CI (wasm build, plugin lint/test, clippy) + release assets (`main.js`, `manifest.json`) + README | done |
+| 10 | End-to-end verification CLI ↔ plugin, migration mid-flight | done |
