@@ -2,13 +2,13 @@ use crate::args::{flag_bool, parse_args};
 use crate::axi::AxiError;
 use crate::config::{config_dir, load_config};
 use crate::context::Ctx;
-use crate::crypto::sha256_hex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use vault_axi_core::hash::sha256_hex;
 
 const UPDATE_COOLDOWN_MS: i64 = 24 * 60 * 60 * 1000;
 const DEFAULT_RELEASE_API: &str =
@@ -137,7 +137,10 @@ pub fn fetch_latest_release(api_url_override: Option<&str>) -> Result<ReleaseInf
 
     let resp = ureq::get(&url)
         .timeout(Duration::from_secs(5))
-        .set("User-Agent", &format!("vault-axi/{}", env!("CARGO_PKG_VERSION")))
+        .set(
+            "User-Agent",
+            &format!("vault-axi/{}", env!("CARGO_PKG_VERSION")),
+        )
         .set("Accept", "application/vnd.github+json")
         .call()
         .map_err(|e| format!("Failed to check GitHub releases: {e}"))?;
@@ -202,13 +205,13 @@ pub fn fetch_latest_release(api_url_override: Option<&str>) -> Result<ReleaseInf
     })
 }
 
-pub fn download_and_replace_binary(
-    info: &ReleaseInfo,
-    target_exe: &Path,
-) -> Result<(), String> {
+pub fn download_and_replace_binary(info: &ReleaseInfo, target_exe: &Path) -> Result<(), String> {
     let resp = ureq::get(&info.download_url)
         .timeout(Duration::from_secs(60))
-        .set("User-Agent", &format!("vault-axi/{}", env!("CARGO_PKG_VERSION")))
+        .set(
+            "User-Agent",
+            &format!("vault-axi/{}", env!("CARGO_PKG_VERSION")),
+        )
         .call()
         .map_err(|e| format!("Failed to download update binary: {e}"))?;
 
@@ -224,7 +227,10 @@ pub fn download_and_replace_binary(
     if let Some(ref sha_url) = info.sha256_url {
         if let Ok(sha_resp) = ureq::get(sha_url)
             .timeout(Duration::from_secs(10))
-            .set("User-Agent", &format!("vault-axi/{}", env!("CARGO_PKG_VERSION")))
+            .set(
+                "User-Agent",
+                &format!("vault-axi/{}", env!("CARGO_PKG_VERSION")),
+            )
             .call()
         {
             if let Ok(sha_text) = sha_resp.into_string() {
@@ -253,8 +259,7 @@ pub fn download_and_replace_binary(
         let _ = fs::remove_file(&old_path);
     }
 
-    fs::write(&new_path, &bytes)
-        .map_err(|e| format!("Failed to write staged binary: {e}"))?;
+    fs::write(&new_path, &bytes).map_err(|e| format!("Failed to write staged binary: {e}"))?;
 
     #[cfg(unix)]
     {

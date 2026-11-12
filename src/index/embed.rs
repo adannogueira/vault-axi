@@ -34,7 +34,9 @@ pub fn fold_diacritics(text: &str) -> String {
                 'é' | 'è' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => out.push('e'),
                 'í' | 'ì' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' => out.push('i'),
                 'ó' | 'ò' | 'õ' | 'ô' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => out.push('o'),
-                'ú' | 'ù' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => out.push('u'),
+                'ú' | 'ù' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => {
+                    out.push('u')
+                }
                 'ç' | 'ć' | 'č' | 'ĉ' | 'ċ' => out.push('c'),
                 'ñ' | 'ń' | 'ň' | 'ņ' => out.push('n'),
                 'ý' | 'ÿ' | 'ŷ' => out.push('y'),
@@ -67,8 +69,8 @@ fn stopwords() -> &'static HashSet<&'static str> {
             "about", "after", "before", "between", "each", "other", "where", "which", "while",
             "who", "whom", "whose", "why", "you", "your", "our", "out", "over", "under", "again",
             "further", "once", "here", "both", "few", "most", "own", "same", "too", "very", "just",
-            "now", "being", "been", "does", "did", "doing", "its", "it", "his", "her", "she", "him",
-            // Portuguese / Spanish / Romance
+            "now", "being", "been", "does", "did", "doing", "its", "it", "his", "her", "she",
+            "him", // Portuguese / Spanish / Romance
             "para", "com", "por", "uma", "uns", "umas", "dos", "das", "nos", "nas", "pelos",
             "pelas", "pelo", "pela", "como", "mais", "mas", "sem", "sob", "sobre", "entre", "ate",
             "apos", "isso", "isto", "aquilo", "este", "esta", "estes", "estas", "esse", "essa",
@@ -120,7 +122,12 @@ pub fn stem_multilingual(word: &str) -> String {
             w = format!("{stem}m");
         }
     } else if let Some(stem) = w.strip_suffix("es") {
-        if stem.ends_with("ss") || stem.ends_with("sh") || stem.ends_with("ch") || stem.ends_with('x') || stem.ends_with('z') {
+        if stem.ends_with("ss")
+            || stem.ends_with("sh")
+            || stem.ends_with("ch")
+            || stem.ends_with('x')
+            || stem.ends_with('z')
+        {
             if stem.len() >= 3 {
                 w = stem.to_string();
             }
@@ -316,7 +323,9 @@ pub fn to_blob(vec: &[f32]) -> Vec<u8> {
 }
 
 pub fn from_blob(buf: &[u8]) -> Vec<f32> {
-    buf.chunks_exact(4)
+    buf.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -366,10 +375,13 @@ mod tests {
             stem_multilingual(&fold_diacritics("estrategia"))
         );
 
-        let v_docker1 = embed_single("Docker containers package images and layers for virtualization");
+        let v_docker1 =
+            embed_single("Docker containers package images and layers for virtualization");
         let v_docker2 = embed_single("Building a container image with a Dockerfile layer cache");
-        let v_pt_cognate = embed_single("Virtualização de containers e imagens com camadas no Docker");
-        let v_unrelated = embed_single("Quantum electrodynamics photon propagator Feynman diagrams");
+        let v_pt_cognate =
+            embed_single("Virtualização de containers e imagens com camadas no Docker");
+        let v_unrelated =
+            embed_single("Quantum electrodynamics photon propagator Feynman diagrams");
 
         let sim_related = cosine(&v_docker1, &v_docker2);
         let sim_cross_lang = cosine(&v_docker1, &v_pt_cognate);

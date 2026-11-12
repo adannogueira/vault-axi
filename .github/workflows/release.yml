@@ -125,9 +125,60 @@ jobs:
             dist/${{ matrix.asset_name }}
             dist/${{ matrix.asset_name }}.sha256
 
+  plugin:
+    name: Build Obsidian plugin
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.1
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+
+      - name: Stamp the release version into the plugin manifest
+        shell: bash
+        run: |
+          RAW_TAG="${GITHUB_REF#refs/tags/}"
+          [ -n "${{ inputs.tag_name }}" ] && RAW_TAG="${{ inputs.tag_name }}"
+          [ "${{ github.event_name }}" = "release" ] && RAW_TAG="${{ github.event.release.tag_name }}"
+          VERSION="${RAW_TAG#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            VERSION=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          fi
+          node -e 'const fs=require("fs");for(const f of ["plugin/manifest.json","plugin/package.json"]){const j=JSON.parse(fs.readFileSync(f));j.version=process.argv[1];fs.writeFileSync(f,JSON.stringify(j,null,2)+"\n")}' "$VERSION"
+          echo "Plugin version ${VERSION}"
+
+      - name: Build
+        working-directory: plugin
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload plugin assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: obsidian-plugin
+          path: |
+            plugin/main.js
+            plugin/manifest.json
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, plugin]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

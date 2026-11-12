@@ -205,7 +205,8 @@ mod tests {
             .unwrap();
         assert_eq!(count_after_insert, 1);
 
-        db.execute("DELETE FROM blocks WHERE path = 'a.md'", []).unwrap();
+        db.execute("DELETE FROM blocks WHERE path = 'a.md'", [])
+            .unwrap();
         let count_after_delete: i64 = db
             .query_row(
                 "SELECT COUNT(*) FROM blocks_fts WHERE blocks_fts MATCH 'unique_fts_token'",

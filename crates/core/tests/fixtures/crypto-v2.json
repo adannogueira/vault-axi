@@ -1,0 +1,34 @@
+{
+  "cases": [
+    {
+      "ciphertext": "enc:v2:k2_f3069256e29ab73b:Wdjb9aY3UMZmNo2m:1Yiy8P/Hh6UJYbT2BEeDwJWCMMeFuGmX2ibIwGQ3q6KYR3EXJT8BHf8eziZzS5C6tsOyc5MlTKVLLA==",
+      "path": "notes/a.md",
+      "plaintext": "# Note\n\nUTF-8: café, ação, 東京 🚀\n"
+    },
+    {
+      "ciphertext": "enc:v2:k2_f3069256e29ab73b:yhzEMqTSFXuct4cu:9AelCyXimaQyxDyvzARu1CYdb94sIYPUR2qVuouhYudnAaI=",
+      "path": "img/x.png",
+      "plaintext": "b64:v1:iVBORw0KGgo="
+    },
+    {
+      "ciphertext": "enc:v2:k2_f3069256e29ab73b:PZ+iStq/8fEms+Na:et90XEFKGCZcB0A4mUaDLg==",
+      "path": "empty.md",
+      "plaintext": ""
+    }
+  ],
+  "description": "Frozen enc:v2 keyring and payloads (Argon2id-wrapped data key, AES-256-GCM with path AAD). Never regenerate.",
+  "keyring": {
+    "createdAt": "2026-11-12T00:00:00Z",
+    "kdf": {
+      "alg": "argon2id",
+      "m": 8192,
+      "p": 1,
+      "salt": "hq6d59ptGMXBkitwBVjNzA==",
+      "t": 1
+    },
+    "keyId": "k2_f3069256e29ab73b",
+    "version": 2,
+    "wrappedKey": "Fp4nFysslB4877ZJmjjnUMa2qvk0Lnv0hlmK/EyZuNQArCNztvKIFDAKMPD9xfwRR8cf9e2o5OLz+Xu9"
+  },
+  "passphrase": "correct horse battery staple"
+}

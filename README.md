@@ -4,7 +4,8 @@ An [AXI](https://www.axi.md) (agent-ergonomic) CLI and built-in MCP server for r
 and searching an Obsidian markdown vault, compiled to a single standalone Rust binary (`vault`).
 
 - **Zero-config Hosted Cloud + Self-Hosted Sync.** Register or sign in with `vault register` / `vault login` (with optional TOTP MFA) on our hosted multi-tenant cloud for instant automatic sync (including markdown notes, binary attachments, and `.obsidian/` settings/plugins with live progress), or point `--remote` at a **Git** repository or **S3 / Cloudflare R2** bucket.
-- **Client-Side AES-256-GCM Encryption at Rest & Scoped API Tokens.** Notes, version history, and trash are encrypted at rest with AES-256-GCM (`vault setup --encryption-key <key>` or `VAULT_ENCRYPTION_KEY`), and headless `vlt_...` API tokens can be scoped to a specific vault (`--vault-id`) and permission mode (`--scope read|write` / `--read-only`), enforced server-side via Postgres RLS.
+- **End-to-End Encryption & Scoped API Tokens.** With `vault setup --encryption-key <passphrase>` (or `VAULT_ENCRYPTION_KEY`), synced notes, attachments, history and trash are encrypted under a random per-vault key, wrapped by an Argon2id key derived from your passphrase; the server never sees anything it could decrypt. Headless `vlt_...` API tokens can be scoped to a specific vault (`--vault-id`) and permission mode (`--scope read|write` / `--read-only`), enforced server-side via Postgres RLS.
+- **Mobile Sync via the Obsidian Plugin.** The `Vault AXI Sync` plugin syncs the same vault on Android, iOS and desktop Obsidian through the hosted cloud or your S3 bucket, using the same Rust core (compiled to WebAssembly) as the CLI.
 - **Fast Capture, 7-Day Trash & Version History.** Capture thoughts instantaneously into today's daily note (`vault capture "..."`), inspect or restore any historical note version (`vault history <file> [--version N | --diff N | --restore N]`) without polluting search results, and recover deleted notes/attachments for up to 7 days (`vault trash`, `vault restore <file>`).
 - **Attachments & Local Image OCR.** Attach images and documents (`vault attach <note> <file>`), automatically extract text from attached images via local OCR (`tesseract` or OS-native OCR), and search text inside images with `vault search`.
 - **First-Class Task Build Logs (`vault log`).** Append timestamped entries with any custom `--kind <label>` directly into a task note's `## Build Log` section (`vault log plans/my-task.md "..." [--kind <label>] [--section <heading>]`)—safe across concurrent multi-tab sessions with zero global state collisions.
@@ -117,9 +118,68 @@ vault setup --remote git:git@github.com:you/vault.git --branch main
 vault setup --remote s3://my-vault-bucket/notes --endpoint https://<account>.r2.cloudflarestorage.com
 ```
 
+## Encryption
+
+Synced data is always encrypted client-side with AES-256-GCM. What protects the key depends on
+whether you set a passphrase:
+
+| Setup | Key | Who can decrypt |
+|---|---|---|
+| `vault setup --encryption-key <passphrase>` (recommended) | Random per-vault key, wrapped by Argon2id(passphrase) in a keyring stored next to your data | Only devices that know the passphrase |
+| Hosted cloud, no passphrase | Derived from your account and vault ids | Anyone holding those ids, including the server |
+| S3, no passphrase | Derived from the local vault path | Only devices whose vault sits at the same path |
+
+- The first sync after setting a passphrase creates the keyring and re-encrypts every remote and
+  local copy. Data written by earlier versions stays readable throughout.
+- Changing the passphrase (`vault setup --encryption-key <new>`) re-wraps the vault key; nothing is
+  re-encrypted, and other devices keep working until you give them the new passphrase.
+- The passphrase cannot be removed once a vault is end-to-end encrypted.
+- `vault doctor` reports the encryption mode in use.
+- Payloads are bound to their path, so a server cannot swap one note's content into another.
+
+## Mobile (Obsidian plugin)
+
+The plugin lives in [`plugin/`](plugin/) and is attached to every release (`main.js`,
+`manifest.json`).
+
+1. Install [BRAT](https://github.com/TfTHacker/obsidian42-brat) in Obsidian and add this repository
+   as a beta plugin (or copy `main.js` and `manifest.json` into
+   `<vault>/.obsidian/plugins/vault-axi-sync/`).
+2. Enable **Vault AXI Sync** and open its settings.
+3. Hosted cloud: sign in with your email and password (plus the two-factor code if enabled), or
+   paste a token from `vault token create`. S3: enter the same endpoint, bucket and prefix as
+   `vault setup --remote s3://...`.
+4. Enter your vault passphrase (required for S3).
+
+It syncs on startup, a few seconds after edits, when the app returns to the foreground, and on an
+interval. Credentials and the unlocked vault key are stored on the device, outside the vault;
+`data.json` holds only non-secret settings.
+
+## Upgrading from 1.1
+
+- Upgrade the CLI on every device that syncs the vault. Older versions cannot read the end-to-end
+  encrypted format, and older versions writing to S3 would overwrite the new manifest format.
+- S3 sync now merges concurrent edits, propagates deletions and commits its manifest with
+  compare-and-swap. Legacy manifests are upgraded on the first sync.
+- `VAULT_AXI_CLOUD_URL` points the hosted-cloud backend at another Supabase project
+  (self-hosting or testing).
+
 ## Development
 
+The repository is a Cargo workspace: the CLI at the root, `crates/core` (I/O-free crypto, merge,
+path rules and sync planning shared by every client), `crates/core-wasm` (its WebAssembly
+bindings) and `plugin/` (the Obsidian plugin). Design notes are in
+[`docs/specs/`](docs/specs/).
+
 ```bash
-cargo test
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 cargo build --release
+
+# Plugin (needs wasm-pack and the wasm32-unknown-unknown target)
+cd plugin
+npm ci
+npm run build                # WASM core, typecheck, bundle -> main.js
+cargo build && npm run check # typecheck, lint, tests (incl. CLI <-> plugin interop)
 ```

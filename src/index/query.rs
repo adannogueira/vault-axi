@@ -95,9 +95,7 @@ pub fn rank_by_vector(db: &Connection, qvec: &[f32], limit: usize) -> Vec<Hit> {
     else {
         return Vec::new();
     };
-    let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
-    });
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)));
     let Ok(rows) = rows else {
         return Vec::new();
     };
@@ -108,7 +106,11 @@ pub fn rank_by_vector(db: &Connection, qvec: &[f32], limit: usize) -> Vec<Hit> {
             score: cosine(qvec, &from_blob(&blob)) as f64,
         })
         .collect();
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scored.truncate(limit);
     scored
 }

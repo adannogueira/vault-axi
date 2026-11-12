@@ -1,0 +1,28 @@
+{
+  "name": "vault-axi-sync",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Obsidian plugin that syncs a vault with vault-axi's hosted cloud or S3 backend, end-to-end encrypted.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "wasm": "wasm-pack build ../crates/core-wasm --target web --release --out-dir ../../plugin/wasm --out-name core --no-pack",
+    "build": "npm run wasm && npm run typecheck && node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run lint && npm run test"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.15.0",
+    "@types/node": "22.9.0",
+    "esbuild": "0.24.0",
+    "eslint": "9.15.0",
+    "fake-indexeddb": "6.0.0",
+    "obsidian": "1.7.2",
+    "typescript": "5.6.3",
+    "typescript-eslint": "8.15.0",
+    "vitest": "2.1.5"
+  }
+}

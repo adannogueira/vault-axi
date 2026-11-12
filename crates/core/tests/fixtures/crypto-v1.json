@@ -1,0 +1,59 @@
+{
+  "description": "Frozen enc:v1 payloads produced by vault-axi 1.1.2 (ring AES-256-GCM, PBKDF2-HMAC-SHA256, 10k iterations, salt 'vault-axi-at-rest-salt-v1'). Never regenerate: these guard backward compatibility.",
+  "cases": [
+    {
+      "name": "passphrase",
+      "key": {
+        "kind": "pbkdf2",
+        "input": "correct horse battery staple"
+      },
+      "plaintext": "# Note\n\nUTF-8: café, ação, 東京 🚀\n",
+      "ciphertext": "enc:v1:J9SbS3n0pqqbipfx:rwA5TkMHXZ3iN4kS8ioSJ7uL4o39+VwuriU0foBoCkZbtbURJXusyCOdhqakW1BGdLzc5pM6mB8Hng=="
+    },
+    {
+      "name": "previous_passphrase_raw32",
+      "key": {
+        "kind": "raw",
+        "b64": "AwoRGB8mLTQ7QklQV15lbHN6gYiPlp2kq7K5wMfO1dw="
+      },
+      "plaintext": "previous raw key\n",
+      "ciphertext": "enc:v1:9x6RY43JloARazuA:6eLmHxix7Nmk3ZTBMM7flv1fJdWYX3bX9Og6MnnTYRP3"
+    },
+    {
+      "name": "cloud_derived",
+      "key": {
+        "kind": "pbkdf2",
+        "input": "vault-axi-cloud-e2ee:6f1c2d3e-0000-4000-8000-123456789abc:default"
+      },
+      "plaintext": "cloud note\r\nwith CRLF\r\n",
+      "ciphertext": "enc:v1:ZGahMizKkZiaVkUR:iBSFXO08MEucuW4nlyl3AOWiij4rw+8Ud/OoioTtI3fhzu+Ylkoq"
+    },
+    {
+      "name": "local_derived",
+      "key": {
+        "kind": "pbkdf2",
+        "input": "vault-axi-local-at-rest:/Users/someone/Vault"
+      },
+      "plaintext": "local base content",
+      "ciphertext": "enc:v1:7DD/GfgMQtSTiYXj:6w6TZroHNbDFwmPWU88y+g6XdgRW8g9bnMQ3zBYvjUMJgQ=="
+    },
+    {
+      "name": "binary_payload",
+      "key": {
+        "kind": "pbkdf2",
+        "input": "correct horse battery staple"
+      },
+      "plaintext": "b64:v1:iVBORw0KGgoA/xA=",
+      "ciphertext": "enc:v1:jRGLL1+Wfa83ATt/:4MorcwQGHzqJKMcxDo3SQ2W7PBOxSBlDXWTljno7y+D2kSsYLngJ"
+    },
+    {
+      "name": "empty_plaintext",
+      "key": {
+        "kind": "pbkdf2",
+        "input": "correct horse battery staple"
+      },
+      "plaintext": "",
+      "ciphertext": "enc:v1:ymRoJjWLla/GqxkE:k8c1sqQCIzqVKzLkrVElCQ=="
+    }
+  ]
+}

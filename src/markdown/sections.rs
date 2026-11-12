@@ -347,7 +347,7 @@ pub enum SectionMode {
 }
 
 impl SectionMode {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "replace" => Some(Self::Replace),
             "append" => Some(Self::Append),
@@ -443,9 +443,12 @@ pub fn insert_at_heading(
     block.push(String::new());
 
     let out = match where_anchor {
-        HeadingAnchor::BeforeHeading => {
-            splice(&doc.lines, section.heading_line, section.heading_line, &block)
-        }
+        HeadingAnchor::BeforeHeading => splice(
+            &doc.lines,
+            section.heading_line,
+            section.heading_line,
+            &block,
+        ),
         HeadingAnchor::AfterHeading => {
             splice(&doc.lines, section.body_start, section.body_start, &block)
         }
@@ -585,14 +588,22 @@ mod tests {
     #[test]
     fn builds_ancestor_paths_and_ignores_code_fences() {
         let doc = parse_doc(DOC);
-        let sub = doc.headings.iter().find(|h| h.title == "Sub-detail").unwrap();
+        let sub = doc
+            .headings
+            .iter()
+            .find(|h| h.title == "Sub-detail")
+            .unwrap();
         assert_eq!(
             sub.path,
             vec!["AXI Tool Scratch Test", "Design", "Sub-detail"]
         );
         // Open Questions (level 2) comes after Sub-detail (level 3) and Design (level 2),
         // so both Sub-detail and Design must be popped from the ancestor stack.
-        let oq = doc.headings.iter().find(|h| h.title == "Open Questions").unwrap();
+        let oq = doc
+            .headings
+            .iter()
+            .find(|h| h.title == "Open Questions")
+            .unwrap();
         assert_eq!(oq.path, vec!["AXI Tool Scratch Test", "Open Questions"]);
 
         // Test H1 through H6 and ensure 7 hashes is not treated as a heading,
@@ -621,7 +632,17 @@ mod tests {
         let h2b = deep_doc.headings.iter().find(|h| h.title == "H2b").unwrap();
         assert_eq!(h2b.path, vec!["H1", "H2b"]);
 
-        let raw = ["# Real", "", "```", "# not a heading", "```", "", "## Also Real", ""].join("\n");
+        let raw = [
+            "# Real",
+            "",
+            "```",
+            "# not a heading",
+            "```",
+            "",
+            "## Also Real",
+            "",
+        ]
+        .join("\n");
         let doc2 = parse_doc(&raw);
         let titles: Vec<&str> = doc2.headings.iter().map(|h| h.title.as_str()).collect();
         assert_eq!(titles, vec!["Real", "Also Real"]);
@@ -637,7 +658,13 @@ mod tests {
 
     #[test]
     fn edit_section_replace_in_place() {
-        let out = edit_section(DOC, "Design", SectionMode::Replace, "Replaced design notes.").unwrap();
+        let out = edit_section(
+            DOC,
+            "Design",
+            SectionMode::Replace,
+            "Replaced design notes.",
+        )
+        .unwrap();
         let design_headings: Vec<&str> = out
             .lines()
             .filter(|l| l.ends_with("Design") && l.starts_with('#'))
@@ -702,9 +729,8 @@ mod tests {
         assert!(appended.trim_end().ends_with("## Appended Tail\ncontent"));
 
         let prepended = prepend_to_doc(DOC, "Intro paragraph.");
-        assert!(prepended.starts_with(
-            "---\ndate: 2026-07-01\nstatus: draft\n---\n\nIntro paragraph.\n\n# AXI"
-        ));
+        assert!(prepended
+            .starts_with("---\ndate: 2026-07-01\nstatus: draft\n---\n\nIntro paragraph.\n\n# AXI"));
     }
 
     #[test]
@@ -772,10 +798,7 @@ mod tests {
         assert_eq!(empty_anc.kind, SectionErrorKind::NotFound);
 
         // Prepend on doc without frontmatter and empty block no-ops
-        assert_eq!(
-            prepend_to_doc("# H\nBody\n", "Top"),
-            "Top\n\n# H\nBody\n"
-        );
+        assert_eq!(prepend_to_doc("# H\nBody\n", "Top"), "Top\n\n# H\nBody\n");
         assert_eq!(prepend_to_doc("# H\n", "   "), "# H\n");
         assert_eq!(append_to_doc("# H\n", "   "), "# H\n");
         assert_eq!(

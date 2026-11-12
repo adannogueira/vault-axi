@@ -16,7 +16,10 @@ pub fn setup_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
         || flag_bool(&parsed.flags, "hooks");
     let vault = flag_string(&parsed.flags, "vault");
     let remote = flag_string(&parsed.flags, "remote");
-    let auto_sync_flag = parsed.flags.get("auto-sync").map(|_| flag_bool(&parsed.flags, "auto-sync"));
+    let auto_sync_flag = parsed
+        .flags
+        .get("auto-sync")
+        .map(|_| flag_bool(&parsed.flags, "auto-sync"));
     let auto_update_flag = parsed
         .flags
         .get("auto-update")
@@ -152,32 +155,52 @@ pub fn setup_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
         }
     }
 
-    let old_key = encryption_key
-        .as_ref()
-        .map(|_| crate::crypto::resolve_active_key());
-    if let Some(ek) = encryption_key {
-        if let Some(prev_ek) = config.encryption_key.take() {
-            if !prev_ek.trim().is_empty() {
-                config.local_encryption_key = Some(prev_ek);
+    let encryption_changed = match &encryption_key {
+        Some(ek) => {
+            let new_pass = ek.trim().to_string();
+            let old_pass = config
+                .encryption_key
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            if new_pass != old_pass {
+                let cached = crate::crypto::key_scope(&config)
+                    .and_then(|scope| crate::crypto::KeyCache::default().get(&scope));
+                if let Some(data_key) = cached {
+                    if new_pass.is_empty() {
+                        return Err(AxiError::new(
+                            "This vault is end-to-end encrypted; its passphrase cannot be removed",
+                            "ENCRYPTION_IN_USE",
+                            vec!["Change it instead: `vault setup --encryption-key <new passphrase>`".to_string()],
+                        ));
+                    }
+                    let rewrapped = crate::sync::rewrap_keyring(&config, &data_key, &new_pass)?;
+                    out.insert("keyringRewrapped".to_string(), json!(rewrapped));
+                }
+                if !old_pass.is_empty() {
+                    config.local_encryption_key = Some(old_pass);
+                }
+                config.encryption_key = (!new_pass.is_empty()).then_some(new_pass);
             }
+            out.insert(
+                "encryptionConfigured".to_string(),
+                json!(config.encryption_key.is_some()),
+            );
+            true
         }
-        let trimmed = ek.trim().to_string();
-        if trimmed.is_empty() {
-            config.encryption_key = None;
-            out.insert("encryptionConfigured".to_string(), json!(false));
-        } else {
-            config.encryption_key = Some(trimmed);
-            out.insert("encryptionConfigured".to_string(), json!(true));
-        }
-    }
+        None => false,
+    };
 
     save_config(&config);
-    if let Some(prev_key) = old_key {
-        let new_key = crate::crypto::resolve_active_key();
+    if encryption_changed {
         if let Ok(db) = ctx.db() {
             crate::sync::ensure_sync_table(db);
-            let reencrypted = crate::crypto::reencrypt_local_db(db, Some(&prev_key), &new_key);
-            out.insert("localRowsReencrypted".to_string(), json!(reencrypted));
+            let report = crate::crypto::reencrypt_local_db(db, &crate::crypto::keychain());
+            out.insert("localRowsReencrypted".to_string(), json!(report.updated));
+            if report.unreadable > 0 {
+                out.insert("localRowsUnreadable".to_string(), json!(report.unreadable));
+            }
         }
     }
     out.insert(
@@ -243,10 +266,7 @@ fn find_vault_session_hook() -> Option<String> {
     let path = home.join(".claude").join("settings.json");
     let raw = fs::read_to_string(path).ok()?;
     let settings: Value = serde_json::from_str(&raw).ok()?;
-    let groups = settings
-        .get("hooks")?
-        .get("SessionStart")?
-        .as_array()?;
+    let groups = settings.get("hooks")?.get("SessionStart")?.as_array()?;
     for group in groups {
         if let Some(hooks) = group.get("hooks").and_then(|h| h.as_array()) {
             for h in hooks {

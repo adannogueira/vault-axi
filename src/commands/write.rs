@@ -32,7 +32,9 @@ pub fn write_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
         return Err(AxiError::new(
             format!("Note already exists: {note_path}"),
             "VALIDATION_ERROR",
-            vec!["Pass --force to overwrite, or use `vault update` for a surgical edit".to_string()],
+            vec![
+                "Pass --force to overwrite, or use `vault update` for a surgical edit".to_string(),
+            ],
         ));
     }
 

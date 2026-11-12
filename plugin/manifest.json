@@ -1,0 +1,9 @@
+{
+  "id": "vault-axi-sync",
+  "name": "Vault AXI Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.7.2",
+  "description": "Sync your vault with vault-axi's hosted cloud or S3 backend, end-to-end encrypted, on desktop and mobile.",
+  "author": "vault-axi",
+  "isDesktopOnly": false
+}

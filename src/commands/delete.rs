@@ -84,13 +84,18 @@ pub fn delete_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
         out.insert("retentionDays".to_string(), json!(7));
         out.insert(
             "restoreHint".to_string(),
-            json!(format!("Recover within 7 days via `vault restore {note_path}`")),
+            json!(format!(
+                "Recover within 7 days via `vault restore {note_path}`"
+            )),
         );
     }
     if !backlinks.is_empty() {
         out.insert(
             "warning".to_string(),
-            json!(format!("{} note(s) now have dangling links", backlinks.len())),
+            json!(format!(
+                "{} note(s) now have dangling links",
+                backlinks.len()
+            )),
         );
         out.insert("danglingIn".to_string(), json!(backlinks));
     }

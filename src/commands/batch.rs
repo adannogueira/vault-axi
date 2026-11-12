@@ -2,9 +2,7 @@ use crate::args::{flag_string, parse_args, resolve_content};
 use crate::axi::AxiError;
 use crate::commands::history::record_edit_transition;
 use crate::context::Ctx;
-use crate::markdown::frontmatter::{
-    coerce_value, set_frontmatter_field, unset_frontmatter_field,
-};
+use crate::markdown::frontmatter::{coerce_value, set_frontmatter_field, unset_frontmatter_field};
 use crate::markdown::sections::{
     append_to_doc, edit_section, insert_at_heading, prepend_to_doc, replace_anchor, HeadingAnchor,
     SectionError, SectionErrorKind, SectionMode,
@@ -122,7 +120,7 @@ pub fn batch_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
                 mode,
                 content,
             } => {
-                let Some(m) = SectionMode::from_str(mode) else {
+                let Some(m) = SectionMode::parse(mode) else {
                     return Err(AxiError::new(
                         format!("Batch op #{step}: invalid section mode '{mode}'"),
                         "VALIDATION_ERROR",

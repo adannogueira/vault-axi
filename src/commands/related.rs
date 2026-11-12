@@ -48,9 +48,9 @@ pub fn related_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
     }
 
     let mut backlinks: HashSet<String> = HashSet::new();
-    if let Ok(mut stmt) = db.prepare(
-        "SELECT DISTINCT src_path FROM links WHERE target_path = ?1 AND src_path != ?1",
-    ) {
+    if let Ok(mut stmt) =
+        db.prepare("SELECT DISTINCT src_path FROM links WHERE target_path = ?1 AND src_path != ?1")
+    {
         if let Ok(rows) = stmt.query_map(params![note_path], |r| r.get::<_, String>(0)) {
             backlinks = rows.flatten().collect();
         }
@@ -171,9 +171,11 @@ pub fn related_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
         .collect();
 
     scored.sort_by(|a, b| {
-        b.hop_rank
-            .cmp(&a.hop_rank)
-            .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
+        b.hop_rank.cmp(&a.hop_rank).then_with(|| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     });
     scored.truncate(limit);
 

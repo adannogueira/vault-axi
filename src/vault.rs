@@ -7,7 +7,14 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 fn ignored_dirs() -> HashSet<&'static str> {
-    HashSet::from([".obsidian", ".smart-env", ".trash", ".git", "node_modules", "target"])
+    HashSet::from([
+        ".obsidian",
+        ".smart-env",
+        ".trash",
+        ".git",
+        "node_modules",
+        "target",
+    ])
 }
 
 /// List all markdown files under the vault, as vault-relative POSIX paths.
@@ -48,9 +55,7 @@ pub fn list_obsidian_config_files(vault_root: &str) -> Vec<String> {
 pub fn is_image_attachment(rel_path: &str) -> bool {
     let lower = rel_path.to_ascii_lowercase();
     matches!(
-        Path::new(&lower)
-            .extension()
-            .and_then(|e| e.to_str()),
+        Path::new(&lower).extension().and_then(|e| e.to_str()),
         Some("png" | "jpg" | "jpeg" | "webp" | "bmp" | "tiff" | "tif" | "gif")
     )
 }
@@ -209,8 +214,7 @@ pub fn resolve_in_vault(vault_root: &str, rel_path: &str) -> Result<String, Stri
 pub fn normalize_note_path(rel_path: &str) -> String {
     let mut p = rel_path
         .trim()
-        .replace(std::path::MAIN_SEPARATOR, "/")
-        .replace('\\', "/");
+        .replace([std::path::MAIN_SEPARATOR, '\\'], "/");
     while let Some(stripped) = p.strip_prefix("./").or_else(|| p.strip_prefix('/')) {
         p = stripped.to_string();
     }
@@ -234,8 +238,7 @@ pub fn normalize_note_path(rel_path: &str) -> String {
 pub fn normalize_any_vault_path(rel_path: &str) -> String {
     let mut p = rel_path
         .trim()
-        .replace(std::path::MAIN_SEPARATOR, "/")
-        .replace('\\', "/");
+        .replace([std::path::MAIN_SEPARATOR, '\\'], "/");
     while let Some(stripped) = p.strip_prefix("./").or_else(|| p.strip_prefix('/')) {
         p = stripped.to_string();
     }
@@ -270,7 +273,10 @@ pub fn resolve_attachment_target(target: &str, attachments: &[String]) -> Option
         .unwrap_or("")
         .trim()
         .replace('\\', "/");
-    let clean = clean.strip_prefix("./").unwrap_or(&clean).trim_start_matches('/');
+    let clean = clean
+        .strip_prefix("./")
+        .unwrap_or(&clean)
+        .trim_start_matches('/');
     if clean.is_empty() {
         return None;
     }

@@ -2,9 +2,7 @@ use crate::args::{flag_bool, flag_string, parse_args};
 use crate::axi::AxiError;
 use crate::commands::history::record_note_version;
 use crate::context::Ctx;
-use crate::crypto::{
-    decode_binary_payload, decrypt_at_rest, encode_binary_payload, encrypt_at_rest,
-};
+use crate::crypto::{crypto_error, keychain, LOCAL_CONTEXT};
 use crate::vault::{file_stat, normalize_any_vault_path, normalize_note_path, resolve_in_vault};
 use chrono::{TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -12,6 +10,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use vault_axi_core::payload::{decode_binary, encode_binary};
 
 pub const TRASH_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -54,10 +53,10 @@ pub fn move_file_to_trash(db: &Connection, rel_path: &str, abs_path: &Path) -> O
             }
             (text, 0i64)
         }
-        Err(_) => (encode_binary_payload(&bytes), 1i64),
+        Err(_) => (encode_binary(&bytes), 1i64),
     };
 
-    let enc = encrypt_at_rest(&raw_payload);
+    let enc = keychain().encrypt(&raw_payload, LOCAL_CONTEXT);
     let _ = db.execute(
         "INSERT INTO trash(path, content, is_binary, mtime_ms, deleted_at, expires_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -76,12 +75,16 @@ pub fn move_file_to_trash(db: &Connection, rel_path: &str, abs_path: &Path) -> O
 pub fn store_text_in_trash(db: &Connection, rel_path: &str, content: &str, deleted_at_ms: i64) {
     purge_expired_trash(db);
     let now = now_ms();
-    let del_ts = if deleted_at_ms > 0 { deleted_at_ms } else { now };
+    let del_ts = if deleted_at_ms > 0 {
+        deleted_at_ms
+    } else {
+        now
+    };
     let expires_at = del_ts + TRASH_RETENTION_MS;
     if expires_at <= now {
         return;
     }
-    let enc = encrypt_at_rest(content);
+    let enc = keychain().encrypt(content, LOCAL_CONTEXT);
     let _ = db.execute(
         "INSERT INTO trash(path, content, is_binary, mtime_ms, deleted_at, expires_at)
          VALUES (?1, ?2, 0, ?3, ?4, ?5)
@@ -228,16 +231,16 @@ pub fn restore_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
         ));
     }
 
-    let decrypted =
-        decrypt_at_rest(&enc_content).map_err(|e| AxiError::new(e, "CRYPTO_ERROR", vec![]))?;
+    let decrypted = keychain()
+        .decrypt(&enc_content, LOCAL_CONTEXT)
+        .map_err(crypto_error)?;
 
     if let Some(parent) = dest_p.parent() {
         let _ = fs::create_dir_all(parent);
     }
 
     if is_bin != 0 {
-        let bytes =
-            decode_binary_payload(&decrypted).unwrap_or_else(|| decrypted.clone().into_bytes());
+        let bytes = decode_binary(&decrypted).unwrap_or_else(|| decrypted.clone().into_bytes());
         fs::write(dest_p, &bytes).map_err(|e| {
             AxiError::new(
                 format!("Failed to restore binary attachment {dest_rel}: {e}"),

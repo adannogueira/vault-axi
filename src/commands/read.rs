@@ -143,7 +143,9 @@ pub fn read_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
                 return Err(AxiError::new(
                     e.message,
                     code,
-                    vec![format!("Run `vault read {note_path} --outline` to see headings")],
+                    vec![format!(
+                        "Run `vault read {note_path} --outline` to see headings"
+                    )],
                 ));
             }
         }
@@ -168,7 +170,9 @@ pub fn read_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
     if t.truncated {
         obj.insert(
             "hint".to_string(),
-            json!("Use --outline for structure, --section <h> for one part, or --full for everything"),
+            json!(
+                "Use --outline for structure, --section <h> for one part, or --full for everything"
+            ),
         );
     }
     Ok(Value::Object(obj))

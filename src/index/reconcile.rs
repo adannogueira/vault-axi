@@ -354,7 +354,7 @@ pub fn reconcile(db: &mut Connection, vault_root: &str, opts: ReconcileOpts) -> 
                         result.embedded += chunk.len();
                     } else {
                         for (id, text) in chunk {
-                            if let Some(one) = embed(&[text.clone()]) {
+                            if let Some(one) = embed(std::slice::from_ref(text)) {
                                 if let Some(vec) = one.first() {
                                     let blob = to_blob(vec);
                                     let text_hash = sha1_hex(text);
@@ -387,15 +387,20 @@ pub fn reconcile(db: &mut Connection, vault_root: &str, opts: ReconcileOpts) -> 
     // If any files were added or removed, re-resolve previously dangling links across the vault
     if result.indexed > 0 || result.removed > 0 {
         let mut danglers: Vec<(i64, String)> = Vec::new();
-        if let Ok(mut stmt) = db.prepare("SELECT rowid, target_raw FROM links WHERE target_path IS NULL") {
-            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) {
+        if let Ok(mut stmt) =
+            db.prepare("SELECT rowid, target_raw FROM links WHERE target_path IS NULL")
+        {
+            if let Ok(rows) =
+                stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            {
                 danglers = rows.flatten().collect();
             }
         }
         for (rowid, raw_target) in danglers {
             let parsed_links = parse_wiki_links(&format!("[[{raw_target}]]"));
             if let Some(first) = parsed_links.first() {
-                if let Some(resolved) = resolve_link_target(&first.target, &paths, &basename_index) {
+                if let Some(resolved) = resolve_link_target(&first.target, &paths, &basename_index)
+                {
                     let _ = db.execute(
                         "UPDATE links SET target_path = ?1 WHERE rowid = ?2",
                         params![resolved, rowid],
@@ -447,10 +452,7 @@ mod tests {
         std::env::set_var("VAULT_AXI_NO_EMBED", "1");
         std::env::set_var("VAULT_AXI_NO_SYNC", "1");
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "vault-axi-{tag}-{}-{id}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("vault-axi-{tag}-{}-{id}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let db = open_db_at(":memory:").unwrap();
@@ -503,11 +505,8 @@ mod tests {
         assert!(raw_after_log.contains("**[DECISION]** Chose bundled SQLite FTS5 architecture"));
 
         // 3. Toggle checklist item via `vault check`
-        let chk_res = check_command(
-            &svec(&["plans/task-1.md", "Ship single binary"]),
-            &mut ctx,
-        )
-        .unwrap();
+        let chk_res =
+            check_command(&svec(&["plans/task-1.md", "Ship single binary"]), &mut ctx).unwrap();
         assert_eq!(chk_res["checked"], true);
         let raw_after_check = fs::read_to_string(dir.join("plans").join("task-1.md")).unwrap();
         assert!(raw_after_check.contains("- [x] Ship single binary"));
@@ -517,26 +516,15 @@ mod tests {
             {"op":"section","heading":"Overview","mode":"append","content":"Added detail linking to [[second-note]]."},
             {"op":"frontmatter","key":"owner","value":"adan"}
         ]"#;
-        let b_res = batch_command(
-            &svec(&["plans/task-1.md", "--ops", ops_json]),
-            &mut ctx,
-        )
-        .unwrap();
+        let b_res =
+            batch_command(&svec(&["plans/task-1.md", "--ops", ops_json]), &mut ctx).unwrap();
         assert_eq!(b_res["changed"], true);
 
         // 5. Metadata filters on `vault ls` and `vault search`
-        let ls_res = ls_command(
-            &svec(&["--status", "active", "--tag", "rust"]),
-            &mut ctx,
-        )
-        .unwrap();
+        let ls_res = ls_command(&svec(&["--status", "active", "--tag", "rust"]), &mut ctx).unwrap();
         assert_eq!(ls_res["total"], 1);
 
-        let srch_res = search_command(
-            &svec(&["SQLite", "--status", "active"]),
-            &mut ctx,
-        )
-        .unwrap();
+        let srch_res = search_command(&svec(&["SQLite", "--status", "active"]), &mut ctx).unwrap();
         assert_eq!(srch_res["shown"], 1);
 
         // 6. `vault doctor` catches the 2 dangling links to `[[second-note]]`
@@ -748,8 +736,11 @@ mod tests {
         let s_long = read_command(&svec(&["doc.md", "--section", "LongSec"]), &mut ctx).unwrap();
         assert_eq!(s_long["truncated"], true);
         assert!(s_long.get("hint").is_some());
-        let s_long_full =
-            read_command(&svec(&["doc.md", "--section", "LongSec", "--full"]), &mut ctx).unwrap();
+        let s_long_full = read_command(
+            &svec(&["doc.md", "--section", "LongSec", "--full"]),
+            &mut ctx,
+        )
+        .unwrap();
         assert_eq!(s_long_full["truncated"], false);
 
         assert_eq!(
@@ -775,7 +766,11 @@ mod tests {
         // write edge cases
         assert!(write_command(&[], &mut ctx).is_err());
         assert!(write_command(&svec(&["a.md"]), &mut ctx).is_err());
-        assert!(write_command(&svec(&["a.md", "--frontmatter", "=bad", "--content", "x"]), &mut ctx).is_err());
+        assert!(write_command(
+            &svec(&["a.md", "--frontmatter", "=bad", "--content", "x"]),
+            &mut ctx
+        )
+        .is_err());
 
         // write with --title only, and --title when content already starts with `# `
         write_command(&svec(&["title-only.md", "--title", "Only Title"]), &mut ctx).unwrap();
@@ -785,7 +780,13 @@ mod tests {
         );
 
         write_command(
-            &svec(&["has-h1.md", "--title", "Other", "--content", "# Existing H1\nBody"]),
+            &svec(&[
+                "has-h1.md",
+                "--title",
+                "Other",
+                "--content",
+                "# Existing H1\nBody",
+            ]),
             &mut ctx,
         )
         .unwrap();
@@ -795,7 +796,12 @@ mod tests {
         // overwrite without --force fails; with --force succeeds
         assert!(write_command(&svec(&["has-h1.md", "--content", "new"]), &mut ctx).is_err());
         let ow = write_command(
-            &svec(&["has-h1.md", "--content", "# Doc\n\n## Sec\nBody\n", "--force"]),
+            &svec(&[
+                "has-h1.md",
+                "--content",
+                "# Doc\n\n## Sec\nBody\n",
+                "--force",
+            ]),
             &mut ctx,
         )
         .unwrap();
@@ -811,7 +817,15 @@ mod tests {
         );
         assert!(update_command(&svec(&["has-h1.md"]), &mut ctx).is_err());
         assert!(update_command(
-            &svec(&["has-h1.md", "--section", "Sec", "--mode", "bad", "--content", "x"]),
+            &svec(&[
+                "has-h1.md",
+                "--section",
+                "Sec",
+                "--mode",
+                "bad",
+                "--content",
+                "x"
+            ]),
             &mut ctx
         )
         .is_err());
@@ -820,7 +834,15 @@ mod tests {
 
         // update no-op returns changed: false
         let u_noop = update_command(
-            &svec(&["has-h1.md", "--section", "Sec", "--mode", "replace", "--content", "Body"]),
+            &svec(&[
+                "has-h1.md",
+                "--section",
+                "Sec",
+                "--mode",
+                "replace",
+                "--content",
+                "Body",
+            ]),
             &mut ctx,
         )
         .unwrap();
@@ -828,7 +850,15 @@ mod tests {
 
         // update prepend, anchor, and frontmatter set/unset
         let u_prep = update_command(
-            &svec(&["has-h1.md", "--section", "Sec", "--mode", "prepend", "--content", "Prepended"]),
+            &svec(&[
+                "has-h1.md",
+                "--section",
+                "Sec",
+                "--mode",
+                "prepend",
+                "--content",
+                "Prepended",
+            ]),
             &mut ctx,
         )
         .unwrap();
@@ -842,7 +872,13 @@ mod tests {
         assert_eq!(u_anc["changed"], true);
 
         update_command(
-            &svec(&["has-h1.md", "--frontmatter", "status=active", "--frontmatter", "temp=1"]),
+            &svec(&[
+                "has-h1.md",
+                "--frontmatter",
+                "status=active",
+                "--frontmatter",
+                "temp=1",
+            ]),
             &mut ctx,
         )
         .unwrap();
@@ -862,12 +898,24 @@ mod tests {
         assert_eq!(ins_empty["changed"], false);
 
         insert_command(
-            &svec(&["has-h1.md", "--before-heading", "Sec", "--content", "## BeforeSec\nB"]),
+            &svec(&[
+                "has-h1.md",
+                "--before-heading",
+                "Sec",
+                "--content",
+                "## BeforeSec\nB",
+            ]),
             &mut ctx,
         )
         .unwrap();
         insert_command(
-            &svec(&["has-h1.md", "--after-heading", "Sec", "--content", "AfterLine"]),
+            &svec(&[
+                "has-h1.md",
+                "--after-heading",
+                "Sec",
+                "--content",
+                "AfterLine",
+            ]),
             &mut ctx,
         )
         .unwrap();
@@ -933,16 +981,12 @@ mod tests {
 
         // Ambiguous match without --all fails; with --all checks both
         assert!(check_command(&svec(&["tasks.md", "Task alpha"]), &mut ctx).is_err());
-        let all_res =
-            check_command(&svec(&["tasks.md", "Task alpha", "--all"]), &mut ctx).unwrap();
+        let all_res = check_command(&svec(&["tasks.md", "Task alpha", "--all"]), &mut ctx).unwrap();
         assert_eq!(all_res["items"].as_array().unwrap().len(), 2);
 
         // Uncheck item
-        let unchk = check_command(
-            &svec(&["tasks.md", "Done item", "--uncheck"]),
-            &mut ctx,
-        )
-        .unwrap();
+        let unchk =
+            check_command(&svec(&["tasks.md", "Done item", "--uncheck"]), &mut ctx).unwrap();
         assert_eq!(unchk["checked"], false);
         assert_eq!(unchk["changed"], true);
 
@@ -963,7 +1007,10 @@ mod tests {
         assert!(parse_since_ms("-1w").is_none());
         assert!(parse_since_ms("999999999999999999d").is_none());
         assert!(parse_since_ms("not-a-date").is_none());
-        assert_eq!(normalize_dir_filter("./plans\\sub/"), Some("plans/sub".to_string()));
+        assert_eq!(
+            normalize_dir_filter("./plans\\sub/"),
+            Some("plans/sub".to_string())
+        );
         assert_eq!(normalize_dir_filter("/"), None);
 
         // Create notes in `plans_v1` and `plansXv1` to verify SQL LIKE `_` wildcard is not triggered
@@ -1076,11 +1123,16 @@ mod tests {
         assert_eq!(beta_rel2["via"], "link");
 
         // related --limit 1
-        let rel_lim = related_command(&svec(&["plans_v1/alpha.md", "--limit", "1"]), &mut ctx).unwrap();
+        let rel_lim =
+            related_command(&svec(&["plans_v1/alpha.md", "--limit", "1"]), &mut ctx).unwrap();
         assert_eq!(rel_lim["shown"], 1);
 
         // context command: test --limit 1 and --full
-        let ctx_lim = context_command(&svec(&["plans_v1/alpha.md", "--limit", "1", "--full"]), &mut ctx).unwrap();
+        let ctx_lim = context_command(
+            &svec(&["plans_v1/alpha.md", "--limit", "1", "--full"]),
+            &mut ctx,
+        )
+        .unwrap();
         assert_eq!(ctx_lim["connectedCount"], 1);
 
         // doctor command: test healthy=false when only dangling (no orphans) vs only orphan (no dangling)
@@ -1098,7 +1150,13 @@ mod tests {
         .unwrap();
         // Fix the dangling link by creating missing.md linking to beta
         write_command(
-            &svec(&["missing.md", "--frontmatter", "status=ok", "--content", "Links to [[beta]].\n"]),
+            &svec(&[
+                "missing.md",
+                "--frontmatter",
+                "status=ok",
+                "--content",
+                "Links to [[beta]].\n",
+            ]),
             &mut ctx,
         )
         .unwrap();
@@ -1145,11 +1203,13 @@ mod tests {
         let p_221 = srch_221["results"][0]["preview"].as_str().unwrap();
         assert!(p_221.ends_with('…'));
 
-        let srch_221_full = search_command(&svec(&["qqqqqq", "--mode", "fts", "--full"]), &mut ctx).unwrap();
+        let srch_221_full =
+            search_command(&svec(&["qqqqqq", "--mode", "fts", "--full"]), &mut ctx).unwrap();
         let p_221_full = srch_221_full["results"][0]["preview"].as_str().unwrap();
         assert!(!p_221_full.ends_with('…'));
 
-        let srch_lim1 = search_command(&svec(&["plansXv1 OR beta", "--limit", "1"]), &mut ctx).unwrap();
+        let srch_lim1 =
+            search_command(&svec(&["plansXv1 OR beta", "--limit", "1"]), &mut ctx).unwrap();
         assert_eq!(srch_lim1["shown"], 1);
 
         // search validation errors
@@ -1180,7 +1240,10 @@ mod tests {
             &mut ctx,
         )
         .unwrap();
-        assert!(mcp_r["content"].as_str().unwrap().contains("--force is a flag"));
+        assert!(mcp_r["content"]
+            .as_str()
+            .unwrap()
+            .contains("--force is a flag"));
 
         // sync/register/login validation errors when unconfigured
         assert!(register_command(&[], &mut ctx).is_err());
@@ -1196,7 +1259,7 @@ mod tests {
         let vault_dir = home_dir.join("my-vault");
         let _ = fs::remove_dir_all(&home_dir);
         fs::create_dir_all(&home_dir).unwrap();
-        std::env::set_var("VAULT_AXI_HOME", &home_dir);
+        let _home = crate::test_support::HomeGuard::new(&home_dir);
 
         let mut ctx = Ctx::with_vault(vault_dir.to_string_lossy().to_string());
 
@@ -1231,7 +1294,12 @@ mod tests {
 
         // Git remote setup
         let s_git = setup_command(
-            &svec(&["--remote", "git:https://github.com/example/vault.git", "--branch", "main"]),
+            &svec(&[
+                "--remote",
+                "git:https://github.com/example/vault.git",
+                "--branch",
+                "main",
+            ]),
             &mut ctx,
         )
         .unwrap();
@@ -1248,11 +1316,22 @@ mod tests {
         // matches_metadata_filter direct unit coverage
         assert!(matches_metadata_filter(None, 100, None, None, Some(100)));
         assert!(!matches_metadata_filter(None, 99, None, None, Some(100)));
-        assert!(!matches_metadata_filter(None, 100, Some("active"), None, None));
-        assert!(!matches_metadata_filter(Some("not-json"), 100, Some("active"), None, None));
+        assert!(!matches_metadata_filter(
+            None,
+            100,
+            Some("active"),
+            None,
+            None
+        ));
+        assert!(!matches_metadata_filter(
+            Some("not-json"),
+            100,
+            Some("active"),
+            None,
+            None
+        ));
 
         let _ = fs::remove_dir_all(&home_dir);
-        std::env::remove_var("VAULT_AXI_HOME");
     }
     #[test]
     fn reconcile_indexes_resolves_links_and_prunes() {
@@ -1375,18 +1454,14 @@ mod tests {
         .unwrap();
 
         // 2. Tag filtering matches both `--tag work` and `--tag "#work"`
-        let ls_plain = crate::commands::ls::ls_command(
-            &["--tag".to_string(), "work".to_string()],
-            &mut ctx,
-        )
-        .unwrap();
+        let ls_plain =
+            crate::commands::ls::ls_command(&["--tag".to_string(), "work".to_string()], &mut ctx)
+                .unwrap();
         assert_eq!(ls_plain["total"], 1);
 
-        let ls_hash = crate::commands::ls::ls_command(
-            &["--tag".to_string(), "#work".to_string()],
-            &mut ctx,
-        )
-        .unwrap();
+        let ls_hash =
+            crate::commands::ls::ls_command(&["--tag".to_string(), "#work".to_string()], &mut ctx)
+                .unwrap();
         assert_eq!(ls_hash["total"], 1);
 
         // 3. UTF-8 BOM in `--from ops.json` for `vault batch` + section with `/`
@@ -1475,6 +1550,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        let _home = crate::test_support::HomeGuard::new(&dir.join(".home"));
         let vault_str = dir.to_string_lossy().to_string();
         let db = open_db_at(":memory:").unwrap();
         let mut ctx = Ctx::with_vault_and_db(&vault_str, db);
@@ -1561,7 +1637,10 @@ mod tests {
             &mut ctx,
         )
         .unwrap();
-        assert!(srch_old["results"].as_str().unwrap().starts_with("0 matches"));
+        assert!(srch_old["results"]
+            .as_str()
+            .unwrap()
+            .starts_with("0 matches"));
 
         let srch_curr = crate::commands::search::search_command(
             &[
@@ -1642,11 +1721,9 @@ mod tests {
         assert_eq!(att_res["ocrExtracted"], true);
         let _ = fs::remove_file(&ext_img);
 
-        let att_list = crate::commands::attach::attachments_command(
-            &["specs/auth.md".to_string()],
-            &mut ctx,
-        )
-        .unwrap();
+        let att_list =
+            crate::commands::attach::attachments_command(&["specs/auth.md".to_string()], &mut ctx)
+                .unwrap();
         assert_eq!(att_list["count"], 1);
 
         // Search finds `specs/auth.md` via the OCR text inside `assets/temp_whiteboard.png`!
@@ -1686,7 +1763,10 @@ mod tests {
             &mut ctx,
         )
         .unwrap();
-        assert!(srch_obs["results"].as_str().unwrap().starts_with("0 matches"));
+        assert!(srch_obs["results"]
+            .as_str()
+            .unwrap()
+            .starts_with("0 matches"));
 
         let _ = fs::remove_dir_all(&dir);
     }

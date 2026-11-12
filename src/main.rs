@@ -10,6 +10,8 @@ pub mod markdown;
 pub mod ocr;
 pub mod render;
 pub mod sync;
+#[cfg(test)]
+mod test_support;
 pub mod updater;
 pub mod vault;
 

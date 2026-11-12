@@ -211,8 +211,14 @@ mod tests {
             "--force",
         ]);
         assert_eq!(parsed.positionals, vec!["notes/a.md"]);
-        assert_eq!(flag_string(&parsed.flags, "section").as_deref(), Some("Design"));
-        assert_eq!(flag_string(&parsed.flags, "mode").as_deref(), Some("replace"));
+        assert_eq!(
+            flag_string(&parsed.flags, "section").as_deref(),
+            Some("Design")
+        );
+        assert_eq!(
+            flag_string(&parsed.flags, "mode").as_deref(),
+            Some("replace")
+        );
         assert!(flag_bool(&parsed.flags, "force"));
     }
 

@@ -99,8 +99,7 @@ pub fn search_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
         }
     }
 
-    let has_meta_filter =
-        status_filter.is_some() || tag_filter.is_some() || since_ms.is_some();
+    let has_meta_filter = status_filter.is_some() || tag_filter.is_some() || since_ms.is_some();
 
     let mut results: Vec<Value> = Vec::new();
     for id in ordered_ids {

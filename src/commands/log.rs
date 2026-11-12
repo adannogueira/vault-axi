@@ -35,9 +35,9 @@ pub fn log_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
         return Err(AxiError::new(
             "Missing build log entry message",
             "VALIDATION_ERROR",
-            vec![
-                format!("Usage: vault log {note_path} \"<entry>\" [--kind <label>]"),
-            ],
+            vec![format!(
+                "Usage: vault log {note_path} \"<entry>\" [--kind <label>]"
+            )],
         ));
     };
 
@@ -45,7 +45,9 @@ pub fn log_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
         return Err(AxiError::new(
             "Build log entry message must not be empty",
             "VALIDATION_ERROR",
-            vec![format!("Usage: vault log {note_path} \"<entry>\" [--kind <label>]")],
+            vec![format!(
+                "Usage: vault log {note_path} \"<entry>\" [--kind <label>]"
+            )],
         ));
     }
 

@@ -11,7 +11,8 @@ pub fn reindex_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
     let with_embeddings = !flag_bool(&parsed.flags, "no-embed");
     let db = ctx.db()?;
     if force {
-        let _ = db.execute_batch("DELETE FROM embedding_cache; UPDATE blocks SET embedding = NULL;");
+        let _ =
+            db.execute_batch("DELETE FROM embedding_cache; UPDATE blocks SET embedding = NULL;");
     }
     let res = reconcile(
         db,

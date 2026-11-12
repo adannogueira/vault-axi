@@ -27,9 +27,9 @@ pub fn doctor_command(_args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
     if let Ok(mut stmt) = db.prepare(
         "SELECT src_path, target_raw FROM links WHERE target_path IS NULL ORDER BY src_path",
     ) {
-        if let Ok(rows) = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        }) {
+        if let Ok(rows) =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
             for (src, raw_target) in rows.flatten() {
                 if resolve_attachment_target(&raw_target, &attachments).is_some() {
                     continue;
@@ -78,6 +78,10 @@ pub fn doctor_command(_args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
         "orphanCount": orphans.len(),
         "orphanNotes": orphans,
         "missingFrontmatterCount": missing_frontmatter.len(),
-        "missingFrontmatter": missing_frontmatter
+        "missingFrontmatter": missing_frontmatter,
+        "encryption": crate::crypto::encryption_status(
+            &crate::config::load_config(),
+            &crate::crypto::KeyCache::default()
+        )
     }))
 }
