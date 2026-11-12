@@ -9,8 +9,10 @@ mod keychain;
 pub mod keyring;
 pub mod v1;
 pub mod v2;
+mod vault_key;
 
 pub use keychain::Keychain;
+pub use vault_key::{resolve_vault_key, VaultKeyError, VaultKeyStep};
 
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::OsRng;

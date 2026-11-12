@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use vault_axi_core::crypto::keyring::{KdfParams, Keyring};
-use vault_axi_core::crypto::{v1, CryptoError, DataKey, Key, Keychain};
+use vault_axi_core::crypto::{
+    resolve_vault_key, v1, CryptoError, DataKey, Key, Keychain, VaultKeyError, VaultKeyStep,
+};
 use vault_axi_core::hash::sha256_hex;
 
 /// Associated-data context for rows in the local SQLite database. Local rows are not bound to
@@ -231,6 +233,27 @@ pub fn invalid_keyring_error(detail: &str) -> AxiError {
     )
 }
 
+fn vault_key_error(e: VaultKeyError) -> AxiError {
+    match e {
+        VaultKeyError::Mismatch => mismatch_error(),
+        VaultKeyError::PassphraseRequired => AxiError::new(
+            "This vault is end-to-end encrypted with a passphrase",
+            "ENCRYPTION_KEY_REQUIRED",
+            vec![
+                "Set it on this device: `vault setup --encryption-key <passphrase>` or VAULT_ENCRYPTION_KEY".to_string(),
+            ],
+        ),
+        VaultKeyError::KeyringLost => AxiError::new(
+            "This device holds a vault key but the remote has no keyring",
+            "ENCRYPTION_KEY_REQUIRED",
+            vec![
+                "Set the passphrase so the keyring can be restored: `vault setup --encryption-key <passphrase>`".to_string(),
+            ],
+        ),
+        VaultKeyError::Crypto(e) => crypto_error(e),
+    }
+}
+
 fn mismatch_error() -> AxiError {
     AxiError::new(
         "The encryption passphrase does not unlock this vault's keyring",
@@ -257,60 +280,37 @@ pub fn prepare_sync_keychain(
         return Ok(keychain_for(cfg, cache));
     };
     let passphrase = configured_passphrase(cfg);
-    let cached = cache.get(&scope);
+    let decide = |remote: Option<&Keyring>| {
+        resolve_vault_key(
+            remote,
+            passphrase.as_deref(),
+            cache.get(&scope),
+            &now_rfc3339(),
+            KdfParams::recommended(),
+        )
+        .map_err(vault_key_error)
+    };
     let remote = store.fetch_keyring()?.map(|s| s.keyring);
-
-    let data_key = match (remote, passphrase) {
-        (Some(kr), _) if cached.as_ref().is_some_and(|c| c.id() == kr.key_id) => cached,
-        (Some(kr), Some(pass)) => Some(kr.unlock(&pass).map_err(|e| match e {
-            CryptoError::WrongKey => mismatch_error(),
-            other => crypto_error(other),
-        })?),
-        (Some(_), None) => {
-            return Err(AxiError::new(
-                "This vault is end-to-end encrypted with a passphrase",
-                "ENCRYPTION_KEY_REQUIRED",
-                vec![
-                    "Set it on this device: `vault setup --encryption-key <passphrase>` or VAULT_ENCRYPTION_KEY".to_string(),
-                ],
-            ));
-        }
-        (None, Some(pass)) => {
-            // Re-wrap a cached key if the remote lost its keyring, so data this device already
-            // encrypted stays readable; otherwise start a fresh vault key.
-            let (keyring, dk) = match cached {
-                Some(dk) => (
-                    Keyring::create_for(&dk, &pass, KdfParams::recommended(), &now_rfc3339())
-                        .map_err(crypto_error)?,
-                    dk,
-                ),
-                None => Keyring::create(&pass, KdfParams::recommended(), &now_rfc3339())
-                    .map_err(crypto_error)?,
-            };
+    let data_key = match decide(remote.as_ref())? {
+        VaultKeyStep::Use(dk) => Some(dk),
+        VaultKeyStep::LegacyOnly => None,
+        VaultKeyStep::Create { keyring, data_key } => {
             if store.create_keyring(&keyring)? {
-                Some(dk)
+                Some(data_key)
             } else {
-                let winner = store.fetch_keyring()?.map(|s| s.keyring).ok_or_else(|| {
-                    AxiError::new(
-                        "Keyring creation conflicted but no keyring was found",
-                        "SYNC_ERROR",
-                        vec!["Retry `vault sync`".to_string()],
-                    )
-                })?;
-                Some(winner.unlock(&pass).map_err(|_| mismatch_error())?)
+                // Another device created the keyring first: adopt it.
+                let winner = store.fetch_keyring()?.map(|s| s.keyring);
+                match decide(winner.as_ref())? {
+                    VaultKeyStep::Use(dk) => Some(dk),
+                    _ => {
+                        return Err(AxiError::new(
+                            "Keyring creation conflicted but no keyring was found",
+                            "SYNC_ERROR",
+                            vec!["Retry `vault sync`".to_string()],
+                        ))
+                    }
+                }
             }
-        }
-        (None, None) => {
-            if cached.is_some() {
-                return Err(AxiError::new(
-                    "This device holds a vault key but the remote has no keyring",
-                    "ENCRYPTION_KEY_REQUIRED",
-                    vec![
-                        "Set the passphrase so the keyring can be restored: `vault setup --encryption-key <passphrase>`".to_string(),
-                    ],
-                ));
-            }
-            None
         }
     };
 
