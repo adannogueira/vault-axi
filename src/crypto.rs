@@ -391,3 +391,35 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod v1_fixtures {
+    use super::*;
+
+    #[test]
+    fn frozen_v1_payloads_still_decrypt() {
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../crates/core/tests/fixtures/crypto-v1.json"))
+                .unwrap();
+        for case in doc["cases"].as_array().unwrap() {
+            let key = &case["key"];
+            let key_bytes = match key["kind"].as_str().unwrap() {
+                "pbkdf2" => derive_key_bytes(key["input"].as_str().unwrap()),
+                "raw" => B64
+                    .decode(key["b64"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                other => panic!("unknown key kind {other}"),
+            };
+            let plain = decrypt_with_key(case["ciphertext"].as_str().unwrap(), &key_bytes)
+                .unwrap_or_else(|e| panic!("{}: {e}", case["name"]));
+            assert_eq!(
+                plain,
+                case["plaintext"].as_str().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+}
