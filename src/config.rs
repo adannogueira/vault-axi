@@ -4,6 +4,16 @@ use std::path::PathBuf;
 
 /// Official hosted `vault-axi` cloud endpoint (Supabase project in sa-east-1).
 pub const HOSTED_SUPABASE_URL: &str = "https://mlmmzutdfnahbdquslzf.supabase.co";
+
+/// The hosted-cloud endpoint: `VAULT_AXI_CLOUD_URL` (a self-hosted Supabase project, or a test
+/// server), else the official one.
+pub fn hosted_url() -> String {
+    std::env::var("VAULT_AXI_CLOUD_URL")
+        .ok()
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| HOSTED_SUPABASE_URL.to_string())
+}
 /// Public publishable / anon key for `vault-axi` hosted cloud (all rows protected by RLS `auth.uid() = user_id`).
 pub const HOSTED_SUPABASE_ANON_KEY: &str =
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1sbW16dXRkZm5haGJkcXVzbHpmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTM0NTcyNTUsImV4cCI6MjEwOTAzMzI1NX0.5ac5z0VZi1ZWTG9eyd8CtMVawP1mlL4Sxf7cRKTSSNc";

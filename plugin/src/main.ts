@@ -17,6 +17,8 @@ const EDIT_DEBOUNCE_MS = 3_000;
 const OWN_WRITE_WINDOW_MS = 5_000;
 const RESUME_MIN_GAP_MS = 30_000;
 
+type SyncReason = "manual" | "startup" | "edit" | "resume" | "interval" | "settings";
+
 type Status = { kind: "idle" } | { kind: "syncing"; detail: string } | { kind: "ok"; at: number } | { kind: "error"; message: string };
 
 function errorMessage(e: unknown): string {
@@ -114,13 +116,17 @@ export default class VaultAxiSyncPlugin extends Plugin {
   }
 
   /** Debounced, single-flight sync. Automatic triggers respect the auto-sync setting. */
-  requestSync(reason: "manual" | "startup" | "edit" | "resume" | "interval" | "settings", delayMs: number): void {
+  requestSync(reason: SyncReason, delayMs: number): void {
     if (reason !== "manual" && !this.settings.autoSync) return;
     if (this.timer !== null) window.clearTimeout(this.timer);
     this.timer = window.setTimeout(() => {
       this.timer = null;
-      void this.runSync(reason === "manual");
+      void this.runSync(reason);
     }, delayMs);
+  }
+
+  isSyncing(): boolean {
+    return this.running;
   }
 
   /** Identity of the configured remote; keys and sync state are kept per scope. */
@@ -152,9 +158,11 @@ export default class VaultAxiSyncPlugin extends Plugin {
       : null;
   }
 
-  private async runSync(manual: boolean): Promise<void> {
+  private async runSync(reason: SyncReason): Promise<void> {
+    const manual = reason === "manual";
     if (this.running) {
-      this.pending = true;
+      // Only changes made during a run need another one; periodic triggers are redundant.
+      if (reason === "edit" || manual) this.pending = true;
       return;
     }
     const remote = this.remote();

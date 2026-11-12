@@ -3,14 +3,14 @@
 
 use crate::axi::AxiError;
 use crate::config::{
-    env_api_key, load_config, save_config, RemoteBackendConfig, HOSTED_SUPABASE_ANON_KEY,
-    HOSTED_SUPABASE_URL,
+    env_api_key, hosted_url, load_config, save_config, RemoteBackendConfig,
+    HOSTED_SUPABASE_ANON_KEY,
 };
 use serde_json::{json, Value};
 use std::fs;
 
 pub(super) fn try_refresh_hosted_token(refresh_token: &str) -> Option<(String, String)> {
-    let url = format!("{HOSTED_SUPABASE_URL}/auth/v1/token?grant_type=refresh_token");
+    let url = format!("{}/auth/v1/token?grant_type=refresh_token", hosted_url());
     let payload = json!({ "refresh_token": refresh_token });
     let resp = ureq::post(&url)
         .set("apikey", HOSTED_SUPABASE_ANON_KEY)
@@ -54,7 +54,7 @@ pub(super) fn exchange_api_key(
     ),
     String,
 > {
-    let url = format!("{HOSTED_SUPABASE_URL}/functions/v1/token-exchange");
+    let url = format!("{}/functions/v1/token-exchange", hosted_url());
     let payload = json!({
         "action": "exchange",
         "api_key": api_key.trim()
@@ -336,7 +336,7 @@ pub fn register_hosted(
     password: &str,
     vault_id: Option<&str>,
 ) -> Result<Value, AxiError> {
-    let clean_url = HOSTED_SUPABASE_URL;
+    let clean_url = &hosted_url();
     let anon_key = HOSTED_SUPABASE_ANON_KEY;
 
     let edge_register_url = format!("{clean_url}/functions/v1/register");
@@ -498,7 +498,7 @@ pub fn login_hosted(
     token: Option<&str>,
     vault_id: Option<&str>,
 ) -> Result<Value, AxiError> {
-    let clean_url = HOSTED_SUPABASE_URL;
+    let clean_url = &hosted_url();
     let anon_key = HOSTED_SUPABASE_ANON_KEY;
 
     let mut final_token = token.map(|s| s.to_string()).or_else(env_api_key);
@@ -643,7 +643,7 @@ pub fn manage_api_tokens(
         }
     }
 
-    let url = format!("{HOSTED_SUPABASE_URL}/functions/v1/token-exchange");
+    let url = format!("{}/functions/v1/token-exchange", hosted_url());
     let effective_vault_id = vault_id
         .map(|s| s.to_string())
         .or(cfg_vault_id)
@@ -807,7 +807,7 @@ pub fn handle_mfa(action: &str, code: Option<&str>) -> Result<Value, AxiError> {
         ));
     };
 
-    let clean_url = HOSTED_SUPABASE_URL;
+    let clean_url = &hosted_url();
     let anon_key = HOSTED_SUPABASE_ANON_KEY;
     match action {
         "enroll" => {

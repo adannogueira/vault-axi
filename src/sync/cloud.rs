@@ -6,7 +6,7 @@ use super::engine::{Fetched, Put, PutOutcome, Remote};
 use super::now_ms;
 use crate::axi::AxiError;
 use crate::config::{
-    env_api_key, RemoteBackendConfig, VaultConfig, HOSTED_SUPABASE_ANON_KEY, HOSTED_SUPABASE_URL,
+    env_api_key, hosted_url, RemoteBackendConfig, VaultConfig, HOSTED_SUPABASE_ANON_KEY,
 };
 use crate::crypto::{invalid_keyring_error, KeyringStore, StoredKeyring};
 use serde::Deserialize;
@@ -181,7 +181,7 @@ impl CloudRemote {
     }
 
     fn table_url(&self) -> String {
-        format!("{HOSTED_SUPABASE_URL}/rest/v1/vault_notes")
+        format!("{}/rest/v1/vault_notes", hosted_url())
     }
 
     fn row_url(&self, path: &str) -> String {
