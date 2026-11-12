@@ -14,21 +14,30 @@ pub fn parse_since_ms(since_str: &str) -> Option<i64> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    if let Some(days) = trimmed.strip_suffix('d').and_then(|s| s.parse::<i64>().ok()) {
+    if let Some(days) = trimmed
+        .strip_suffix('d')
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         if days < 0 {
             return None;
         }
         let delta = days.checked_mul(86_400_000)?;
         return now_ms.checked_sub(delta);
     }
-    if let Some(hours) = trimmed.strip_suffix('h').and_then(|s| s.parse::<i64>().ok()) {
+    if let Some(hours) = trimmed
+        .strip_suffix('h')
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         if hours < 0 {
             return None;
         }
         let delta = hours.checked_mul(3_600_000)?;
         return now_ms.checked_sub(delta);
     }
-    if let Some(weeks) = trimmed.strip_suffix('w').and_then(|s| s.parse::<i64>().ok()) {
+    if let Some(weeks) = trimmed
+        .strip_suffix('w')
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         if weeks < 0 {
             return None;
         }
@@ -45,8 +54,7 @@ pub fn parse_since_ms(since_str: &str) -> Option<i64> {
 pub fn normalize_dir_filter(raw_dir: &str) -> Option<String> {
     let mut d = raw_dir
         .trim()
-        .replace(std::path::MAIN_SEPARATOR, "/")
-        .replace('\\', "/");
+        .replace([std::path::MAIN_SEPARATOR, '\\'], "/");
     while let Some(stripped) = d.strip_prefix("./").or_else(|| d.strip_prefix('/')) {
         d = stripped.to_string();
     }

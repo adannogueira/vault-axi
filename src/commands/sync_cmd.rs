@@ -238,7 +238,10 @@ pub fn login_command(args: &[String], _ctx: &mut Ctx) -> Result<Value, AxiError>
 
     let token = flag_string(&parsed.flags, "token");
     let (email, password) = if token.is_some() {
-        (flag_string(&parsed.flags, "email"), flag_string(&parsed.flags, "password"))
+        (
+            flag_string(&parsed.flags, "email"),
+            flag_string(&parsed.flags, "password"),
+        )
     } else {
         resolve_credentials(&parsed)
     };

@@ -16,7 +16,10 @@ pub fn setup_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
         || flag_bool(&parsed.flags, "hooks");
     let vault = flag_string(&parsed.flags, "vault");
     let remote = flag_string(&parsed.flags, "remote");
-    let auto_sync_flag = parsed.flags.get("auto-sync").map(|_| flag_bool(&parsed.flags, "auto-sync"));
+    let auto_sync_flag = parsed
+        .flags
+        .get("auto-sync")
+        .map(|_| flag_bool(&parsed.flags, "auto-sync"));
     let auto_update_flag = parsed
         .flags
         .get("auto-update")
@@ -243,10 +246,7 @@ fn find_vault_session_hook() -> Option<String> {
     let path = home.join(".claude").join("settings.json");
     let raw = fs::read_to_string(path).ok()?;
     let settings: Value = serde_json::from_str(&raw).ok()?;
-    let groups = settings
-        .get("hooks")?
-        .get("SessionStart")?
-        .as_array()?;
+    let groups = settings.get("hooks")?.get("SessionStart")?.as_array()?;
     for group in groups {
         if let Some(hooks) = group.get("hooks").and_then(|h| h.as_array()) {
             for h in hooks {

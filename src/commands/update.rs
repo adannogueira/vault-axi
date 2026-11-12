@@ -2,9 +2,7 @@ use crate::args::{flag_string, parse_args, resolve_content, FlagValue};
 use crate::axi::AxiError;
 use crate::commands::history::record_edit_transition;
 use crate::context::Ctx;
-use crate::markdown::frontmatter::{
-    coerce_value, set_frontmatter_field, unset_frontmatter_field,
-};
+use crate::markdown::frontmatter::{coerce_value, set_frontmatter_field, unset_frontmatter_field};
 use crate::markdown::sections::{
     edit_section, replace_anchor, SectionError, SectionErrorKind, SectionMode,
 };
@@ -56,7 +54,7 @@ pub fn update_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
 
     if let Some(sec) = section {
         let mode_raw = flag_string(&parsed.flags, "mode").unwrap_or_else(|| "replace".to_string());
-        let Some(mode) = SectionMode::from_str(&mode_raw) else {
+        let Some(mode) = SectionMode::parse(&mode_raw) else {
             return Err(usage(&format!(
                 "Invalid --mode \"{mode_raw}\" (replace|append|prepend)"
             )));

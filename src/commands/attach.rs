@@ -110,8 +110,12 @@ pub fn attach_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
     let prev_note = fs::read_to_string(&note_abs).ok();
     let updated_note = if let Some(ref raw) = prev_note {
         if let Some(ref sec_heading) = section {
-            match edit_section(raw, sec_heading, SectionMode::Append, &format!("{embed_syntax}\n"))
-            {
+            match edit_section(
+                raw,
+                sec_heading,
+                SectionMode::Append,
+                &format!("{embed_syntax}\n"),
+            ) {
                 Ok(text) => text,
                 Err(_) => {
                     let trimmed = raw.trim_end_matches(&['\r', '\n'][..]);
@@ -143,7 +147,13 @@ pub fn attach_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError>
     let is_image = is_image_attachment(&dest_rel);
     let mut ocr_text: Option<String> = None;
     if let Ok(db) = ctx.db() {
-        record_edit_transition(db, &note_path, prev_note.as_deref(), &updated_note, "attach");
+        record_edit_transition(
+            db,
+            &note_path,
+            prev_note.as_deref(),
+            &updated_note,
+            "attach",
+        );
         if is_image {
             ocr_text = crate::ocr::extract_image_ocr(db, &dest_abs);
         }
@@ -187,11 +197,7 @@ pub fn attachments_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiE
         let note_abs = resolve_in_vault(&root, note_path)
             .map_err(|e| AxiError::new(e, "VALIDATION_ERROR", vec![]))?;
         let raw = fs::read_to_string(&note_abs).map_err(|_| {
-            AxiError::new(
-                format!("Note not found: {note_path}"),
-                "NOT_FOUND",
-                vec![],
-            )
+            AxiError::new(format!("Note not found: {note_path}"), "NOT_FOUND", vec![])
         })?;
         let mut refs: Vec<String> = Vec::new();
         for link in parse_wiki_links(&raw) {

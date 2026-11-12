@@ -11,11 +11,7 @@ pub struct AxiError {
 }
 
 impl AxiError {
-    pub fn new(
-        message: impl Into<String>,
-        code: impl Into<String>,
-        help: Vec<String>,
-    ) -> Self {
+    pub fn new(message: impl Into<String>, code: impl Into<String>, help: Vec<String>) -> Self {
         Self {
             message: message.into(),
             code: code.into(),

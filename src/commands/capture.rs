@@ -129,9 +129,7 @@ pub fn capture_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
                     .unwrap_or(&date_str)
                     .to_string()
             };
-            format!(
-                "---\ndate: {date_str}\n---\n\n# {title}\n\n## {section_heading}\n{entry}\n"
-            )
+            format!("---\ndate: {date_str}\n---\n\n# {title}\n\n## {section_heading}\n{entry}\n")
         }
         Some(ref existing) => {
             let doc = parse_doc(existing);

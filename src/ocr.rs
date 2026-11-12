@@ -18,7 +18,11 @@ pub fn extract_image_ocr(db: &Connection, abs_path: &str) -> Option<String> {
     let bytes = fs::read(abs_path).ok()?;
     let mut hasher = Sha1::new();
     hasher.update(&bytes);
-    let file_hash: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let file_hash: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
 
     if let Ok(mock) = std::env::var("VAULT_AXI_MOCK_OCR") {
         let trimmed = mock.trim();

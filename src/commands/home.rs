@@ -60,7 +60,11 @@ pub fn home_command(_args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
             for (path, fm_str) in rows.flatten() {
                 let status = fm_str
                     .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                    .and_then(|v| v.get("status").and_then(|st| st.as_str()).map(|s| s.to_string()));
+                    .and_then(|v| {
+                        v.get("status")
+                            .and_then(|st| st.as_str())
+                            .map(|s| s.to_string())
+                    });
                 if let Some(st) = status {
                     recent_notes.push(format!("{path} ({st})"));
                 } else {

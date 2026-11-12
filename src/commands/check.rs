@@ -23,13 +23,16 @@ pub fn check_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
             "Missing file path",
             "VALIDATION_ERROR",
             vec![
-                "Usage: vault check <file> [\"<task substring>\"] [--uncheck] [--list]"
-                    .to_string(),
+                "Usage: vault check <file> [\"<task substring>\"] [--uncheck] [--list]".to_string(),
             ],
         ));
     };
     let note_path = normalize_note_path(rel);
-    let query = parsed.positionals.get(1..).map(|s| s.join(" ")).unwrap_or_default();
+    let query = parsed
+        .positionals
+        .get(1..)
+        .map(|s| s.join(" "))
+        .unwrap_or_default();
     let list_only = flag_bool(&parsed.flags, "list") || query.trim().is_empty();
     if list_only {
         let _ = ctx.pull_if_due();
@@ -88,7 +91,9 @@ pub fn check_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
         return Err(AxiError::new(
             format!("No checklist item matching \"{query}\" in {note_path}"),
             "NOT_FOUND",
-            vec![format!("Run `vault check {note_path} --list` to see all tasks")],
+            vec![format!(
+                "Run `vault check {note_path} --list` to see all tasks"
+            )],
         ));
     }
     if matches.len() > 1 && !flag_bool(&parsed.flags, "all") {
@@ -98,7 +103,9 @@ pub fn check_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> 
                 matches.len()
             ),
             "VALIDATION_ERROR",
-            vec![format!("Run `vault check {note_path} --list` to inspect tasks")],
+            vec![format!(
+                "Run `vault check {note_path} --list` to inspect tasks"
+            )],
         ));
     }
 

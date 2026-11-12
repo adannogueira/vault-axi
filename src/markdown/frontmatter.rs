@@ -104,9 +104,8 @@ fn format_yaml_value(value: &Value, eol: &str) -> Vec<String> {
         .collect::<Vec<_>>()
         .into_iter()
         .filter(|s| !s.is_empty() || matches!(value, Value::String(st) if st.is_empty()))
-        .map(|s| {
+        .inspect(|_s| {
             let _ = eol;
-            s
         })
         .collect()
 }
@@ -142,8 +141,7 @@ fn find_yaml_key_range(lines: &[String], key: &str) -> Option<(usize, usize)> {
     let mut start = None;
     for (i, line) in lines.iter().enumerate() {
         if line == &prefix
-            || (line.starts_with(&prefix)
-                && line[prefix.len()..].starts_with([' ', '\t']))
+            || (line.starts_with(&prefix) && line[prefix.len()..].starts_with([' ', '\t']))
         {
             start = Some(i);
             break;
@@ -245,7 +243,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const DOC: &str = "---\ndate: 2026-07-01\nstatus: draft\ntags:\n  - axi\n---\n\n# Body\n\nContent here.\n";
+    const DOC: &str =
+        "---\ndate: 2026-07-01\nstatus: draft\ntags:\n  - axi\n---\n\n# Body\n\nContent here.\n";
 
     #[test]
     fn read_frontmatter_parses_fields_and_returns_none_when_absent() {

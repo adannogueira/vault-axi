@@ -216,7 +216,8 @@ mod tests {
 
     #[test]
     fn remote_backend_config_serde_supports_cloud_and_supabase_alias() {
-        let raw_supabase = r#"{"vaultPath":"/tmp/v","autoSync":true,"remote":{"type":"supabase","vaultId":"v1"}}"#;
+        let raw_supabase =
+            r#"{"vaultPath":"/tmp/v","autoSync":true,"remote":{"type":"supabase","vaultId":"v1"}}"#;
         let cfg: VaultConfig = serde_json::from_str(raw_supabase).unwrap();
         assert_eq!(cfg.vault_path.as_deref(), Some("/tmp/v"));
         assert_eq!(cfg.auto_sync, Some(true));

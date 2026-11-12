@@ -171,9 +171,8 @@ pub fn merge_three_way(base: &str, local: &str, remote: &str) -> MergeOutcome {
                 ri += 1;
             }
             (Some(lh), Some(rh)) => {
-                let both_pure_insert = lh.b_start == lh.b_end
-                    && rh.b_start == rh.b_end
-                    && lh.b_start == rh.b_start;
+                let both_pure_insert =
+                    lh.b_start == lh.b_end && rh.b_start == rh.b_end && lh.b_start == rh.b_start;
                 if both_pure_insert {
                     if lh.replacement == rh.replacement {
                         out_lines.extend_from_slice(&lh.replacement);
@@ -184,13 +183,15 @@ pub fn merge_three_way(base: &str, local: &str, remote: &str) -> MergeOutcome {
                     li += 1;
                     ri += 1;
                 } else if lh.b_end < rh.b_start
-                    || (lh.b_end == rh.b_start && !(lh.b_start == lh.b_end && rh.b_start == rh.b_end))
+                    || (lh.b_end == rh.b_start
+                        && !(lh.b_start == lh.b_end && rh.b_start == rh.b_end))
                 {
                     out_lines.extend_from_slice(&lh.replacement);
                     b_pos = lh.b_end;
                     li += 1;
                 } else if rh.b_end < lh.b_start
-                    || (rh.b_end == lh.b_start && !(lh.b_start == lh.b_end && rh.b_start == rh.b_end))
+                    || (rh.b_end == lh.b_start
+                        && !(lh.b_start == lh.b_end && rh.b_start == rh.b_end))
                 {
                     out_lines.extend_from_slice(&rh.replacement);
                     b_pos = rh.b_end;
@@ -490,7 +491,8 @@ pub fn run_full_sync(
                 "  vault login --email <email> --password <password>".to_string(),
                 "Or configure self-hosted Git / S3:".to_string(),
                 "  vault setup --remote git:<repo-url>".to_string(),
-                "  vault setup --remote s3://<bucket>/<prefix> --endpoint <https://...>".to_string(),
+                "  vault setup --remote s3://<bucket>/<prefix> --endpoint <https://...>"
+                    .to_string(),
             ],
         ));
     };
@@ -585,7 +587,9 @@ fn sync_git(
             .current_dir(vault_root)
             .output()
             .map_err(|e| AxiError::new(format!("git error: {e}"), "SYNC_ERROR", vec![]))?;
-        let dirty = !String::from_utf8_lossy(&status_out.stdout).trim().is_empty();
+        let dirty = !String::from_utf8_lossy(&status_out.stdout)
+            .trim()
+            .is_empty();
         if dirty {
             let _ = Command::new("git")
                 .args(["add", "-A"])
@@ -718,8 +722,7 @@ fn resolve_concurrent_edit(
         let _ = fs::create_dir_all(parent);
     }
 
-    let is_binary =
-        local_content.starts_with("b64:v1:") || full.content.starts_with("b64:v1:");
+    let is_binary = local_content.starts_with("b64:v1:") || full.content.starts_with("b64:v1:");
     let outcome = if is_binary {
         if local_content == full.content {
             MergeOutcome::Clean(local_content.to_string())
@@ -911,8 +914,8 @@ fn exchange_api_key(
         .set("Content-Type", "application/json")
         .send_string(&payload.to_string())
         .map_err(extract_auth_error)?;
-    let body: Value = serde_json::from_str(&resp.into_string().unwrap_or_default())
-        .unwrap_or_else(|_| json!({}));
+    let body: Value =
+        serde_json::from_str(&resp.into_string().unwrap_or_default()).unwrap_or_else(|_| json!({}));
     let Some(access_token) = body
         .get("access_token")
         .and_then(|v| v.as_str())
@@ -1120,9 +1123,13 @@ fn sync_hosted_cloud(
         .find(|m| !m.deleted && m.enc_key_id == "enc-v1")
         .map(|m| m.path.clone())
     {
-        if let Some(raw_ct) =
-            fetch_raw_remote_content(clean_url, anon_key, &bearer, &effective_vault_id, &sample_path)
-        {
+        if let Some(raw_ct) = fetch_raw_remote_content(
+            clean_url,
+            anon_key,
+            &bearer,
+            &effective_vault_id,
+            &sample_path,
+        ) {
             let active_key = crate::crypto::resolve_active_key();
             if raw_ct.starts_with(crate::crypto::ENC_PREFIX)
                 && crate::crypto::decrypt_with_key(&raw_ct, &active_key).is_ok()
@@ -1150,9 +1157,9 @@ fn sync_hosted_cloud(
     }
 
     let mut synced_state: HashMap<String, SyncedEntry> = HashMap::new();
-    if let Ok(mut stmt) =
-        db.prepare("SELECT path, remote_hash, remote_mtime, COALESCE(base_content, '') FROM sync_state")
-    {
+    if let Ok(mut stmt) = db.prepare(
+        "SELECT path, remote_hash, remote_mtime, COALESCE(base_content, '') FROM sync_state",
+    ) {
         if let Ok(rows) = stmt.query_map([], |r| {
             let raw_base: String = r.get(3)?;
             let dec_base = decrypt_at_rest(&raw_base).unwrap_or(raw_base);
@@ -1205,7 +1212,8 @@ fn sync_hosted_cloud(
                     if local_modified {
                         // Local user modified a note that was deleted on another device:
                         // keep the local note, clear sync_state so do_push re-uploads it, and warn.
-                        let _ = db.execute("DELETE FROM sync_state WHERE path = ?1", params![r_path]);
+                        let _ =
+                            db.execute("DELETE FROM sync_state WHERE path = ?1", params![r_path]);
                         synced_state.remove(r_path);
                         summary.conflicts.push(ConflictInfo {
                             path: r_path.clone(),
@@ -1219,7 +1227,8 @@ fn sync_hosted_cloud(
                         let _ = move_file_to_trash(db, r_path, abs_p);
                         let _ = fs::remove_file(abs_p);
                         summary.deleted_local += 1;
-                        let _ = db.execute("DELETE FROM sync_state WHERE path = ?1", params![r_path]);
+                        let _ =
+                            db.execute("DELETE FROM sync_state WHERE path = ?1", params![r_path]);
                         synced_state.remove(r_path);
                     }
                 } else {
@@ -1231,7 +1240,8 @@ fn sync_hosted_cloud(
 
             // If local file already matches remote hash, ensure sync_state is up-to-date
             if local_hash.as_deref() == Some(r_meta.hash.as_str()) {
-                if synced_entry.as_ref().map(|s| s.remote_hash.as_str()) != Some(r_meta.hash.as_str())
+                if synced_entry.as_ref().map(|s| s.remote_hash.as_str())
+                    != Some(r_meta.hash.as_str())
                 {
                     if let Some(ref lc) = local_content {
                         upsert_sync_state(db, r_path, &r_meta.hash, r_meta.mtime_ms, now, lc);
@@ -1269,13 +1279,9 @@ fn sync_hosted_cloud(
             let local_hash = local_content.as_ref().map(|s| sha1_hex(s));
             let synced_entry = synced_state.get(&r_path).cloned();
 
-            let Some(full) = fetch_remote_note(
-                clean_url,
-                anon_key,
-                &bearer,
-                &effective_vault_id,
-                &r_path,
-            ) else {
+            let Some(full) =
+                fetch_remote_note(clean_url, anon_key, &bearer, &effective_vault_id, &r_path)
+            else {
                 continue;
             };
 
@@ -1759,8 +1765,10 @@ fn sync_hosted_cloud(
                     del_req = del_req.set("x-vault-api-key", &env_key);
                 }
                 let _ = del_req.send_string(&payload.to_string());
-                let _ =
-                    db.execute("DELETE FROM sync_state WHERE path = ?1", params![&synced_path]);
+                let _ = db.execute(
+                    "DELETE FROM sync_state WHERE path = ?1",
+                    params![&synced_path],
+                );
                 summary.deleted_remote += 1;
             }
         }
@@ -1973,8 +1981,8 @@ fn try_password_login(
         .set("Content-Type", "application/json")
         .send_string(&payload.to_string())
         .map_err(extract_auth_error)?;
-    let body: Value = serde_json::from_str(&resp.into_string().unwrap_or_default())
-        .unwrap_or_else(|_| json!({}));
+    let body: Value =
+        serde_json::from_str(&resp.into_string().unwrap_or_default()).unwrap_or_else(|_| json!({}));
     let Some(access_token) = body
         .get("access_token")
         .and_then(|v| v.as_str())
@@ -2119,7 +2127,9 @@ fn wait_for_email_confirmation(
     }
 
     eprintln!("==> Confirmation email sent to {email}.");
-    eprintln!("==> Waiting for you to click the confirmation link in your email... (Ctrl+C to skip)");
+    eprintln!(
+        "==> Waiting for you to click the confirmation link in your email... (Ctrl+C to skip)"
+    );
 
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(180);
@@ -2197,8 +2207,9 @@ pub fn register_hosted(
     };
 
     let body: Value = match resp {
-        Ok(r) => serde_json::from_str(&r.into_string().unwrap_or_default())
-            .unwrap_or_else(|_| json!({})),
+        Ok(r) => {
+            serde_json::from_str(&r.into_string().unwrap_or_default()).unwrap_or_else(|_| json!({}))
+        }
         Err(e) => {
             // If the account already exists and is confirmed, log in directly
             if let Ok((tok, refr, uid)) = try_password_login(clean_url, anon_key, email, password) {
@@ -2224,9 +2235,7 @@ pub fn register_hosted(
             return Err(AxiError::new(
                 format!("Registration failed: {msg}"),
                 "AUTH_ERROR",
-                vec![
-                    "Ensure the email is valid and password is at least 6 characters".to_string(),
-                ],
+                vec!["Ensure the email is valid and password is at least 6 characters".to_string()],
             ));
         }
     };
@@ -2552,8 +2561,8 @@ pub fn manage_api_tokens(
         )
     })?;
 
-    let body: Value = serde_json::from_str(&r.into_string().unwrap_or_default())
-        .unwrap_or_else(|_| json!({}));
+    let body: Value =
+        serde_json::from_str(&r.into_string().unwrap_or_default()).unwrap_or_else(|_| json!({}));
 
     if subaction == "create" {
         let api_key = body.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
@@ -2585,7 +2594,14 @@ fn save_hosted_session(
     email: Option<String>,
     vault_id: Option<&str>,
 ) -> Option<String> {
-    save_hosted_session_with_scope(access_token, refresh_token, user_id, email, vault_id, Some("write"))
+    save_hosted_session_with_scope(
+        access_token,
+        refresh_token,
+        user_id,
+        email,
+        vault_id,
+        Some("write"),
+    )
 }
 
 fn save_hosted_session_with_scope(
@@ -2644,7 +2660,9 @@ pub fn handle_mfa(action: &str, code: Option<&str>) -> Result<Value, AxiError> {
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Content-Type", "application/json")
                 .send_string(&payload.to_string())
-                .map_err(|e| AxiError::new(format!("MFA enroll failed: {e}"), "AUTH_ERROR", vec![]))?;
+                .map_err(|e| {
+                    AxiError::new(format!("MFA enroll failed: {e}"), "AUTH_ERROR", vec![])
+                })?;
             let body: Value = serde_json::from_str(&resp.into_string().unwrap_or_default())
                 .unwrap_or_else(|_| json!({}));
             Ok(json!({
@@ -2701,7 +2719,13 @@ fn verify_mfa_totp(
         .set("apikey", anon_key)
         .set("Authorization", &format!("Bearer {token}"))
         .call()
-        .map_err(|e| AxiError::new(format!("Failed to fetch MFA factors: {e}"), "AUTH_ERROR", vec![]))?;
+        .map_err(|e| {
+            AxiError::new(
+                format!("Failed to fetch MFA factors: {e}"),
+                "AUTH_ERROR",
+                vec![],
+            )
+        })?;
     let user_body: Value = serde_json::from_str(&user_resp.into_string().unwrap_or_default())
         .unwrap_or_else(|_| json!({}));
     let factor_id = user_body
@@ -2742,13 +2766,25 @@ fn verify_mfa_totp(
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json")
         .send_string(&v_payload.to_string())
-        .map_err(|e| AxiError::new(format!("MFA TOTP verification failed: {e}"), "AUTH_ERROR", vec![]))?;
+        .map_err(|e| {
+            AxiError::new(
+                format!("MFA TOTP verification failed: {e}"),
+                "AUTH_ERROR",
+                vec![],
+            )
+        })?;
     let v_body: Value = serde_json::from_str(&v_resp.into_string().unwrap_or_default())
         .unwrap_or_else(|_| json!({}));
     let new_access = v_body
         .get("access_token")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AxiError::new("MFA verify did not return access_token", "AUTH_ERROR", vec![]))?
+        .ok_or_else(|| {
+            AxiError::new(
+                "MFA verify did not return access_token",
+                "AUTH_ERROR",
+                vec![],
+            )
+        })?
         .to_string();
     let new_refresh = v_body
         .get("refresh_token")
@@ -2770,10 +2806,7 @@ mod tests {
             urlencoding_simple("plans/my task#1?.md"),
             "plans/my%20task%231%3F.md"
         );
-        assert_eq!(
-            sha1_hex("abc"),
-            "a9993e364706816aba3e25717850c26c9cd0d89d"
-        );
+        assert_eq!(sha1_hex("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
         let db = open_db_at(":memory:").unwrap();
         ensure_sync_table(&db);
         let count: i64 = db
@@ -2801,7 +2834,10 @@ mod tests {
             parse_query_param("access_token=abc&refresh_token=def", "refresh_token"),
             Some("def".to_string())
         );
-        assert_eq!(parse_query_param("access_token=&other=1", "access_token"), None);
+        assert_eq!(
+            parse_query_param("access_token=&other=1", "access_token"),
+            None
+        );
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2926,8 +2962,14 @@ mod tests {
 
         let conflict_copy_abs = tmp.join(conflict_copy_rel);
         assert!(conflict_copy_abs.exists());
-        assert_eq!(fs::read_to_string(&conflict_copy_abs).unwrap(), local_sec_edit);
-        assert_eq!(fs::read_to_string(&note_abs).unwrap(), remote_conflicting_sec);
+        assert_eq!(
+            fs::read_to_string(&conflict_copy_abs).unwrap(),
+            local_sec_edit
+        );
+        assert_eq!(
+            fs::read_to_string(&note_abs).unwrap(),
+            remote_conflicting_sec
+        );
 
         // Verify Ctx::attach_sync_warnings surfaces the warning and conflict list to the last writer
         let mut ctx = crate::context::Ctx::with_vault_and_db(&root, db);

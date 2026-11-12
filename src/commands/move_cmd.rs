@@ -70,9 +70,9 @@ pub fn move_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError> {
     let db = ctx.db()?;
 
     let mut referrers: Vec<String> = Vec::new();
-    if let Ok(mut stmt) = db.prepare(
-        "SELECT DISTINCT src_path FROM links WHERE target_path = ?1 AND src_path != ?1",
-    ) {
+    if let Ok(mut stmt) =
+        db.prepare("SELECT DISTINCT src_path FROM links WHERE target_path = ?1 AND src_path != ?1")
+    {
         if let Ok(rows) = stmt.query_map(params![old_path], |r| r.get::<_, String>(0)) {
             referrers = rows.flatten().collect();
         }

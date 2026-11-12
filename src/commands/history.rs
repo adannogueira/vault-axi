@@ -175,7 +175,9 @@ pub fn history_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
             AxiError::new(
                 format!("Invalid version number for --restore: {restore_str}"),
                 "VALIDATION_ERROR",
-                vec![format!("Run `vault history {note_path}` to list version numbers")],
+                vec![format!(
+                    "Run `vault history {note_path}` to list version numbers"
+                )],
             )
         })?;
 
@@ -199,8 +201,8 @@ pub fn history_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
             ));
         };
 
-        let restored_text = decrypt_at_rest(&enc_content)
-            .map_err(|e| AxiError::new(e, "CRYPTO_ERROR", vec![]))?;
+        let restored_text =
+            decrypt_at_rest(&enc_content).map_err(|e| AxiError::new(e, "CRYPTO_ERROR", vec![]))?;
 
         ctx.pull_before_mutation()?;
         let abs_p = Path::new(&abs);
@@ -247,7 +249,9 @@ pub fn history_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
             AxiError::new(
                 format!("Invalid version number: {ver_str}"),
                 "VALIDATION_ERROR",
-                vec![format!("Run `vault history {note_path}` to list version numbers")],
+                vec![format!(
+                    "Run `vault history {note_path}` to list version numbers"
+                )],
             )
         })?;
         let full = flag_bool(&parsed.flags, "full");
@@ -273,8 +277,8 @@ pub fn history_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
             ));
         };
 
-        let ver_text = decrypt_at_rest(&enc_content)
-            .map_err(|e| AxiError::new(e, "CRYPTO_ERROR", vec![]))?;
+        let ver_text =
+            decrypt_at_rest(&enc_content).map_err(|e| AxiError::new(e, "CRYPTO_ERROR", vec![]))?;
 
         let (shown_text, truncated) = if full {
             (ver_text.clone(), false)

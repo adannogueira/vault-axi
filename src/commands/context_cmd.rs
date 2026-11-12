@@ -82,10 +82,7 @@ pub fn context_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
         if let Ok(n_abs) = resolve_in_vault(&root, &n_path) {
             if let Ok(n_raw) = fs::read_to_string(&n_abs) {
                 let n_doc = parse_doc(&n_raw);
-                let n_outline: Vec<String> = outline(&n_doc)
-                    .into_iter()
-                    .map(|e| e.path)
-                    .collect();
+                let n_outline: Vec<String> = outline(&n_doc).into_iter().map(|e| e.path).collect();
                 let preview = truncate_text(&n_raw, 300).content;
                 connected_summaries.push(json!({
                     "path": n_path,

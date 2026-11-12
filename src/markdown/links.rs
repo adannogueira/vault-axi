@@ -52,9 +52,8 @@ pub fn parse_wiki_links(raw: &str) -> Vec<WikiLink> {
             continue;
         }
 
-        let scrubbed = inline_code_re().replace_all(line, |caps: &Captures| {
-            " ".repeat(caps[0].len())
-        });
+        let scrubbed =
+            inline_code_re().replace_all(line, |caps: &Captures| " ".repeat(caps[0].len()));
         for caps in wikilink_re().captures_iter(&scrubbed) {
             let embed = caps.get(1).map(|m| m.as_str()) == Some("!");
             let inner = caps.get(2).map(|m| m.as_str()).unwrap_or("");
@@ -261,7 +260,10 @@ mod tests {
             "",
         ]
         .join("\n");
-        let targets: Vec<String> = parse_wiki_links(&raw).into_iter().map(|l| l.target).collect();
+        let targets: Vec<String> = parse_wiki_links(&raw)
+            .into_iter()
+            .map(|l| l.target)
+            .collect();
         assert!(targets.contains(&"parent-note".to_string()));
 
         let raw2 = "Link to [[old-note]] and [[old-note#Goals|the goals]] plus [[keep-me]].";

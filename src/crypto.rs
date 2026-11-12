@@ -180,9 +180,7 @@ pub fn reencrypt_local_db(
     };
 
     // 1. sync_state.base_content
-    if let Ok(mut stmt) =
-        db.prepare("SELECT path, COALESCE(base_content, '') FROM sync_state")
-    {
+    if let Ok(mut stmt) = db.prepare("SELECT path, COALESCE(base_content, '') FROM sync_state") {
         let rows: Vec<(String, String)> = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .ok()
@@ -355,7 +353,8 @@ mod tests {
         let key1 = derive_key_bytes("super-secret-passphrase");
         let key2 = derive_key_bytes("wrong-passphrase");
 
-        let original = "# Secret Note\n\nContains sensitive credentials & UTF-8: café, ação, 東京!\n";
+        let original =
+            "# Secret Note\n\nContains sensitive credentials & UTF-8: café, ação, 東京!\n";
         let encrypted = encrypt_with_key(original, &key1);
         assert!(encrypted.starts_with(ENC_PREFIX));
         assert!(!encrypted.contains("Secret Note"));

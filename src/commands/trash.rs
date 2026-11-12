@@ -76,7 +76,11 @@ pub fn move_file_to_trash(db: &Connection, rel_path: &str, abs_path: &Path) -> O
 pub fn store_text_in_trash(db: &Connection, rel_path: &str, content: &str, deleted_at_ms: i64) {
     purge_expired_trash(db);
     let now = now_ms();
-    let del_ts = if deleted_at_ms > 0 { deleted_at_ms } else { now };
+    let del_ts = if deleted_at_ms > 0 {
+        deleted_at_ms
+    } else {
+        now
+    };
     let expires_at = del_ts + TRASH_RETENTION_MS;
     if expires_at <= now {
         return;

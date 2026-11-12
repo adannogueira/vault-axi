@@ -87,12 +87,16 @@ pub fn mcp_command() -> Result<Value, AxiError> {
             }),
             "tools/call" => {
                 let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let args_obj = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                let args_obj = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
                 let mut ctx = Ctx::new();
                 match dispatch_mcp_tool(tool_name, &args_obj, &mut ctx) {
                     Ok(val) => {
-                        let text = encode(&val, &EncodeOptions::default())
-                            .unwrap_or_else(|_| serde_json::to_string_pretty(&val).unwrap_or_default());
+                        let text = encode(&val, &EncodeOptions::default()).unwrap_or_else(|_| {
+                            serde_json::to_string_pretty(&val).unwrap_or_default()
+                        });
                         json!({
                             "jsonrpc": "2.0",
                             "id": req_id,
@@ -865,7 +869,10 @@ mod tests {
         assert_eq!(home["notes"], 1);
 
         let p_root = dispatch_mcp_tool("vault_path", &json!({}), &mut ctx).unwrap();
-        assert!(p_root["vault"].as_str().unwrap().contains("vault-axi-mcp-test"));
+        assert!(p_root["vault"]
+            .as_str()
+            .unwrap()
+            .contains("vault-axi-mcp-test"));
         let p_note =
             dispatch_mcp_tool("vault_path", &json!({"file": "plans/sub/new.md"}), &mut ctx)
                 .unwrap();
@@ -1021,12 +1028,8 @@ mod tests {
         .unwrap();
         assert_eq!(mv["to"], "plans/moved.md");
 
-        let del = dispatch_mcp_tool(
-            "vault_delete",
-            &json!({"file": "plans/moved.md"}),
-            &mut ctx,
-        )
-        .unwrap();
+        let del = dispatch_mcp_tool("vault_delete", &json!({"file": "plans/moved.md"}), &mut ctx)
+            .unwrap();
         assert_eq!(del["deleted"], true);
 
         let unknown = dispatch_mcp_tool("vault_nonexistent", &json!({}), &mut ctx).unwrap_err();
