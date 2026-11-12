@@ -5,9 +5,7 @@ use crate::config::{
     env_api_key, load_config, save_config, RemoteBackendConfig, HOSTED_SUPABASE_ANON_KEY,
     HOSTED_SUPABASE_URL,
 };
-use crate::crypto::{
-    decode_binary_payload, decrypt_at_rest, encode_binary_payload, encrypt_at_rest,
-};
+use crate::crypto::{decrypt_at_rest, encrypt_at_rest};
 use crate::vault::{
     file_stat, list_attachment_files, list_markdown_files, list_obsidian_config_files,
     resolve_in_vault,
@@ -15,12 +13,16 @@ use crate::vault::{
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use vault_axi_core::crypto::v1;
+use vault_axi_core::hash::sha1_hex;
+use vault_axi_core::merge::{merge_three_way, MergeOutcome};
+use vault_axi_core::paths::conflict_copy_path;
+use vault_axi_core::payload;
 
 const SYNC_COOLDOWN_MS: i64 = 15_000;
 
@@ -43,197 +45,6 @@ pub struct SyncSummary {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts: Vec<ConflictInfo>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MergeOutcome {
-    Clean(String),
-    AutoMerged(String),
-    Conflict,
-}
-
-#[derive(Debug, Clone)]
-struct DiffHunk<'a> {
-    b_start: usize,
-    b_end: usize,
-    replacement: Vec<&'a str>,
-}
-
-fn compute_lcs_hunks<'a>(base: &[&'a str], target: &[&'a str]) -> Option<Vec<DiffHunk<'a>>> {
-    let b_len = base.len();
-    let t_len = target.len();
-    if b_len.saturating_mul(t_len) > 4_000_000 {
-        return None;
-    }
-    let cols = t_len + 1;
-    let mut dp = vec![0u32; (b_len + 1) * cols];
-    for i in (0..b_len).rev() {
-        for j in (0..t_len).rev() {
-            dp[i * cols + j] = if base[i] == target[j] {
-                dp[(i + 1) * cols + (j + 1)] + 1
-            } else {
-                dp[(i + 1) * cols + j].max(dp[i * cols + (j + 1)])
-            };
-        }
-    }
-
-    let mut matches = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < b_len && j < t_len {
-        if base[i] == target[j] {
-            matches.push((i, j));
-            i += 1;
-            j += 1;
-        } else if dp[(i + 1) * cols + j] >= dp[i * cols + (j + 1)] {
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    matches.push((b_len, t_len));
-
-    let mut hunks = Vec::new();
-    let mut b_prev = 0;
-    let mut t_prev = 0;
-    for (b_m, t_m) in matches {
-        if b_prev < b_m || t_prev < t_m {
-            hunks.push(DiffHunk {
-                b_start: b_prev,
-                b_end: b_m,
-                replacement: target[t_prev..t_m].to_vec(),
-            });
-        }
-        b_prev = b_m + 1;
-        t_prev = t_m + 1;
-    }
-    Some(hunks)
-}
-
-/// Perform a line-based 3-way merge of `local` and `remote` against `base`.
-/// - Non-overlapping edits to different lines/sections or concurrent pure insertions
-///   (such as `vault log` appends) are automatically merged into `MergeOutcome::AutoMerged`.
-/// - Overlapping incompatible edits to the same base lines return `MergeOutcome::Conflict`.
-pub fn merge_three_way(base: &str, local: &str, remote: &str) -> MergeOutcome {
-    let b_norm = base.replace("\r\n", "\n");
-    let l_norm = local.replace("\r\n", "\n");
-    let r_norm = remote.replace("\r\n", "\n");
-
-    if l_norm == r_norm {
-        return MergeOutcome::Clean(l_norm);
-    }
-    if l_norm == b_norm {
-        return MergeOutcome::Clean(r_norm);
-    }
-    if r_norm == b_norm {
-        return MergeOutcome::Clean(l_norm);
-    }
-    if b_norm.is_empty() {
-        return MergeOutcome::Conflict;
-    }
-
-    let b_lines: Vec<&str> = b_norm.lines().collect();
-    let l_lines: Vec<&str> = l_norm.lines().collect();
-    let r_lines: Vec<&str> = r_norm.lines().collect();
-
-    let Some(l_hunks) = compute_lcs_hunks(&b_lines, &l_lines) else {
-        return MergeOutcome::Conflict;
-    };
-    let Some(r_hunks) = compute_lcs_hunks(&b_lines, &r_lines) else {
-        return MergeOutcome::Conflict;
-    };
-
-    let mut out_lines: Vec<&str> = Vec::with_capacity(l_lines.len().max(r_lines.len()) + 8);
-    let mut b_pos = 0;
-    let mut li = 0;
-    let mut ri = 0;
-
-    while li < l_hunks.len() || ri < r_hunks.len() {
-        let next_b = match (l_hunks.get(li), r_hunks.get(ri)) {
-            (Some(lh), Some(rh)) => lh.b_start.min(rh.b_start),
-            (Some(lh), None) => lh.b_start,
-            (None, Some(rh)) => rh.b_start,
-            (None, None) => b_lines.len(),
-        };
-        if b_pos < next_b {
-            out_lines.extend_from_slice(&b_lines[b_pos..next_b]);
-            b_pos = next_b;
-        }
-
-        match (l_hunks.get(li), r_hunks.get(ri)) {
-            (Some(lh), None) => {
-                out_lines.extend_from_slice(&lh.replacement);
-                b_pos = lh.b_end;
-                li += 1;
-            }
-            (None, Some(rh)) => {
-                out_lines.extend_from_slice(&rh.replacement);
-                b_pos = rh.b_end;
-                ri += 1;
-            }
-            (Some(lh), Some(rh)) => {
-                let both_pure_insert =
-                    lh.b_start == lh.b_end && rh.b_start == rh.b_end && lh.b_start == rh.b_start;
-                if both_pure_insert {
-                    if lh.replacement == rh.replacement {
-                        out_lines.extend_from_slice(&lh.replacement);
-                    } else {
-                        out_lines.extend_from_slice(&rh.replacement);
-                        out_lines.extend_from_slice(&lh.replacement);
-                    }
-                    li += 1;
-                    ri += 1;
-                } else if lh.b_end < rh.b_start
-                    || (lh.b_end == rh.b_start
-                        && !(lh.b_start == lh.b_end && rh.b_start == rh.b_end))
-                {
-                    out_lines.extend_from_slice(&lh.replacement);
-                    b_pos = lh.b_end;
-                    li += 1;
-                } else if rh.b_end < lh.b_start
-                    || (rh.b_end == lh.b_start
-                        && !(lh.b_start == lh.b_end && rh.b_start == rh.b_end))
-                {
-                    out_lines.extend_from_slice(&rh.replacement);
-                    b_pos = rh.b_end;
-                    ri += 1;
-                } else if lh.b_start == rh.b_start
-                    && lh.b_end == rh.b_end
-                    && lh.replacement == rh.replacement
-                {
-                    out_lines.extend_from_slice(&lh.replacement);
-                    b_pos = lh.b_end;
-                    li += 1;
-                    ri += 1;
-                } else {
-                    return MergeOutcome::Conflict;
-                }
-            }
-            (None, None) => break,
-        }
-    }
-
-    if b_pos < b_lines.len() {
-        out_lines.extend_from_slice(&b_lines[b_pos..]);
-    }
-
-    let mut merged = out_lines.join("\n");
-    if !merged.is_empty() && (l_norm.ends_with('\n') || r_norm.ends_with('\n')) {
-        merged.push('\n');
-    }
-    MergeOutcome::AutoMerged(merged)
-}
-
-fn make_conflict_copy_rel_path(rel_path: &str, ts_ms: i64) -> String {
-    let ts_sec = (ts_ms / 1000).max(1);
-    if let Some(stripped) = rel_path.strip_suffix(".md") {
-        format!("{stripped}.conflict-{ts_sec}.md")
-    } else if let Some(dot_idx) = rel_path.rfind('.') {
-        let base = &rel_path[..dot_idx];
-        let ext = &rel_path[dot_idx..];
-        format!("{base}.conflict-{ts_sec}{ext}")
-    } else {
-        format!("{rel_path}.conflict-{ts_sec}.md")
-    }
 }
 
 fn upsert_sync_state(
@@ -262,40 +73,19 @@ pub fn list_all_syncable_files(vault_root: &str) -> Vec<String> {
     all
 }
 
-/// Read a vault file into its logical sync payload (UTF-8 text for `.md` and text `.obsidian/` files,
-/// or `b64:v1:<base64>` for binary attachments).
+/// Read a vault file into its logical sync payload (see [`vault_axi_core::payload::from_file`]).
 pub fn read_sync_payload(abs_p: &Path, rel_path: &str) -> Option<String> {
-    if rel_path.to_lowercase().ends_with(".md") {
-        if let Ok(s) = fs::read_to_string(abs_p) {
-            Some(s)
-        } else {
-            let bytes = fs::read(abs_p).ok()?;
-            Some(String::from_utf8_lossy(&bytes).into_owned())
-        }
-    } else if rel_path.starts_with(".obsidian/") {
-        if let Ok(text) = fs::read_to_string(abs_p) {
-            if !text.starts_with("b64:v1:") && !text.starts_with("enc:v1:") {
-                return Some(text);
-            }
-        }
-        let bytes = fs::read(abs_p).ok()?;
-        Some(encode_binary_payload(&bytes))
-    } else {
-        let bytes = fs::read(abs_p).ok()?;
-        Some(encode_binary_payload(&bytes))
-    }
+    fs::read(abs_p)
+        .ok()
+        .map(|bytes| payload::from_file(rel_path, &bytes))
 }
 
-/// Write a logical sync payload back to disk (decoding `b64:v1:` binary payloads into raw bytes).
+/// Write a logical sync payload back to disk.
 pub fn write_sync_payload(abs_p: &Path, payload: &str) -> std::io::Result<()> {
     if let Some(parent) = abs_p.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if let Some(bytes) = decode_binary_payload(payload) {
-        fs::write(abs_p, bytes)
-    } else {
-        fs::write(abs_p, payload)
-    }
+    fs::write(abs_p, payload::to_file(payload))
 }
 
 fn report_sync_progress(action: &str, current: usize, total: usize, path: &str) {
@@ -313,13 +103,6 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-fn sha1_hex(text: &str) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(text.as_bytes());
-    let digest = hasher.finalize();
-    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn ensure_sync_table(db: &Connection) {
@@ -722,7 +505,7 @@ fn resolve_concurrent_edit(
         let _ = fs::create_dir_all(parent);
     }
 
-    let is_binary = local_content.starts_with("b64:v1:") || full.content.starts_with("b64:v1:");
+    let is_binary = payload::is_binary(local_content) || payload::is_binary(&full.content);
     let outcome = if is_binary {
         if local_content == full.content {
             MergeOutcome::Clean(local_content.to_string())
@@ -811,7 +594,7 @@ fn resolve_concurrent_edit(
             }
         }
         MergeOutcome::Conflict => {
-            let conflict_rel = make_conflict_copy_rel_path(r_path, now);
+            let conflict_rel = conflict_copy_path(r_path, now);
             if let Ok(conflict_abs) = resolve_in_vault(vault_root, &conflict_rel) {
                 let conflict_p = Path::new(&conflict_abs);
                 let _ = write_sync_payload(conflict_p, local_content);
@@ -1131,9 +914,7 @@ fn sync_hosted_cloud(
             &sample_path,
         ) {
             let active_key = crate::crypto::resolve_active_key();
-            if raw_ct.starts_with(crate::crypto::ENC_PREFIX)
-                && crate::crypto::decrypt_with_key(&raw_ct, &active_key).is_ok()
-            {
+            if v1::is_v1(&raw_ct) && crate::crypto::decrypt_with_key(&raw_ct, &active_key).is_ok() {
                 // Stamp all `enc-v1` rows in this vault with `current_key_id` so they don't need re-uploading
                 let stamp_url = format!(
                     "{clean_url}/rest/v1/vault_notes?vault_id=eq.{effective_vault_id}&enc_key_id=eq.enc-v1"
@@ -2883,37 +2664,13 @@ mod tests {
     }
 
     #[test]
-    fn three_way_merge_and_conflict_copy_resolution() {
+    fn concurrent_edit_conflict_saves_copy_and_warns() {
         let base = "# Plan\n\n## Objective\nInitial objective\n\n## Build Log\n- `2026-10-31 10:00` — Started\n";
         let local_sec_edit = "# Plan\n\n## Objective\nUpdated objective on Machine B\n\n## Build Log\n- `2026-10-31 10:00` — Started\n";
-        let remote_log_edit = "# Plan\n\n## Objective\nInitial objective\n\n## Build Log\n- `2026-10-31 10:00` — Started\n- `2026-10-31 10:02` — Machine A step\n";
 
-        // 1. Non-overlapping edits to different sections auto-merge cleanly
-        match merge_three_way(base, local_sec_edit, remote_log_edit) {
-            MergeOutcome::AutoMerged(merged) => {
-                assert!(merged.contains("Updated objective on Machine B"));
-                assert!(merged.contains("Machine A step"));
-            }
-            other => panic!("Expected AutoMerged, got {other:?}"),
-        }
-
-        // 2. Concurrent pure appends at EOF (e.g. two `vault log` entries) auto-merge in order
-        let local_log_edit = "# Plan\n\n## Objective\nInitial objective\n\n## Build Log\n- `2026-10-31 10:00` — Started\n- `2026-10-31 10:03` — Machine B step\n";
-        match merge_three_way(base, local_log_edit, remote_log_edit) {
-            MergeOutcome::AutoMerged(merged) => {
-                assert!(merged.contains("Machine A step\n- `2026-10-31 10:03` — Machine B step"));
-            }
-            other => panic!("Expected AutoMerged for concurrent log appends, got {other:?}"),
-        }
-
-        // 3. Conflicting edits to the exact same line produce MergeOutcome::Conflict
         let remote_conflicting_sec = "# Plan\n\n## Objective\nConflicting objective on Machine A\n\n## Build Log\n- `2026-10-31 10:00` — Started\n";
-        assert_eq!(
-            merge_three_way(base, local_sec_edit, remote_conflicting_sec),
-            MergeOutcome::Conflict
-        );
 
-        // 4. resolve_concurrent_edit saves a conflict copy and records a warning for the last writer
+        // resolve_concurrent_edit saves a conflict copy and records a warning for the last writer
         let tmp = std::env::temp_dir().join(format!(
             "vault_axi_sync_conflict_test_{}_{}",
             std::process::id(),

@@ -1,34 +1,6 @@
 use crate::config::{load_config, RemoteBackendConfig};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
-use ring::digest::{digest, SHA256};
-use ring::pbkdf2::{derive, PBKDF2_HMAC_SHA256};
-use ring::rand::{SecureRandom, SystemRandom};
-use std::num::NonZeroU32;
-
-pub const ENC_PREFIX: &str = "enc:v1:";
-pub const BIN_PREFIX: &str = "b64:v1:";
-const KDF_SALT: &[u8] = b"vault-axi-at-rest-salt-v1";
-const KDF_ITERATIONS: u32 = 10_000;
-
-/// Compute lowercase hex SHA-256 digest of raw bytes.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let d = digest(&SHA256, bytes);
-    d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Derive a 256-bit AES key from a passphrase or secret string using PBKDF2-HMAC-SHA256.
-pub fn derive_key_bytes(secret: &str) -> [u8; 32] {
-    let mut key = [0u8; 32];
-    derive(
-        PBKDF2_HMAC_SHA256,
-        NonZeroU32::new(KDF_ITERATIONS).unwrap(),
-        KDF_SALT,
-        secret.as_bytes(),
-        &mut key,
-    );
-    key
-}
+use vault_axi_core::crypto::{v1, Key};
 
 /// Resolve the active 256-bit encryption key for database-at-rest protection.
 /// Precedence:
@@ -36,11 +8,11 @@ pub fn derive_key_bytes(secret: &str) -> [u8; 32] {
 /// 2. `encryptionKey` configured via `vault setup --encryption-key <passphrase>`
 /// 3. Per-account cloud key derived from `user_id` + `vault_id` (if logged in)
 /// 4. Local vault key from `localEncryptionKey` or deterministic local fallback
-pub fn resolve_active_key() -> [u8; 32] {
+pub fn resolve_active_key() -> Key {
     if let Ok(env_key) = std::env::var("VAULT_ENCRYPTION_KEY") {
         let trimmed = env_key.trim();
         if !trimmed.is_empty() {
-            return derive_key_bytes(trimmed);
+            return v1::derive_key(trimmed);
         }
     }
 
@@ -48,7 +20,7 @@ pub fn resolve_active_key() -> [u8; 32] {
     if let Some(ref custom_key) = cfg.encryption_key {
         let trimmed = custom_key.trim();
         if !trimmed.is_empty() {
-            return derive_key_bytes(trimmed);
+            return v1::derive_key(trimmed);
         }
     }
 
@@ -60,101 +32,39 @@ pub fn resolve_active_key() -> [u8; 32] {
     {
         if let Some(uid) = user_id.as_deref().filter(|s| !s.is_empty()) {
             let vid = vault_id.as_deref().unwrap_or("default");
-            return derive_key_bytes(&format!("vault-axi-cloud-e2ee:{uid}:{vid}"));
+            return v1::derive_key(&format!("vault-axi-cloud-e2ee:{uid}:{vid}"));
         }
     }
 
     if let Some(ref local_key) = cfg.local_encryption_key {
         let trimmed = local_key.trim();
         if !trimmed.is_empty() {
-            return derive_key_bytes(trimmed);
+            return v1::derive_key(trimmed);
         }
     }
 
     let vault_seed = cfg.vault_path.as_deref().unwrap_or("default-local-vault");
-    derive_key_bytes(&format!("vault-axi-local-at-rest:{vault_seed}"))
+    v1::derive_key(&format!("vault-axi-local-at-rest:{vault_seed}"))
 }
 
-/// Encrypt a UTF-8 string using AES-256-GCM with the provided 256-bit key.
-/// Output format: `enc:v1:<nonce_b64>:<ciphertext_and_tag_b64>`
-pub fn encrypt_with_key(plaintext: &str, key_bytes: &[u8; 32]) -> String {
-    if plaintext.starts_with(ENC_PREFIX) {
-        return plaintext.to_string();
-    }
-    let Ok(unbound) = UnboundKey::new(&AES_256_GCM, key_bytes) else {
-        return plaintext.to_string();
-    };
-    let key = LessSafeKey::new(unbound);
-    let rng = SystemRandom::new();
-    let mut nonce_bytes = [0u8; 12];
-    if rng.fill(&mut nonce_bytes).is_err() {
-        return plaintext.to_string();
-    }
-    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
-    let mut in_out = plaintext.as_bytes().to_vec();
-    if key
-        .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
-        .is_err()
-    {
-        return plaintext.to_string();
-    }
-    format!(
-        "{ENC_PREFIX}{}:{}",
-        B64.encode(nonce_bytes),
-        B64.encode(&in_out)
-    )
-}
-
-/// Decrypt an `enc:v1:...` payload using the provided 256-bit key.
-/// Plaintext strings without `enc:v1:` are returned unchanged for backward compatibility.
-pub fn decrypt_with_key(stored: &str, key_bytes: &[u8; 32]) -> Result<String, String> {
-    let Some(rest) = stored.strip_prefix(ENC_PREFIX) else {
+/// Decrypt with one key; strings without an `enc:v1:` prefix are legacy plaintext and pass through.
+pub fn decrypt_with_key(stored: &str, key: &Key) -> Result<String, String> {
+    if !v1::is_v1(stored) {
         return Ok(stored.to_string());
-    };
-    let Some((nonce_b64, ct_b64)) = rest.split_once(':') else {
-        return Err("Malformed encrypted payload (missing nonce separator)".to_string());
-    };
-    let nonce_vec = B64
-        .decode(nonce_b64)
-        .map_err(|e| format!("Invalid encryption nonce base64: {e}"))?;
-    if nonce_vec.len() != 12 {
-        return Err(format!("Invalid nonce length: {}", nonce_vec.len()));
     }
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes.copy_from_slice(&nonce_vec);
-
-    let mut ct_buf = B64
-        .decode(ct_b64)
-        .map_err(|e| format!("Invalid ciphertext base64: {e}"))?;
-
-    let unbound =
-        UnboundKey::new(&AES_256_GCM, key_bytes).map_err(|_| "Invalid AES-256 key".to_string())?;
-    let key = LessSafeKey::new(unbound);
-    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
-
-    let decrypted = key
-        .open_in_place(nonce, Aad::empty(), &mut ct_buf)
-        .map_err(|_| {
-            "Decryption failed (authentication tag mismatch — check VAULT_ENCRYPTION_KEY or `vault setup --encryption-key`)"
-                .to_string()
-        })?;
-
-    String::from_utf8(decrypted.to_vec())
-        .map_err(|e| format!("Decrypted payload is not valid UTF-8: {e}"))
+    v1::decrypt(stored, key).map_err(|e| e.to_string())
 }
 
 /// Short 16-hex-character fingerprint of the currently active encryption key.
 /// Used to detect when remote or local rows need re-encryption after a key change.
 pub fn active_key_fingerprint() -> String {
-    let key = resolve_active_key();
-    let full = sha256_hex(&key);
+    let full = vault_axi_core::hash::sha256_hex(&resolve_active_key());
     full[..16].to_string()
 }
 
 /// Encrypt a string at rest using the active vault encryption key.
 pub fn encrypt_at_rest(plaintext: &str) -> String {
-    let key = resolve_active_key();
-    encrypt_with_key(plaintext, &key)
+    v1::encrypt(plaintext, &resolve_active_key())
 }
 
 /// Re-encrypt all rows in local SQLite (`sync_state`, `note_versions`, `trash`) that are either
@@ -162,13 +72,13 @@ pub fn encrypt_at_rest(plaintext: &str) -> String {
 /// Returns the total number of local rows re-encrypted.
 pub fn reencrypt_local_db(
     db: &rusqlite::Connection,
-    old_key: Option<&[u8; 32]>,
-    new_key: &[u8; 32],
+    old_key: Option<&Key>,
+    new_key: &Key,
 ) -> usize {
     let mut updated = 0usize;
 
     let decrypt_any = |raw: &str| -> Option<String> {
-        if !raw.starts_with(ENC_PREFIX) {
+        if !v1::is_v1(raw) {
             return Some(raw.to_string());
         }
         if let Some(ok) = old_key {
@@ -192,11 +102,10 @@ pub fn reencrypt_local_db(
             if raw.is_empty() {
                 continue;
             }
-            let already_on_new =
-                raw.starts_with(ENC_PREFIX) && decrypt_with_key(&raw, new_key).is_ok();
+            let already_on_new = v1::is_v1(&raw) && decrypt_with_key(&raw, new_key).is_ok();
             if !already_on_new {
                 if let Some(plain) = decrypt_any(&raw) {
-                    let reenc = encrypt_with_key(&plain, new_key);
+                    let reenc = v1::encrypt(&plain, new_key);
                     if db
                         .execute(
                             "UPDATE sync_state SET base_content = ?1 WHERE path = ?2",
@@ -224,11 +133,10 @@ pub fn reencrypt_local_db(
             if raw.is_empty() {
                 continue;
             }
-            let already_on_new =
-                raw.starts_with(ENC_PREFIX) && decrypt_with_key(&raw, new_key).is_ok();
+            let already_on_new = v1::is_v1(&raw) && decrypt_with_key(&raw, new_key).is_ok();
             if !already_on_new {
                 if let Some(plain) = decrypt_any(&raw) {
-                    let reenc = encrypt_with_key(&plain, new_key);
+                    let reenc = v1::encrypt(&plain, new_key);
                     if db
                         .execute(
                             "UPDATE note_versions SET content = ?1 WHERE id = ?2",
@@ -256,11 +164,10 @@ pub fn reencrypt_local_db(
             if raw.is_empty() {
                 continue;
             }
-            let already_on_new =
-                raw.starts_with(ENC_PREFIX) && decrypt_with_key(&raw, new_key).is_ok();
+            let already_on_new = v1::is_v1(&raw) && decrypt_with_key(&raw, new_key).is_ok();
             if !already_on_new {
                 if let Some(plain) = decrypt_any(&raw) {
-                    let reenc = encrypt_with_key(&plain, new_key);
+                    let reenc = v1::encrypt(&plain, new_key);
                     if db
                         .execute(
                             "UPDATE trash SET content = ?1 WHERE path = ?2",
@@ -286,11 +193,10 @@ pub fn ensure_local_db_encrypted(db: &rusqlite::Connection) -> usize {
 
 /// Decrypt a string stored at rest. Falls back to fallback keys if a custom key was recently toggled.
 pub fn decrypt_at_rest(stored: &str) -> Result<String, String> {
-    if !stored.starts_with(ENC_PREFIX) {
+    if !v1::is_v1(stored) {
         return Ok(stored.to_string());
     }
-    let primary_key = resolve_active_key();
-    if let Ok(plain) = decrypt_with_key(stored, &primary_key) {
+    if let Ok(plain) = decrypt_with_key(stored, &resolve_active_key()) {
         return Ok(plain);
     }
 
@@ -299,17 +205,14 @@ pub fn decrypt_at_rest(stored: &str) -> Result<String, String> {
     if let Some(ref prev_local) = cfg.local_encryption_key {
         let trimmed = prev_local.trim();
         if !trimmed.is_empty() {
-            if let Ok(decoded) = B64.decode(trimmed) {
-                if decoded.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&decoded);
+            if let Ok(raw) = B64.decode(trimmed) {
+                if let Ok(arr) = Key::try_from(raw.as_slice()) {
                     if let Ok(plain) = decrypt_with_key(stored, &arr) {
                         return Ok(plain);
                     }
                 }
             }
-            let prev_derived = derive_key_bytes(trimmed);
-            if let Ok(plain) = decrypt_with_key(stored, &prev_derived) {
+            if let Ok(plain) = decrypt_with_key(stored, &v1::derive_key(trimmed)) {
                 return Ok(plain);
             }
         }
@@ -322,104 +225,15 @@ pub fn decrypt_at_rest(stored: &str) -> Result<String, String> {
     {
         if let Some(uid) = user_id.as_deref().filter(|s| !s.is_empty()) {
             let vid = vault_id.as_deref().unwrap_or("default");
-            let cloud_default_key = derive_key_bytes(&format!("vault-axi-cloud-e2ee:{uid}:{vid}"));
+            let cloud_default_key = v1::derive_key(&format!("vault-axi-cloud-e2ee:{uid}:{vid}"));
             if let Ok(plain) = decrypt_with_key(stored, &cloud_default_key) {
                 return Ok(plain);
             }
         }
     }
     let vault_seed = cfg.vault_path.as_deref().unwrap_or("default-local-vault");
-    let local_default_key = derive_key_bytes(&format!("vault-axi-local-at-rest:{vault_seed}"));
-    decrypt_with_key(stored, &local_default_key)
-}
-
-/// Encode binary file bytes as a `b64:v1:<base64>` string suitable for encrypted cloud/trash storage.
-pub fn encode_binary_payload(bytes: &[u8]) -> String {
-    format!("{BIN_PREFIX}{}", B64.encode(bytes))
-}
-
-/// Decode a `b64:v1:<base64>` string back into raw binary bytes.
-pub fn decode_binary_payload(payload: &str) -> Option<Vec<u8>> {
-    let b64_str = payload.strip_prefix(BIN_PREFIX)?;
-    B64.decode(b64_str.trim()).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn aes_256_gcm_roundtrip_and_tamper_detection_and_legacy_plaintext() {
-        let key1 = derive_key_bytes("super-secret-passphrase");
-        let key2 = derive_key_bytes("wrong-passphrase");
-
-        let original =
-            "# Secret Note\n\nContains sensitive credentials & UTF-8: café, ação, 東京!\n";
-        let encrypted = encrypt_with_key(original, &key1);
-        assert!(encrypted.starts_with(ENC_PREFIX));
-        assert!(!encrypted.contains("Secret Note"));
-
-        // Encrypting an already-encrypted payload is idempotent
-        assert_eq!(encrypt_with_key(&encrypted, &key1), encrypted);
-
-        // Decrypt with correct key succeeds
-        let decrypted = decrypt_with_key(&encrypted, &key1).unwrap();
-        assert_eq!(decrypted, original);
-
-        // Decrypt with wrong key fails authentication tag verification
-        assert!(decrypt_with_key(&encrypted, &key2).is_err());
-
-        // Legacy unencrypted plaintext passes through transparently
-        assert_eq!(
-            decrypt_with_key("plain markdown note", &key1).unwrap(),
-            "plain markdown note"
-        );
-
-        // Binary encoding roundtrip
-        let raw_bin = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0xFF];
-        let encoded_bin = encode_binary_payload(&raw_bin);
-        assert!(encoded_bin.starts_with(BIN_PREFIX));
-        let enc_bin = encrypt_with_key(&encoded_bin, &key1);
-        let dec_bin_str = decrypt_with_key(&enc_bin, &key1).unwrap();
-        let decoded_bin = decode_binary_payload(&dec_bin_str).unwrap();
-        assert_eq!(decoded_bin, raw_bin);
-
-        // SHA-256 test vector
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-}
-
-#[cfg(test)]
-mod v1_fixtures {
-    use super::*;
-
-    #[test]
-    fn frozen_v1_payloads_still_decrypt() {
-        let doc: serde_json::Value =
-            serde_json::from_str(include_str!("../crates/core/tests/fixtures/crypto-v1.json"))
-                .unwrap();
-        for case in doc["cases"].as_array().unwrap() {
-            let key = &case["key"];
-            let key_bytes = match key["kind"].as_str().unwrap() {
-                "pbkdf2" => derive_key_bytes(key["input"].as_str().unwrap()),
-                "raw" => B64
-                    .decode(key["b64"].as_str().unwrap())
-                    .unwrap()
-                    .try_into()
-                    .unwrap(),
-                other => panic!("unknown key kind {other}"),
-            };
-            let plain = decrypt_with_key(case["ciphertext"].as_str().unwrap(), &key_bytes)
-                .unwrap_or_else(|e| panic!("{}: {e}", case["name"]));
-            assert_eq!(
-                plain,
-                case["plaintext"].as_str().unwrap(),
-                "{}",
-                case["name"]
-            );
-        }
-    }
+    decrypt_with_key(
+        stored,
+        &v1::derive_key(&format!("vault-axi-local-at-rest:{vault_seed}")),
+    )
 }

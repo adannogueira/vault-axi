@@ -2,9 +2,7 @@ use crate::args::{flag_bool, flag_string, parse_args};
 use crate::axi::AxiError;
 use crate::commands::history::record_note_version;
 use crate::context::Ctx;
-use crate::crypto::{
-    decode_binary_payload, decrypt_at_rest, encode_binary_payload, encrypt_at_rest,
-};
+use crate::crypto::{decrypt_at_rest, encrypt_at_rest};
 use crate::vault::{file_stat, normalize_any_vault_path, normalize_note_path, resolve_in_vault};
 use chrono::{TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -12,6 +10,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use vault_axi_core::payload::{decode_binary, encode_binary};
 
 pub const TRASH_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -54,7 +53,7 @@ pub fn move_file_to_trash(db: &Connection, rel_path: &str, abs_path: &Path) -> O
             }
             (text, 0i64)
         }
-        Err(_) => (encode_binary_payload(&bytes), 1i64),
+        Err(_) => (encode_binary(&bytes), 1i64),
     };
 
     let enc = encrypt_at_rest(&raw_payload);
@@ -240,8 +239,7 @@ pub fn restore_command(args: &[String], ctx: &mut Ctx) -> Result<Value, AxiError
     }
 
     if is_bin != 0 {
-        let bytes =
-            decode_binary_payload(&decrypted).unwrap_or_else(|| decrypted.clone().into_bytes());
+        let bytes = decode_binary(&decrypted).unwrap_or_else(|| decrypted.clone().into_bytes());
         fs::write(dest_p, &bytes).map_err(|e| {
             AxiError::new(
                 format!("Failed to restore binary attachment {dest_rel}: {e}"),

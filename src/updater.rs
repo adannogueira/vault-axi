@@ -2,13 +2,13 @@ use crate::args::{flag_bool, parse_args};
 use crate::axi::AxiError;
 use crate::config::{config_dir, load_config};
 use crate::context::Ctx;
-use crate::crypto::sha256_hex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use vault_axi_core::hash::sha256_hex;
 
 const UPDATE_COOLDOWN_MS: i64 = 24 * 60 * 60 * 1000;
 const DEFAULT_RELEASE_API: &str =

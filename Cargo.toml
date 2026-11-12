@@ -6,6 +6,9 @@ description = "Agent-ergonomic (AXI) CLI for reading, editing, and searching an 
 license = "MIT"
 default-run = "vault"
 
+[workspace]
+members = [".", "crates/core"]
+
 [[bin]]
 name = "vault"
 path = "src/main.rs"
@@ -16,12 +19,12 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "6.0"
 regex = "1.11"
-ring = "0.17"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_yaml = "0.9"
 sha1 = "0.10"
 toon-format = "0.4"
+vault-axi-core = { path = "crates/core" }
 ureq = { version = "2.12", features = ["json"] }
 
