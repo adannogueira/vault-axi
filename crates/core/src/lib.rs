@@ -9,3 +9,4 @@ pub mod merge;
 pub mod paths;
 pub mod payload;
 pub mod plan;
+pub mod s3_manifest;

@@ -11,76 +11,10 @@
 use super::engine::{Fetched, Put, PutOutcome, Remote, REMOTE_CHANGED};
 use crate::axi::AxiError;
 use crate::crypto::{invalid_keyring_error, KeyringStore, StoredKeyring};
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use vault_axi_core::crypto::keyring::{Keyring, KEYRING_PATH};
-use vault_axi_core::hash::sha256_hex;
-use vault_axi_core::paths::RESERVED_PREFIX;
 use vault_axi_core::plan::RemoteFile;
-
-const MANIFEST: &str = ".vault-manifest.json";
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Entry {
-    hash: String,
-    #[serde(default)]
-    key_id: String,
-    #[serde(default)]
-    deleted: bool,
-    #[serde(default)]
-    mtime: i64,
-    /// Object key relative to the prefix; `None` for tombstones.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    object: Option<String>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Manifest {
-    version: u32,
-    entries: BTreeMap<String, Entry>,
-}
-
-impl Manifest {
-    fn parse(body: &str) -> Result<Self, AxiError> {
-        if let Ok(m) = serde_json::from_str::<Manifest>(body) {
-            if m.version == 2 {
-                return Ok(m);
-            }
-        }
-        let legacy: BTreeMap<String, String> = serde_json::from_str(body).map_err(|e| {
-            AxiError::new(
-                format!("The S3 manifest is unreadable: {e}"),
-                "SYNC_ERROR",
-                vec![],
-            )
-        })?;
-        let entries = legacy
-            .into_iter()
-            .map(|(path, value)| {
-                let (hash, key_id) = value.split_once(':').unwrap_or((&value, ""));
-                let entry = Entry {
-                    hash: hash.to_string(),
-                    key_id: key_id.to_string(),
-                    deleted: false,
-                    mtime: 0,
-                    object: Some(path.clone()),
-                };
-                (path, entry)
-            })
-            .collect();
-        Ok(Self {
-            version: 2,
-            entries,
-        })
-    }
-}
-
-fn object_key(path: &str, hash: &str, key_id: &str) -> String {
-    let path_id = &sha256_hex(path.as_bytes())[..32];
-    let key = if key_id.is_empty() { "plain" } else { key_id };
-    format!("{RESERVED_PREFIX}objects/{path_id}/{hash}.{key}")
-}
+use vault_axi_core::s3_manifest::{object_key, Entry, Manifest, MANIFEST_PATH as MANIFEST};
 
 pub struct S3Remote {
     base: String,
@@ -139,28 +73,16 @@ impl Remote for S3Remote {
         match ureq::get(&self.url(MANIFEST)).call() {
             Ok(resp) => {
                 self.etag = resp.header("ETag").map(str::to_string);
-                self.manifest = Manifest::parse(&resp.into_string().unwrap_or_default())?;
+                self.manifest = Manifest::parse(&resp.into_string().unwrap_or_default())
+                    .map_err(|e| AxiError::new(e, "SYNC_ERROR", vec![]))?;
             }
             Err(ureq::Error::Status(404 | 403, _)) => {
                 self.etag = None;
-                self.manifest = Manifest {
-                    version: 2,
-                    entries: BTreeMap::new(),
-                };
+                self.manifest = Manifest::default();
             }
             Err(e) => return Err(s3_error("Fetching the S3 manifest failed", e)),
         }
-        Ok(self
-            .manifest
-            .entries
-            .iter()
-            .map(|(path, e)| RemoteFile {
-                path: path.clone(),
-                hash: e.hash.clone(),
-                deleted: e.deleted,
-                key_id: e.key_id.clone(),
-            })
-            .collect())
+        Ok(self.manifest.remote_files())
     }
 
     fn fetch(&mut self, path: &str) -> Result<Option<Fetched>, AxiError> {
@@ -239,7 +161,7 @@ impl Remote for S3Remote {
         if !self.dirty {
             return Ok(());
         }
-        let body = serde_json::to_string_pretty(&self.manifest).expect("manifest serializes");
+        let body = self.manifest.to_json();
         let req = ureq::put(&self.url(MANIFEST)).set("Content-Type", "application/json");
         let req = match &self.etag {
             Some(etag) => req.set("If-Match", etag),
@@ -320,49 +242,6 @@ impl KeyringStore for S3Remote {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn legacy_manifests_are_upgraded_on_read() {
-        let m = Manifest::parse(r#"{"a.md": "h1:abcd", "img/x.png": "h2"}"#).unwrap();
-        assert_eq!(m.version, 2);
-        let a = &m.entries["a.md"];
-        assert_eq!((a.hash.as_str(), a.key_id.as_str()), ("h1", "abcd"));
-        assert_eq!(a.object.as_deref(), Some("a.md"));
-        assert_eq!(m.entries["img/x.png"].key_id, "");
-    }
-
-    #[test]
-    fn v2_manifest_roundtrip() {
-        let mut m = Manifest {
-            version: 2,
-            entries: BTreeMap::new(),
-        };
-        m.entries.insert(
-            "a.md".into(),
-            Entry {
-                hash: "h".into(),
-                key_id: "k2_1".into(),
-                deleted: false,
-                mtime: 7,
-                object: Some(object_key("a.md", "h", "k2_1")),
-            },
-        );
-        let json = serde_json::to_string(&m).unwrap();
-        assert!(json.contains("\"keyId\""));
-        let back = Manifest::parse(&json).unwrap();
-        assert_eq!(back.entries, m.entries);
-        assert!(Manifest::parse("not json").is_err());
-    }
-
-    #[test]
-    fn object_keys_are_reserved_and_content_addressed() {
-        let k = object_key("notes/a.md", "abc", "k2_1");
-        assert!(k.starts_with(".vault-axi/objects/"));
-        assert!(k.ends_with("/abc.k2_1"));
-        assert_ne!(k, object_key("notes/b.md", "abc", "k2_1"));
-        assert_ne!(k, object_key("notes/a.md", "abc", "k2_2"));
-        assert!(object_key("a.md", "h", "").ends_with("h.plain"));
-    }
 
     #[test]
     fn base_url_normalizes_slashes() {

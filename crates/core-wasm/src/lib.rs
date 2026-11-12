@@ -7,6 +7,7 @@ use vault_axi_core::crypto::keyring::{KdfParams, Keyring};
 use vault_axi_core::crypto::{
     resolve_vault_key, v1, CryptoError, DataKey, Key, Keychain, VaultKeyError, VaultKeyStep,
 };
+use vault_axi_core::s3_manifest::{self, Manifest};
 use vault_axi_core::{hash, paths, payload, plan};
 use wasm_bindgen::prelude::*;
 
@@ -280,4 +281,25 @@ pub fn is_ignored_dir(name: &str) -> bool {
 #[wasm_bindgen(js_name = keyringPath)]
 pub fn keyring_path() -> String {
     vault_axi_core::crypto::keyring::KEYRING_PATH.to_string()
+}
+
+/// Parse an S3 manifest (v2, or a legacy one upgraded in memory).
+#[wasm_bindgen(js_name = parseManifest)]
+pub fn parse_manifest(body: &str) -> Result<JsValue, JsError> {
+    to_js(&Manifest::parse(body).map_err(|e| JsError::new(&format!("SYNC_ERROR: {e}")))?)
+}
+
+#[wasm_bindgen(js_name = manifestToJson)]
+pub fn manifest_to_json(manifest: JsValue) -> Result<String, JsError> {
+    Ok(from_js::<Manifest>(manifest)?.to_json())
+}
+
+#[wasm_bindgen(js_name = objectKey)]
+pub fn object_key(path: &str, hash: &str, key_id: &str) -> String {
+    s3_manifest::object_key(path, hash, key_id)
+}
+
+#[wasm_bindgen(js_name = manifestPath)]
+pub fn manifest_path() -> String {
+    s3_manifest::MANIFEST_PATH.to_string()
 }
