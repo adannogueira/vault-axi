@@ -8,3 +8,4 @@ pub mod hash;
 pub mod merge;
 pub mod paths;
 pub mod payload;
+pub mod plan;
