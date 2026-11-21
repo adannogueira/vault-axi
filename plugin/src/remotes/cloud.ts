@@ -20,8 +20,6 @@ interface Row {
   content?: string;
 }
 
-const RESERVED = /[,()"\\]/;
-
 /** Percent-encode everything except unreserved characters and `/` (as the CLI does). */
 export function percentEncode(value: string): string {
   let out = "";
@@ -32,9 +30,13 @@ export function percentEncode(value: string): string {
   return out;
 }
 
-/** Encode a value for a PostgREST `eq.` filter, quoting reserved characters. */
+/**
+ * Percent-encode a value for a standalone PostgREST `eq.` filter.
+ * PostgREST treats everything after `eq.` literally; double-quote wrapping is only for
+ * `in.(...)` / `or=(...)` lists and would match literal `"` characters here.
+ */
 export function eqValue(value: string): string {
-  return percentEncode(RESERVED.test(value) ? `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` : value);
+  return percentEncode(value);
 }
 
 export class CloudRemote implements Remote {

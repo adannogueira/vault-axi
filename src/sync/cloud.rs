@@ -77,14 +77,11 @@ pub(super) fn urlencoding_simple(s: &str) -> String {
     out
 }
 
-/// Encode a value for a PostgREST `eq.` filter, quoting reserved characters.
+/// Percent-encode a value for a standalone PostgREST `col=eq.<val>` query parameter.
+/// PostgREST treats everything after `eq.` literally; double-quote wrapping is only for
+/// `in.(...)` / `or=(...)` composite lists and would search for literal `"` characters here.
 pub(super) fn postgrest_eq_val(s: &str) -> String {
-    if s.chars().any(|c| matches!(c, ',' | '(' | ')' | '"' | '\\')) {
-        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-        urlencoding_simple(&format!("\"{escaped}\""))
-    } else {
-        urlencoding_simple(s)
-    }
+    urlencoding_simple(s)
 }
 
 impl CloudRemote {
@@ -524,7 +521,19 @@ mod tests {
             "plans/my%20task%231%3F.md"
         );
         assert_eq!(postgrest_eq_val("a/b.md"), "a/b.md");
-        assert_eq!(postgrest_eq_val("a,(b).md"), "%22a%2C%28b%29.md%22");
+        assert_eq!(postgrest_eq_val("a,(b).md"), "a%2C%28b%29.md");
+        assert_eq!(
+            postgrest_eq_val("Resources/rush00_(colle00).en.pdf"),
+            "Resources/rush00_%28colle00%29.en.pdf"
+        );
+        assert_eq!(
+            postgrest_eq_val("passaporte_formulario_poderes_para_genitor_new (1).pdf"),
+            "passaporte_formulario_poderes_para_genitor_new%20%281%29.pdf"
+        );
+        assert_eq!(
+            postgrest_eq_val("a,b \"c\"\\d&e=f.md"),
+            "a%2Cb%20%22c%22%5Cd%26e%3Df.md"
+        );
         assert_eq!(postgrest_eq_val(KEYRING_PATH), ".vault-axi/keyring.json");
     }
 

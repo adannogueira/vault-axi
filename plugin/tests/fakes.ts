@@ -146,7 +146,7 @@ export class FakePostgrest {
 
     const filters = [...url.searchParams].filter(([, v]) => v.startsWith("eq."));
     const match = (r: NoteRow) =>
-      filters.every(([k, v]) => String(r[k as keyof NoteRow]) === v.slice(3).replace(/^"(.*)"$/, "$1"));
+      filters.every(([k, v]) => String(r[k as keyof NoteRow]) === v.slice(3));
     const pick = (r: NoteRow) => {
       const cols = url.searchParams.get("select")?.split(",");
       return cols ? Object.fromEntries(cols.map((c) => [c, r[c as keyof NoteRow]])) : r;

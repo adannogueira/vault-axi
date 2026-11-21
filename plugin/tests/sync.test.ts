@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { CloudSession } from "../src/auth";
 import { newKeychain, sha1Hex } from "../src/core";
-import { CloudRemote } from "../src/remotes/cloud";
+import { CloudRemote, eqValue } from "../src/remotes/cloud";
 import { S3Remote } from "../src/remotes/s3";
 import { cloudKeys, Device, FakePostgrest, FakeS3 } from "./fakes";
 
@@ -98,6 +98,26 @@ describe("two devices over the hosted cloud", () => {
     const summary = await reader.sync(cloud(api, { scope: "read" }));
     expect([summary.pulled, summary.pushed]).toEqual([1, 0]);
     expect(api.rows.some((r) => r.path === "draft.md")).toBe(false);
+  });
+
+  it("syncs and updates paths containing parentheses, commas, spaces and quotes without double-quoting eq filters", async () => {
+    expect(eqValue("Resources/rush00_(colle00).en.pdf")).toBe("Resources/rush00_%28colle00%29.en.pdf");
+    expect(eqValue("passaporte (1).pdf")).toBe("passaporte%20%281%29.pdf");
+    expect(eqValue('a,b "c"\\d.md')).toBe("a%2Cb%20%22c%22%5Cd.md");
+
+    const api = new FakePostgrest();
+    const a = new Device(cloudKeys("pass"));
+    const b = new Device(cloudKeys("pass"));
+    const path = "Resources/rush00_(colle00).en.pdf";
+    a.vault.files.set(path, new Uint8Array([1, 2, 3, 4]));
+    expect((await a.sync(cloud(api))).pushed).toBe(1);
+    expect((await b.sync(cloud(api))).pulled).toBe(1);
+    expect([...(b.vault.files.get(path) ?? [])]).toEqual([1, 2, 3, 4]);
+
+    b.vault.files.set(path, new Uint8Array([5, 6, 7, 8]));
+    expect((await b.sync(cloud(api))).pushed).toBe(1);
+    expect((await a.sync(cloud(api))).pulled).toBe(1);
+    expect([...(a.vault.files.get(path) ?? [])]).toEqual([5, 6, 7, 8]);
   });
 });
 
