@@ -1,3 +1,4 @@
+import { yieldToMain } from "./concurrency";
 import { errorCode, newKeychain, resolveVaultKey, type DataKey, type Keychain } from "./core";
 import { SyncError, type Remote } from "./remote";
 
@@ -29,23 +30,29 @@ export async function prepareKeychain(
   cache: DataKeyCache,
   now: () => Date = () => new Date(),
 ): Promise<Keychain> {
-  const decide = (keyring: string | null) => {
+  const decide = async (keyring: string | null) => {
+    const cached = cache.get();
+    // Argon2id runs synchronously in WASM when unlocking or creating a keyring; yield once first
+    // so the browser can paint the "Unlocking vault" status before the main thread blocks.
+    if (cached === null && (keyring !== null || Boolean(settings.passphrase))) {
+      await yieldToMain();
+    }
     try {
-      return resolveVaultKey(keyring, settings.passphrase, cache.get(), now().toISOString());
+      return resolveVaultKey(keyring, settings.passphrase, cached, now().toISOString());
     } catch (e) {
       throw coreError(e);
     }
   };
 
   let dataKey: DataKey | null = null;
-  const step = decide((await remote.fetchKeyring())?.keyring ?? null);
+  const step = await decide((await remote.fetchKeyring())?.keyring ?? null);
   if (step.kind === "use") {
     dataKey = step.dataKey;
   } else if (step.kind === "create") {
     if (await remote.createKeyring(step.keyring)) {
       dataKey = step.dataKey;
     } else {
-      const winner = decide((await remote.fetchKeyring())?.keyring ?? null);
+      const winner = await decide((await remote.fetchKeyring())?.keyring ?? null);
       if (winner.kind !== "use") throw new SyncError("SYNC_ERROR", "Keyring creation conflicted but no keyring was found");
       dataKey = winner.dataKey;
     }

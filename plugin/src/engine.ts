@@ -1,6 +1,7 @@
 // Executes the core sync plan against a Remote with this device's vault and base store. A
 // line-for-line counterpart of the CLI's `sync/engine.rs`; all decisions come from the core.
 import type { BaseRecord, BaseStore } from "./base-store";
+import { createFrameYielder, runConcurrent } from "./concurrency";
 import {
   isSyncable,
   payloadFromFile,
@@ -20,10 +21,28 @@ import { REMOTE_CHANGED, SyncError, type Put, type Remote } from "./remote";
 /** Associated-data context for base content kept on this device. */
 const LOCAL_CONTEXT = "local-db";
 const MAX_ATTEMPTS = 3;
+const DEFAULT_CONCURRENCY = 4;
+/** Bounded upload chunks keep mobile RAM low, start transfers immediately, and checkpoint base state. */
+const UPLOAD_CHUNK_MAX_ITEMS = 40;
+const UPLOAD_CHUNK_MAX_BYTES = 1024 * 1024;
+const ADOPT_BATCH_SIZE = 40;
+/** Minimum plausible epoch-ms timestamp (filters out stubbed mtime values in tests). */
+const REAL_MTIME_FLOOR_MS = 1_000_000_000_000;
+/** Re-hash files touched within this window to guard against coarse filesystem mtime granularity. */
+const RACY_CLEAN_WINDOW_MS = 2_000;
+const SCAN_PROGRESS_INTERVAL_MS = 50;
 
 export interface VaultFile {
   path: string;
   size: number;
+  mtime?: number;
+}
+
+/** Cached content hash for an unchanged local file. */
+export interface FileHashEntry {
+  size: number;
+  mtime: number;
+  hash: string;
 }
 
 /** File access for the vault, including `.obsidian/`. Paths are vault-relative, `/`-separated. */
@@ -57,6 +76,20 @@ export interface SyncSummary {
   failures: string[];
 }
 
+export type SyncPhase = "listing" | "unlocking" | "scanning" | "pulling" | "pushing" | "committing";
+
+export interface SyncProgress {
+  phase: SyncPhase;
+  /** Short human-readable label for the current step, e.g. "Downloading", "Uploading". */
+  label: string;
+  /** Completed items in the current step (0..total). */
+  done: number;
+  /** Total items in the current step (0 when indeterminate). */
+  total: number;
+  /** Vault-relative paths currently being processed right now. */
+  active: string[];
+}
+
 export interface SyncOptions {
   io: VaultIO;
   base: BaseStore;
@@ -66,7 +99,15 @@ export interface SyncOptions {
   pull: boolean;
   push: boolean;
   now?: () => number;
-  onProgress?: (action: string, done: number, total: number, path: string) => void;
+  /** Optional per-vault `(size, mtime) -> hash` cache to skip re-hashing unchanged files. */
+  hashCache?: Map<string, FileHashEntry>;
+  /** Max concurrent network transfers (defaults to 4). */
+  concurrency?: number;
+  onProgress?: (progress: SyncProgress) => void;
+}
+
+function clockMs(): number {
+  return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
 
 export async function syncVault(options: SyncOptions): Promise<SyncSummary> {
@@ -84,15 +125,30 @@ async function runOnce(options: SyncOptions): Promise<SyncSummary> {
   if (push && !pull && remote.readOnly) {
     throw new SyncError("PERMISSION_DENIED", "This API token is read-only and cannot push changes");
   }
+
+  const emit = (progress: SyncProgress): void => {
+    options.onProgress?.(progress);
+  };
+
+  emit({ phase: "listing", label: "Listing remote", done: 0, total: 0, active: [] });
   const remoteFiles = await remote.list();
+
+  emit({ phase: "unlocking", label: "Unlocking vault", done: 0, total: 0, active: [] });
   const keychain = await prepareKeychain(remote, options.keys, options.keyCache);
   await remote.adoptLegacyKeyIds?.(keychain, remoteFiles);
 
   const run = new Run(options, keychain, await options.base.load());
-  await run.executePull(planPull(await run.scanLocal(), run.baseEntries(), remoteFiles, pull));
+  await run.scanLocal();
+  const pullPlan = planPull(run.localFiles(), run.baseEntries(), remoteFiles, pull);
+  await run.executePull(pullPlan);
+  let pushedAny = false;
   if (push && !remote.readOnly) {
-    const local = await run.scanLocal();
-    await run.executePush(planPush(local, run.baseEntries(), remoteFiles, keychain.activeKeyId()));
+    const pushPlan = planPush(run.localFiles(), run.baseEntries(), remoteFiles, keychain.activeKeyId());
+    pushedAny = pushPlan.length > 0;
+    await run.executePush(pushPlan);
+  }
+  if (pushedAny) {
+    emit({ phase: "committing", label: "Finishing sync", done: 0, total: 0, active: [] });
   }
   await remote.finish();
   return run.summary;
@@ -107,6 +163,9 @@ interface RemoteVersion {
 class Run {
   readonly summary: SyncSummary;
   private readonly now: number;
+  private readonly concurrency: number;
+  private readonly local = new Map<string, LocalFile>();
+  private readonly maybeYield = createFrameYielder();
 
   constructor(
     private readonly options: SyncOptions,
@@ -114,6 +173,7 @@ class Run {
     private readonly base: Map<string, BaseRecord>,
   ) {
     this.now = (options.now ?? Date.now)();
+    this.concurrency = Math.max(1, options.concurrency ?? DEFAULT_CONCURRENCY);
     this.summary = {
       backend: options.remote.name,
       pulled: 0,
@@ -125,18 +185,72 @@ class Run {
     };
   }
 
+  localFiles(): LocalFile[] {
+    return [...this.local.values()];
+  }
+
   baseEntries(): BaseEntry[] {
     return [...this.base].map(([path, b]) => ({ path, remoteHash: b.remoteHash }));
   }
 
-  async scanLocal(): Promise<LocalFile[]> {
+  private emit(progress: SyncProgress): void {
+    this.options.onProgress?.(progress);
+  }
+
+  async scanLocal(): Promise<void> {
+    this.emit({ phase: "scanning", label: "Scanning vault", done: 0, total: 0, active: [] });
     const files = (await this.options.io.listFiles()).filter((f) => isSyncable(f.path, f.size));
-    const local: LocalFile[] = [];
+    const cache = this.options.hashCache;
+    const seen = new Set<string>();
+    this.local.clear();
+
+    const total = files.length;
+    let done = 0;
+    let lastReport = 0;
+
     for (const f of files) {
+      seen.add(f.path);
+      const cached = cache?.get(f.path);
+      const cacheUsable =
+        cached !== undefined &&
+        f.mtime !== undefined &&
+        f.mtime > REAL_MTIME_FLOOR_MS &&
+        this.now - f.mtime > RACY_CLEAN_WINDOW_MS &&
+        cached.size === f.size &&
+        cached.mtime === f.mtime;
+
+      if (cacheUsable) {
+        this.local.set(f.path, { path: f.path, hash: cached.hash });
+        done++;
+        continue;
+      }
+
+      const t = clockMs();
+      if (lastReport === 0 || t - lastReport >= SCAN_PROGRESS_INTERVAL_MS) {
+        this.emit({ phase: "scanning", label: "Scanning vault", done, total, active: [f.path] });
+        lastReport = t;
+      }
+      await this.maybeYield();
+
       const content = await this.readLocal(f.path);
-      if (content !== null) local.push({ path: f.path, hash: sha1Hex(content) });
+      if (content !== null) {
+        const hash = sha1Hex(content);
+        this.local.set(f.path, { path: f.path, hash });
+        if (cache && f.mtime !== undefined) {
+          cache.set(f.path, { size: f.size, mtime: f.mtime, hash });
+        }
+      }
+      done++;
     }
-    return local;
+
+    if (cache) {
+      for (const path of cache.keys()) {
+        if (!seen.has(path)) cache.delete(path);
+      }
+    }
+    if (lastReport > 0) {
+      this.emit({ phase: "scanning", label: "Scanning vault", done: total, total, active: [] });
+    }
   }
 
   private async readLocal(path: string): Promise<string | null> {
@@ -147,6 +261,8 @@ class Run {
   private async writeLocal(path: string, content: string): Promise<boolean> {
     try {
       await this.options.io.write(path, payloadToFile(content));
+      this.local.set(path, { path, hash: sha1Hex(content) });
+      this.options.hashCache?.delete(path);
       return true;
     } catch (e) {
       this.fail(path, `could not write: ${String(e)}`);
@@ -160,9 +276,29 @@ class Run {
     this.base.set(path, record);
   }
 
+  private async setBaseMany(entries: readonly [string, BaseRecord][]): Promise<void> {
+    if (entries.length === 0) return;
+    if (this.options.base.putMany) {
+      await this.options.base.putMany(entries);
+    } else {
+      for (const [path, record] of entries) await this.options.base.put(path, record);
+    }
+    for (const [path, record] of entries) this.base.set(path, record);
+  }
+
   private async forgetBase(path: string): Promise<void> {
     await this.options.base.delete(path);
     this.base.delete(path);
+  }
+
+  private async forgetBaseMany(paths: readonly string[]): Promise<void> {
+    if (paths.length === 0) return;
+    if (this.options.base.deleteMany) {
+      await this.options.base.deleteMany(paths);
+    } else {
+      for (const path of paths) await this.options.base.delete(path);
+    }
+    for (const path of paths) this.base.delete(path);
   }
 
   private baseContent(path: string): string {
@@ -183,14 +319,11 @@ class Run {
     this.summary.failures.push(`${path}: ${why}`);
   }
 
-  private progress(action: string, done: number, total: number, path: string): void {
-    this.options.onProgress?.(action, done, total, path);
-  }
-
   /** Fetch and decrypt the live remote version; undecryptable payloads are reported, not written. */
   private async fetch(path: string): Promise<RemoteVersion | null> {
     const fetched = await this.options.remote.fetch(path);
     if (!fetched) return null;
+    await this.maybeYield();
     try {
       return { content: this.kc.decrypt(fetched.content, path), hash: fetched.hash, mtimeMs: fetched.mtimeMs };
     } catch (e) {
@@ -200,35 +333,25 @@ class Run {
   }
 
   async executePull(actions: Action[]): Promise<void> {
-    const total = actions.filter((a) => a.action === "download" || a.action === "merge").length;
-    let done = 0;
+    const toForget: string[] = [];
+    const toAdopt: Extract<Action, { action: "adoptBase" }>[] = [];
+    const toDelete: Extract<Action, { action: "deleteLocal" }>[] = [];
+    const transfers: Extract<Action, { action: "download" | "merge" }>[] = [];
+
     for (const a of actions) {
       switch (a.action) {
-        case "adoptBase": {
-          const content = await this.readLocal(a.path);
-          if (content !== null) await this.setBase(a.path, a.hash, content);
+        case "adoptBase":
+          toAdopt.push(a);
           break;
-        }
-        case "download": {
-          this.progress("Downloading", ++done, total, a.path);
-          const rv = await this.fetch(a.path);
-          if (rv && (await this.writeLocal(a.path, rv.content))) {
-            await this.setBase(a.path, rv.hash, rv.content);
-            this.summary.pulled++;
-          }
-          break;
-        }
+        case "download":
         case "merge":
-          this.progress("Merging", ++done, total, a.path);
-          await this.merge(a.path);
+          transfers.push(a);
           break;
         case "deleteLocal":
-          await this.options.io.trash(a.path);
-          this.summary.deletedLocal++;
-          await this.forgetBase(a.path);
+          toDelete.push(a);
           break;
         case "keepLocalOverRemoteDelete":
-          await this.forgetBase(a.path);
+          toForget.push(a.path);
           this.conflict(
             a.path,
             "kept_local_edit_over_remote_delete",
@@ -237,11 +360,83 @@ class Run {
           );
           break;
         case "forgetBase":
-          await this.forgetBase(a.path);
+          toForget.push(a.path);
           break;
         default:
           throw new Error(`not a pull action: ${a.action}`);
       }
+    }
+
+    await this.forgetBaseMany(toForget);
+
+    if (toAdopt.length > 0) {
+      let adopted = 0;
+      let batch: [string, BaseRecord][] = [];
+      let lastReport = 0;
+      for (const a of toAdopt) {
+        const t = clockMs();
+        if (lastReport === 0 || t - lastReport >= SCAN_PROGRESS_INTERVAL_MS) {
+          this.emit({ phase: "pulling", label: "Indexing synced files", done: adopted, total: toAdopt.length, active: [a.path] });
+          lastReport = t;
+        }
+        await this.maybeYield();
+        const content = await this.readLocal(a.path);
+        if (content !== null) {
+          batch.push([a.path, { remoteHash: a.hash, stored: this.kc.encrypt(content, LOCAL_CONTEXT) }]);
+          if (batch.length >= ADOPT_BATCH_SIZE) {
+            await this.setBaseMany(batch);
+            batch = [];
+          }
+        }
+        adopted++;
+      }
+      await this.setBaseMany(batch);
+      this.emit({ phase: "pulling", label: "Indexing synced files", done: toAdopt.length, total: toAdopt.length, active: [] });
+    }
+
+    if (toDelete.length > 0) {
+      const deletedBase: string[] = [];
+      for (const [i, a] of toDelete.entries()) {
+        this.emit({ phase: "pulling", label: "Removing", done: i, total: toDelete.length, active: [a.path] });
+        await this.options.io.trash(a.path);
+        this.local.delete(a.path);
+        this.options.hashCache?.delete(a.path);
+        this.summary.deletedLocal++;
+        deletedBase.push(a.path);
+      }
+      await this.forgetBaseMany(deletedBase);
+      this.emit({ phase: "pulling", label: "Removing", done: toDelete.length, total: toDelete.length, active: [] });
+    }
+
+    if (transfers.length > 0) {
+      const hasDownload = transfers.some((a) => a.action === "download");
+      const hasMerge = transfers.some((a) => a.action === "merge");
+      const label = hasDownload && hasMerge ? "Pulling" : hasMerge ? "Merging" : "Downloading";
+      const active = new Set<string>();
+      let done = 0;
+      const emitTransfer = () => {
+        this.emit({ phase: "pulling", label, done, total: transfers.length, active: [...active] });
+      };
+
+      await runConcurrent(transfers, this.concurrency, async (a) => {
+        active.add(a.path);
+        emitTransfer();
+        try {
+          if (a.action === "download") {
+            const rv = await this.fetch(a.path);
+            if (rv && (await this.writeLocal(a.path, rv.content))) {
+              await this.setBase(a.path, rv.hash, rv.content);
+              this.summary.pulled++;
+            }
+          } else {
+            await this.merge(a.path);
+          }
+        } finally {
+          active.delete(a.path);
+          done++;
+          emitTransfer();
+        }
+      });
     }
   }
 
@@ -277,6 +472,7 @@ class Run {
   private async preparePut(path: string, expectedRemoteHash: string | null): Promise<{ put: Put; content: string } | null> {
     const content = await this.readLocal(path);
     if (content === null) return null;
+    await this.maybeYield();
     return {
       content,
       put: {
@@ -291,20 +487,57 @@ class Run {
   }
 
   async executePush(actions: Action[]): Promise<void> {
-    const uploads: { put: Put; content: string }[] = [];
+    const uploads: Extract<Action, { action: "upload" }>[] = [];
+    const deletes: Extract<Action, { action: "deleteRemote" }>[] = [];
+    const restores: Extract<Action, { action: "restoreRemote" }>[] = [];
+
     for (const a of actions) {
       switch (a.action) {
-        case "upload": {
-          const prepared = await this.preparePut(a.path, a.expectedRemoteHash);
-          if (prepared) uploads.push(prepared);
+        case "upload":
+          uploads.push(a);
           break;
-        }
         case "deleteRemote":
+          deletes.push(a);
+          break;
+        case "restoreRemote":
+          restores.push(a);
+          break;
+        default:
+          throw new Error(`not a push action: ${a.action}`);
+      }
+    }
+
+    if (deletes.length > 0) {
+      const active = new Set<string>();
+      let done = 0;
+      const emitDelete = () => {
+        this.emit({ phase: "pushing", label: "Deleting remotely", done, total: deletes.length, active: [...active] });
+      };
+      await runConcurrent(deletes, this.concurrency, async (a) => {
+        active.add(a.path);
+        emitDelete();
+        try {
           await this.options.remote.tombstone(a.path, this.now);
           await this.forgetBase(a.path);
           this.summary.deletedRemote++;
-          break;
-        case "restoreRemote": {
+        } finally {
+          active.delete(a.path);
+          done++;
+          emitDelete();
+        }
+      });
+    }
+
+    if (restores.length > 0) {
+      const active = new Set<string>();
+      let done = 0;
+      const emitRestore = () => {
+        this.emit({ phase: "pushing", label: "Restoring", done, total: restores.length, active: [...active] });
+      };
+      await runConcurrent(restores, this.concurrency, async (a) => {
+        active.add(a.path);
+        emitRestore();
+        try {
           const rv = await this.fetch(a.path);
           if (rv && (await this.writeLocal(a.path, rv.content))) {
             await this.setBase(a.path, rv.hash, rv.content);
@@ -316,26 +549,113 @@ class Run {
               `'${a.path}' was deleted here but edited on another device; restored that version.`,
             );
           }
-          break;
+        } finally {
+          active.delete(a.path);
+          done++;
+          emitRestore();
         }
-        default:
-          throw new Error(`not a push action: ${a.action}`);
-      }
+      });
     }
 
-    uploads.forEach(({ put }, i) => {
-      this.progress("Uploading", i + 1, uploads.length, put.path);
-    });
-    const outcomes = await this.options.remote.put(uploads.map((u) => u.put));
-    for (const [i, { put, content }] of uploads.entries()) {
-      const outcome = outcomes[i];
-      if (outcome?.kind === "stored") {
-        await this.setBase(put.path, put.hash, content);
-        this.summary.pushed++;
-      } else if (outcome?.kind === "conflict") {
-        await this.resolveUploadConflict(put.path);
-      } else {
-        this.fail(put.path, outcome?.reason ?? "no upload outcome");
+    if (uploads.length > 0) {
+      await this.executeUploads(uploads);
+    }
+  }
+
+  private async executeUploads(uploads: readonly Extract<Action, { action: "upload" }>[]): Promise<void> {
+    const total = uploads.length;
+    const active = new Set<string>();
+    let done = 0;
+    const emitUpload = () => {
+      this.emit({ phase: "pushing", label: "Uploading", done, total, active: [...active] });
+    };
+
+    let cursor = 0;
+    let lastPrepareReport = 0;
+    while (cursor < uploads.length) {
+      const chunk: { put: Put; content: string }[] = [];
+      let chunkBytes = 0;
+
+      while (
+        cursor < uploads.length &&
+        chunk.length < UPLOAD_CHUNK_MAX_ITEMS &&
+        (chunk.length === 0 || chunkBytes < UPLOAD_CHUNK_MAX_BYTES)
+      ) {
+        const action = uploads[cursor++] as Extract<Action, { action: "upload" }>;
+        active.add(action.path);
+        const t = clockMs();
+        if (lastPrepareReport === 0 || t - lastPrepareReport >= SCAN_PROGRESS_INTERVAL_MS) {
+          emitUpload();
+          lastPrepareReport = t;
+        }
+        const prepared = await this.preparePut(action.path, action.expectedRemoteHash);
+        active.delete(action.path);
+        if (prepared) {
+          chunk.push(prepared);
+          chunkBytes += prepared.put.content.length;
+        } else {
+          done++;
+          emitUpload();
+        }
+      }
+
+      if (chunk.length === 0) continue;
+
+      const finishedByRemote = new Set<string>();
+      const outcomes = await this.options.remote.put(
+        chunk.map((u) => u.put),
+        {
+          onStart: (paths) => {
+            for (const p of paths) active.add(p);
+            emitUpload();
+          },
+          onDone: (paths) => {
+            for (const p of paths) {
+              active.delete(p);
+              if (!finishedByRemote.has(p)) {
+                finishedByRemote.add(p);
+                done++;
+              }
+            }
+            emitUpload();
+          },
+        },
+      );
+
+      for (const { put } of chunk) {
+        active.delete(put.path);
+        if (!finishedByRemote.has(put.path)) {
+          finishedByRemote.add(put.path);
+          done++;
+        }
+      }
+      emitUpload();
+
+      const baseUpdates: [string, BaseRecord][] = [];
+      const conflicts: string[] = [];
+      for (const [i, { put, content }] of chunk.entries()) {
+        const outcome = outcomes[i];
+        if (outcome?.kind === "stored") {
+          await this.maybeYield();
+          baseUpdates.push([put.path, { remoteHash: put.hash, stored: this.kc.encrypt(content, LOCAL_CONTEXT) }]);
+          this.summary.pushed++;
+        } else if (outcome?.kind === "conflict") {
+          conflicts.push(put.path);
+        } else {
+          this.fail(put.path, outcome?.reason ?? "no upload outcome");
+        }
+      }
+      await this.setBaseMany(baseUpdates);
+
+      for (const path of conflicts) {
+        active.add(path);
+        emitUpload();
+        try {
+          await this.resolveUploadConflict(path);
+        } finally {
+          active.delete(path);
+          emitUpload();
+        }
       }
     }
   }

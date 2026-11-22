@@ -20,6 +20,12 @@ export interface Put {
 
 export type PutOutcome = { kind: "stored" } | { kind: "conflict" } | { kind: "failed"; reason: string };
 
+/** Lifecycle hooks for reporting which upload paths are actually in flight over the network. */
+export interface PutProgress {
+  onStart?(paths: string[]): void;
+  onDone?(paths: string[]): void;
+}
+
 export interface StoredKeyring {
   keyring: string;
   /** Opaque version for compare-and-swap replacement. */
@@ -33,7 +39,7 @@ export interface Remote {
   list(): Promise<RemoteFile[]>;
   adoptLegacyKeyIds?(keychain: Keychain, files: RemoteFile[]): Promise<void>;
   fetch(path: string): Promise<Fetched | null>;
-  put(items: Put[]): Promise<PutOutcome[]>;
+  put(items: Put[], progress?: PutProgress): Promise<PutOutcome[]>;
   tombstone(path: string, mtimeMs: number): Promise<void>;
   finish(): Promise<void>;
   fetchKeyring(): Promise<StoredKeyring | null>;

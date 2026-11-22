@@ -3,13 +3,13 @@ import wasmModule from "vault-axi-core-wasm";
 import { exchangeApiToken, passwordLogin, type CloudSession } from "./auth";
 import { IndexedDbBaseStore } from "./base-store";
 import { isSyncable, loadCore, rewrapKeyring, sha1Hex } from "./core";
-import { syncVault, type SyncSummary } from "./engine";
+import { syncVault, type FileHashEntry, type SyncProgress, type SyncSummary } from "./engine";
 import { obsidianHttp, ObsidianVaultIO } from "./obsidian-io";
 import { SyncError, type Remote } from "./remote";
 import { CloudRemote } from "./remotes/cloud";
 import { S3Remote } from "./remotes/s3";
 import { DeviceSecrets } from "./secrets";
-import { DEFAULT_SETTINGS, SyncSettingTab, type SyncSettings } from "./settings";
+import { DEFAULT_SETTINGS, SyncSettingTab, SyncStatusModal, type SyncSettings } from "./settings";
 
 /** Edits settle for this long before a sync starts. */
 const EDIT_DEBOUNCE_MS = 3_000;
@@ -19,19 +19,78 @@ const RESUME_MIN_GAP_MS = 30_000;
 
 type SyncReason = "manual" | "startup" | "edit" | "resume" | "interval" | "settings";
 
-type Status = { kind: "idle" } | { kind: "syncing"; detail: string } | { kind: "ok"; at: number } | { kind: "error"; message: string };
+export type SyncStatus =
+  | { kind: "idle" }
+  | { kind: "syncing"; progress: SyncProgress }
+  | { kind: "ok"; at: number; summary: SyncSummary }
+  | { kind: "error"; message: string };
 
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+function basename(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash >= 0 ? path.slice(slash + 1) : path;
+}
+
+function truncate(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+export function formatStatusText(status: SyncStatus): string {
+  switch (status.kind) {
+    case "idle":
+      return "Not synced yet.";
+    case "syncing": {
+      const { label, done, total, active } = status.progress;
+      const head = total > 0 ? `${label} (${done}/${total})` : `${label}…`;
+      if (active.length === 0) return head;
+      if (active.length <= 3) return `${head}: ${active.join(", ")}`;
+      return `${head}: ${active.slice(0, 3).join(", ")} (+${active.length - 3} more)`;
+    }
+    case "ok":
+      return `Synced at ${new Date(status.at).toLocaleTimeString()}.`;
+    case "error":
+      return `Last sync failed: ${status.message}`;
+  }
+}
+
+export function formatStatusBarText(status: SyncStatus): string {
+  switch (status.kind) {
+    case "idle":
+      return "vault-axi ○";
+    case "ok":
+      return "vault-axi ✓";
+    case "error":
+      return "vault-axi ⚠";
+    case "syncing": {
+      const { label, done, total, active } = status.progress;
+      const count = total > 0 ? ` ${done}/${total}` : "";
+      const first = active[0];
+      if (first === undefined) {
+        return total > 0 ? `vault-axi ⟳ ${label}${count}` : `vault-axi ⟳ ${label}…`;
+      }
+      if (active.length === 1) {
+        return `vault-axi ⟳ ${label}${count} · ${truncate(basename(first), 24)}`;
+      }
+      return `vault-axi ⟳ ${label}${count} · ${truncate(basename(first), 20)} (+${active.length - 1})`;
+    }
+  }
+}
+
 export default class VaultAxiSyncPlugin extends Plugin {
   settings!: SyncSettings;
   secrets!: DeviceSecrets;
-  private status: Status = { kind: "idle" };
+  private status: SyncStatus = { kind: "idle" };
   private statusEl!: HTMLElement;
+  private ribbonEl: HTMLElement | null = null;
+  private readonly statusListeners = new Set<() => void>();
+  private readonly hashCache = new Map<string, FileHashEntry>();
   private running = false;
-  private pending = false;
+  private pendingReason: SyncReason | null = null;
+  private scheduledReason: SyncReason | null = null;
+  private scheduledAt = 0;
   private timer: number | null = null;
   private intervalId: number | null = null;
   private lastFinished = 0;
@@ -44,15 +103,26 @@ export default class VaultAxiSyncPlugin extends Plugin {
     this.secrets = new DeviceSecrets(this.settings.installId);
 
     this.statusEl = this.addStatusBarItem();
-    this.renderStatus();
-    this.addRibbonIcon("refresh-cw", "Sync with vault-axi", () => {
+    if (typeof this.statusEl.addClass === "function") this.statusEl.addClass("mod-clickable");
+    this.registerDomEvent(this.statusEl, "click", () => {
+      new SyncStatusModal(this.app, this).open();
+    });
+    this.ribbonEl = this.addRibbonIcon("refresh-cw", "Sync with vault-axi", () => {
       this.requestSync("manual", 0);
     });
+    this.renderStatus();
     this.addCommand({
       id: "sync-now",
       name: "Sync now",
       callback: () => {
         this.requestSync("manual", 0);
+      },
+    });
+    this.addCommand({
+      id: "show-status",
+      name: "Show sync status",
+      callback: () => {
+        new SyncStatusModal(this.app, this).open();
       },
     });
     this.addSettingTab(new SyncSettingTab(this.app, this));
@@ -82,6 +152,7 @@ export default class VaultAxiSyncPlugin extends Plugin {
 
   override onunload(): void {
     if (this.timer !== null) window.clearTimeout(this.timer);
+    this.statusListeners.clear();
   }
 
   async loadSettings(): Promise<void> {
@@ -109,6 +180,7 @@ export default class VaultAxiSyncPlugin extends Plugin {
   }
 
   private onVaultChange(path: string): void {
+    this.hashCache.delete(path);
     const ownWrite = this.ownWrites.get(path);
     if (ownWrite !== undefined && Date.now() - ownWrite < OWN_WRITE_WINDOW_MS) return;
     if (!isSyncable(path, 0)) return;
@@ -118,15 +190,36 @@ export default class VaultAxiSyncPlugin extends Plugin {
   /** Debounced, single-flight sync. Automatic triggers respect the auto-sync setting. */
   requestSync(reason: SyncReason, delayMs: number): void {
     if (reason !== "manual" && !this.settings.autoSync) return;
-    if (this.timer !== null) window.clearTimeout(this.timer);
+    const fireAt = Date.now() + delayMs;
+    if (this.timer !== null) {
+      // Never let a background debounce downgrade or delay a queued manual or earlier sync.
+      if (this.scheduledReason === "manual" && reason !== "manual") return;
+      if (reason !== "manual" && this.scheduledReason !== "edit" && fireAt > this.scheduledAt) return;
+      window.clearTimeout(this.timer);
+    }
+    this.scheduledReason = reason;
+    this.scheduledAt = fireAt;
     this.timer = window.setTimeout(() => {
       this.timer = null;
+      this.scheduledReason = null;
+      this.scheduledAt = 0;
       void this.runSync(reason);
     }, delayMs);
   }
 
   isSyncing(): boolean {
     return this.running;
+  }
+
+  getStatus(): SyncStatus {
+    return this.status;
+  }
+
+  onStatusChange(listener: () => void): () => void {
+    this.statusListeners.add(listener);
+    return () => {
+      this.statusListeners.delete(listener);
+    };
   }
 
   /** Identity of the configured remote; keys and sync state are kept per scope. */
@@ -161,8 +254,9 @@ export default class VaultAxiSyncPlugin extends Plugin {
   private async runSync(reason: SyncReason): Promise<void> {
     const manual = reason === "manual";
     if (this.running) {
-      // Only changes made during a run need another one; periodic triggers are redundant.
-      if (reason === "edit" || manual) this.pending = true;
+      // Only changes made during a run (or an explicit manual click) need a follow-up run.
+      if (manual) this.pendingReason = "manual";
+      else if (reason === "edit" && this.pendingReason !== "manual") this.pendingReason = "edit";
       return;
     }
     const remote = this.remote();
@@ -173,12 +267,15 @@ export default class VaultAxiSyncPlugin extends Plugin {
     }
 
     this.running = true;
-    this.setStatus({ kind: "syncing", detail: "starting" });
+    this.setStatus({ kind: "syncing", progress: { phase: "listing", label: "Starting", done: 0, total: 0, active: [] } });
     const session = this.secrets.session;
     const base = new IndexedDbBaseStore(`vault-axi-sync:${this.settings.installId}:${sha1Hex(scope)}`);
     try {
       const summary = await syncVault({
-        io: new ObsidianVaultIO(this.app, (path) => this.ownWrites.set(path, Date.now())),
+        io: new ObsidianVaultIO(this.app, (path) => {
+          this.ownWrites.set(path, Date.now());
+          this.hashCache.delete(path);
+        }),
         base,
         remote,
         keys: {
@@ -192,14 +289,15 @@ export default class VaultAxiSyncPlugin extends Plugin {
             this.secrets.setDataKey(scope, key);
           },
         },
+        hashCache: this.hashCache,
         pull: true,
         push: true,
-        onProgress: (action, done, total, path) => {
-          this.setStatus({ kind: "syncing", detail: `${action.toLowerCase()} ${done}/${total} ${path}` });
+        onProgress: (progress) => {
+          this.setStatus({ kind: "syncing", progress });
         },
       });
       this.lastError = null;
-      this.setStatus({ kind: "ok", at: Date.now() });
+      this.setStatus({ kind: "ok", at: Date.now(), summary });
       this.report(summary, manual);
     } catch (e) {
       const message = errorMessage(e);
@@ -212,9 +310,10 @@ export default class VaultAxiSyncPlugin extends Plugin {
       this.running = false;
       this.lastFinished = Date.now();
       this.pruneOwnWrites();
-      if (this.pending) {
-        this.pending = false;
-        this.requestSync("edit", 0);
+      if (this.pendingReason !== null) {
+        const next = this.pendingReason;
+        this.pendingReason = null;
+        this.requestSync(next, 0);
       }
     }
   }
@@ -234,28 +333,27 @@ export default class VaultAxiSyncPlugin extends Plugin {
     for (const [path, at] of this.ownWrites) if (at < cutoff) this.ownWrites.delete(path);
   }
 
-  private setStatus(status: Status): void {
+  private setStatus(status: SyncStatus): void {
     this.status = status;
     this.renderStatus();
+    for (const listener of this.statusListeners) listener();
   }
 
   statusText(): string {
-    switch (this.status.kind) {
-      case "idle":
-        return "Not synced yet.";
-      case "syncing":
-        return `Syncing: ${this.status.detail}`;
-      case "ok":
-        return `Synced at ${new Date(this.status.at).toLocaleTimeString()}.`;
-      case "error":
-        return `Last sync failed: ${this.status.message}`;
-    }
+    return formatStatusText(this.status);
+  }
+
+  statusBarText(): string {
+    return formatStatusBarText(this.status);
   }
 
   private renderStatus(): void {
-    const label = { idle: "○", syncing: "⟳", ok: "✓", error: "⚠" }[this.status.kind];
-    this.statusEl.setText(`vault-axi ${label}`);
-    this.statusEl.setAttribute("aria-label", this.statusText());
+    const detail = this.statusText();
+    this.statusEl.setText(this.statusBarText());
+    this.statusEl.setAttribute("aria-label", detail);
+    if (this.ribbonEl && typeof this.ribbonEl.setAttribute === "function") {
+      this.ribbonEl.setAttribute("aria-label", this.status.kind === "syncing" ? detail : `Sync with vault-axi — ${detail}`);
+    }
   }
 
   async signIn({ email, password, totp }: { email: string; password: string; totp: string | null }): Promise<void> {

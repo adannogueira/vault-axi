@@ -1,5 +1,6 @@
 // S3 / R2 over plain HTTP: a manifest plus content-addressed objects, committed with
 // compare-and-swap. Same protocol as the CLI's `sync/s3.rs`.
+import { runConcurrent } from "../concurrency";
 import {
   keyringPath,
   manifestPath,
@@ -11,7 +12,10 @@ import {
   type RemoteFile,
 } from "../core";
 import { describe, isOk, type Http } from "../http";
-import { REMOTE_CHANGED, SyncError, type Fetched, type Put, type PutOutcome, type Remote, type StoredKeyring } from "../remote";
+import { REMOTE_CHANGED, SyncError, type Fetched, type Put, type PutOutcome, type PutProgress, type Remote, type StoredKeyring } from "../remote";
+
+const PUT_CONCURRENCY = 4;
+const DELETE_CONCURRENCY = 4;
 
 export interface S3Location {
   endpoint: string;
@@ -82,30 +86,36 @@ export class S3Remote implements Remote {
     return { content: res.text, hash: entry.hash, mtimeMs: entry.mtime };
   }
 
-  async put(items: Put[]): Promise<PutOutcome[]> {
-    const outcomes: PutOutcome[] = [];
-    for (const put of items) {
+  async put(items: Put[], progress?: PutProgress): Promise<PutOutcome[]> {
+    const outcomes: PutOutcome[] = items.map(() => ({ kind: "failed", reason: "not attempted" }));
+    await runConcurrent(items, PUT_CONCURRENCY, async (put, i) => {
       const live = this.manifest.entries[put.path];
       const liveHash = live && !live.deleted ? live.hash : null;
       if (liveHash !== put.expectedRemoteHash) {
-        outcomes.push({ kind: "conflict" });
-        continue;
+        outcomes[i] = { kind: "conflict" };
+        progress?.onDone?.([put.path]);
+        return;
       }
       const object = objectKey(put.path, put.hash, put.keyId);
-      const res = await this.http({
-        url: this.url(object),
-        method: "PUT",
-        headers: { "Content-Type": "text/plain; charset=utf-8" },
-        body: put.content,
-      });
-      if (!isOk(res)) {
-        outcomes.push({ kind: "failed", reason: describe(res) });
-        continue;
+      progress?.onStart?.([put.path]);
+      try {
+        const res = await this.http({
+          url: this.url(object),
+          method: "PUT",
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+          body: put.content,
+        });
+        if (!isOk(res)) {
+          outcomes[i] = { kind: "failed", reason: describe(res) };
+          return;
+        }
+        this.superseded.delete(object);
+        this.replaceEntry(put.path, { hash: put.hash, keyId: put.keyId, deleted: false, mtime: put.mtimeMs, object });
+        outcomes[i] = { kind: "stored" };
+      } finally {
+        progress?.onDone?.([put.path]);
       }
-      this.superseded.delete(object);
-      this.replaceEntry(put.path, { hash: put.hash, keyId: put.keyId, deleted: false, mtime: put.mtimeMs, object });
-      outcomes.push({ kind: "stored" });
-    }
+    });
     return outcomes;
   }
 
@@ -127,9 +137,10 @@ export class S3Remote implements Remote {
     if (!isOk(res)) throw new SyncError("SYNC_ERROR", `Committing the S3 manifest failed (${describe(res)})`);
     this.dirty = false;
     const referenced = new Set(Object.values(this.manifest.entries).flatMap((e) => (e.object ? [e.object] : [])));
-    for (const object of this.superseded) {
-      if (!referenced.has(object)) await this.http({ url: this.url(object), method: "DELETE" }).catch(() => undefined);
-    }
+    const toDelete = [...this.superseded].filter((object) => !referenced.has(object));
+    await runConcurrent(toDelete, DELETE_CONCURRENCY, async (object) => {
+      await this.http({ url: this.url(object), method: "DELETE" }).catch(() => undefined);
+    });
     this.superseded.clear();
   }
 

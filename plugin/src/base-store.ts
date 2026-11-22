@@ -10,6 +10,8 @@ export interface BaseStore {
   load(): Promise<Map<string, BaseRecord>>;
   put(path: string, record: BaseRecord): Promise<void>;
   delete(path: string): Promise<void>;
+  putMany?(entries: readonly [string, BaseRecord][]): Promise<void>;
+  deleteMany?(paths: readonly string[]): Promise<void>;
 }
 
 export class MemoryBaseStore implements BaseStore {
@@ -26,6 +28,14 @@ export class MemoryBaseStore implements BaseStore {
     this.records.delete(path);
     return Promise.resolve();
   }
+  putMany(entries: readonly [string, BaseRecord][]): Promise<void> {
+    for (const [path, record] of entries) this.records.set(path, record);
+    return Promise.resolve();
+  }
+  deleteMany(paths: readonly string[]): Promise<void> {
+    for (const path of paths) this.records.delete(path);
+    return Promise.resolve();
+  }
 }
 
 const STORE = "base";
@@ -37,6 +47,20 @@ function promisify<T>(request: IDBRequest<T>): Promise<T> {
     };
     request.onerror = () => {
       reject(request.error ?? new Error("IndexedDB request failed"));
+    };
+  });
+}
+
+function finishTransaction(tx: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => {
+      resolve();
+    };
+    tx.onerror = () => {
+      reject(tx.error ?? new Error("IndexedDB transaction failed"));
+    };
+    tx.onabort = () => {
+      reject(tx.error ?? new Error("IndexedDB transaction aborted"));
     };
   });
 }
@@ -82,6 +106,22 @@ export class IndexedDbBaseStore implements BaseStore {
 
   async delete(path: string): Promise<void> {
     await promisify((await this.store("readwrite")).delete(path));
+  }
+
+  async putMany(entries: readonly [string, BaseRecord][]): Promise<void> {
+    if (entries.length === 0) return;
+    const tx = (await this.open()).transaction(STORE, "readwrite");
+    const store = tx.objectStore(STORE);
+    for (const [path, record] of entries) store.put(record, path);
+    await finishTransaction(tx);
+  }
+
+  async deleteMany(paths: readonly string[]): Promise<void> {
+    if (paths.length === 0) return;
+    const tx = (await this.open()).transaction(STORE, "readwrite");
+    const store = tx.objectStore(STORE);
+    for (const path of paths) store.delete(path);
+    await finishTransaction(tx);
   }
 
   async close(): Promise<void> {

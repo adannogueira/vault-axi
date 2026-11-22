@@ -1,14 +1,16 @@
 // Hosted cloud: the `vault_notes` table behind PostgREST. Same protocol as the CLI's
 // `sync/cloud.rs`.
 import { HOSTED_ANON_KEY, HOSTED_URL, renewSession, type CloudSession } from "../auth";
+import { runConcurrent } from "../concurrency";
 import { keyringPath, sha1Hex, type Keychain, type RemoteFile } from "../core";
 import { describe, isOk, type Http, type HttpResponse } from "../http";
-import { SyncError, type Fetched, type Put, type PutOutcome, type Remote, type StoredKeyring } from "../remote";
+import { SyncError, type Fetched, type Put, type PutOutcome, type PutProgress, type Remote, type StoredKeyring } from "../remote";
 
 const PAGE_SIZE = 1000;
 const BATCH_ROWS = 20;
 const BATCH_BYTES = 256_000;
 const BATCHABLE_ROW_BYTES = 48_000;
+const PUT_CONCURRENCY = 4;
 const LEGACY_KEY_ID = "enc-v1";
 
 interface Row {
@@ -42,6 +44,7 @@ export function eqValue(value: string): string {
 export class CloudRemote implements Remote {
   readonly name = "vault-cloud";
   private hasKeyIdColumn = true;
+  private renewing: Promise<CloudSession | null> | null = null;
 
   constructor(
     private readonly http: Http,
@@ -51,6 +54,20 @@ export class CloudRemote implements Remote {
 
   get readOnly(): boolean {
     return this.session.scope.toLowerCase() === "read";
+  }
+
+  private async ensureRenewed(expiredToken: string): Promise<boolean> {
+    if (this.session.accessToken !== expiredToken) return true;
+    this.renewing ??= renewSession(this.http, this.session).finally(() => {
+      this.renewing = null;
+    });
+    const renewed = await this.renewing;
+    if (!renewed) return false;
+    if (this.session.accessToken === expiredToken) {
+      this.session = renewed;
+      this.onSessionChange(renewed);
+    }
+    return true;
   }
 
   private async request(method: string, url: string, body?: unknown, prefer?: string): Promise<HttpResponse> {
@@ -63,14 +80,10 @@ export class CloudRemote implements Remote {
       if (prefer) headers.Prefer = prefer;
       return this.http({ url, method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     };
+    const tokenUsed = this.session.accessToken;
     let res = await send();
-    if (res.status === 401) {
-      const renewed = await renewSession(this.http, this.session);
-      if (renewed) {
-        this.session = renewed;
-        this.onSessionChange(renewed);
-        res = await send();
-      }
+    if (res.status === 401 && (await this.ensureRenewed(tokenUsed))) {
+      res = await send();
     }
     if (res.status === 401) {
       throw new SyncError("AUTH_ERROR", "The hosted-cloud session expired; sign in again in the plugin settings");
@@ -176,7 +189,7 @@ export class CloudRemote implements Remote {
     return row ? { content: row.content ?? "", hash: row.hash ?? "", mtimeMs: row.mtime_ms ?? 0 } : null;
   }
 
-  async put(items: Put[]): Promise<PutOutcome[]> {
+  async put(items: Put[], progress?: PutProgress): Promise<PutOutcome[]> {
     const outcomes: PutOutcome[] = items.map(() => ({ kind: "failed", reason: "not attempted" }));
     const groups: number[][] = [];
     let groupBytes = 0;
@@ -198,26 +211,42 @@ export class CloudRemote implements Remote {
       }
     });
 
-    for (const group of groups) {
-      const rows = group.map((i) => this.putRow(items[i] as Put));
-      if ((await this.upsert(rows)) === null) {
-        for (const i of group) outcomes[i] = { kind: "stored" };
-        continue;
+    await runConcurrent(groups, PUT_CONCURRENCY, async (group) => {
+      const paths = group.map((i) => (items[i] as Put).path);
+      const remaining = new Set(paths);
+      progress?.onStart?.(paths);
+      try {
+        const rows = group.map((i) => this.putRow(items[i] as Put));
+        if ((await this.upsert(rows)) === null) {
+          for (const i of group) outcomes[i] = { kind: "stored" };
+          return;
+        }
+        for (const [n, i] of group.entries()) {
+          const path = (items[i] as Put).path;
+          const error = await this.upsert(rows[n]);
+          outcomes[i] = error === null ? { kind: "stored" } : { kind: "failed", reason: error };
+          remaining.delete(path);
+          progress?.onDone?.([path]);
+        }
+      } finally {
+        if (remaining.size > 0) progress?.onDone?.([...remaining]);
       }
-      for (const [n, i] of group.entries()) {
-        const error = await this.upsert(rows[n]);
-        outcomes[i] = error === null ? { kind: "stored" } : { kind: "failed", reason: error };
-      }
-    }
-    for (const i of conditional) {
+    });
+
+    await runConcurrent(conditional, PUT_CONCURRENCY, async (i) => {
       const p = items[i] as Put;
-      if (p.expectedRemoteHash === null) {
-        const error = await this.upsert(this.putRow(p));
-        outcomes[i] = error === null ? { kind: "stored" } : { kind: "failed", reason: error };
-      } else {
-        outcomes[i] = await this.conditionalUpdate(p, p.expectedRemoteHash);
+      progress?.onStart?.([p.path]);
+      try {
+        if (p.expectedRemoteHash === null) {
+          const error = await this.upsert(this.putRow(p));
+          outcomes[i] = error === null ? { kind: "stored" } : { kind: "failed", reason: error };
+        } else {
+          outcomes[i] = await this.conditionalUpdate(p, p.expectedRemoteHash);
+        }
+      } finally {
+        progress?.onDone?.([p.path]);
       }
-    }
+    });
     return outcomes;
   }
 

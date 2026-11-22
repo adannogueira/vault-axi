@@ -15,4 +15,19 @@ describe("IndexedDbBaseStore", () => {
     expect([...(await reopened.load())]).toEqual([["b/c.md", { remoteHash: "2", stored: "enc:y" }]]);
     expect([...(await new IndexedDbBaseStore("other", factory).load())]).toEqual([]);
   });
+
+  it("batches putMany and deleteMany in single transactions", async () => {
+    const factory = new IDBFactory();
+    const store = new IndexedDbBaseStore("vault-axi-sync:batch", factory);
+    await store.putMany([
+      ["a.md", { remoteHash: "1", stored: "enc:a" }],
+      ["b.md", { remoteHash: "2", stored: "enc:b" }],
+      ["c.md", { remoteHash: "3", stored: "enc:c" }],
+    ]);
+    await store.deleteMany(["a.md", "c.md"]);
+    await store.close();
+
+    const reopened = new IndexedDbBaseStore("vault-axi-sync:batch", factory);
+    expect([...(await reopened.load())]).toEqual([["b.md", { remoteHash: "2", stored: "enc:b" }]]);
+  });
 });

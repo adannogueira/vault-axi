@@ -1,6 +1,7 @@
-import { Modal, Notice, PluginSettingTab, Setting, type App } from "obsidian";
+import { Modal, Notice, PluginSettingTab, Setting, type App, type ButtonComponent } from "obsidian";
 import type { S3Location } from "./remotes/s3";
 import type VaultAxiSyncPlugin from "./main";
+import type { SyncStatus } from "./main";
 
 export interface SyncSettings {
   /** Random per-install id namespacing this device's secrets and sync state. */
@@ -21,12 +22,63 @@ export const DEFAULT_SETTINGS: Omit<SyncSettings, "installId"> = {
   intervalMinutes: 5,
 };
 
+const MAX_DISPLAYED_ACTIVE_FILES = 8;
+
 function passwordField(input: HTMLInputElement): void {
   input.type = "password";
   input.autocomplete = "off";
 }
 
+function renderActiveFilesList(container: HTMLElement, status: SyncStatus): void {
+  container.empty();
+  if (status.kind !== "syncing" || status.progress.active.length === 0) {
+    container.style.display = "none";
+    return;
+  }
+  container.style.display = "";
+  const heading = container.createDiv({ text: "In progress:" });
+  heading.style.fontSize = "var(--font-ui-smaller)";
+  heading.style.color = "var(--text-muted)";
+  heading.style.marginBottom = "4px";
+
+  const list = container.createEl("ul");
+  list.style.margin = "0";
+  list.style.paddingLeft = "1.2em";
+  list.style.fontSize = "var(--font-ui-smaller)";
+  list.style.fontFamily = "var(--font-monospace)";
+  list.style.color = "var(--text-muted)";
+
+  const shown = status.progress.active.slice(0, MAX_DISPLAYED_ACTIVE_FILES);
+  for (const path of shown) {
+    list.createEl("li", { text: path });
+  }
+  const extra = status.progress.active.length - shown.length;
+  if (extra > 0) {
+    list.createEl("li", { text: `…and ${extra} more` });
+  }
+}
+
+function statusHeadline(status: SyncStatus, fallbackText: string): string {
+  if (status.kind === "syncing") {
+    const { label, done, total } = status.progress;
+    return total > 0 ? `${label} (${done}/${total})` : `${label}…`;
+  }
+  if (status.kind === "ok") {
+    const { pulled, pushed, deletedLocal, deletedRemote, failures } = status.summary;
+    const deleted = deletedLocal + deletedRemote;
+    const counts = `${pulled} in, ${pushed} out, ${deleted} deleted`;
+    const failed = failures.length > 0 ? `, ${failures.length} failed` : "";
+    return `${fallbackText} (${counts}${failed})`;
+  }
+  return fallbackText;
+}
+
 export class SyncSettingTab extends PluginSettingTab {
+  private unsubscribeStatus: (() => void) | null = null;
+  private statusDescEl: HTMLElement | null = null;
+  private activeListEl: HTMLElement | null = null;
+  private syncButton: ButtonComponent | null = null;
+
   constructor(
     app: App,
     private readonly plugin: VaultAxiSyncPlugin,
@@ -35,6 +87,7 @@ export class SyncSettingTab extends PluginSettingTab {
   }
 
   override display(): void {
+    this.cleanupStatusSubscription();
     const { containerEl } = this;
     containerEl.empty();
     const settings = this.plugin.settings;
@@ -58,6 +111,33 @@ export class SyncSettingTab extends PluginSettingTab {
     else this.s3Section(containerEl);
     this.encryptionSection(containerEl);
     this.syncSection(containerEl);
+  }
+
+  override hide(): void {
+    this.cleanupStatusSubscription();
+  }
+
+  private cleanupStatusSubscription(): void {
+    this.unsubscribeStatus?.();
+    this.unsubscribeStatus = null;
+    this.statusDescEl = null;
+    this.activeListEl = null;
+    this.syncButton = null;
+  }
+
+  private updateStatusUI(): void {
+    const status = this.plugin.getStatus();
+    if (this.statusDescEl) {
+      this.statusDescEl.setText(statusHeadline(status, this.plugin.statusText()));
+    }
+    if (this.activeListEl) {
+      renderActiveFilesList(this.activeListEl, status);
+    }
+    if (this.syncButton) {
+      const syncing = status.kind === "syncing";
+      this.syncButton.setButtonText(syncing ? "Syncing…" : "Sync now");
+      this.syncButton.setDisabled(syncing);
+    }
   }
 
   private cloudSection(el: HTMLElement): void {
@@ -102,8 +182,12 @@ export class SyncSettingTab extends PluginSettingTab {
           .setButtonText("Sign in")
           .setCta()
           .onClick(async () => {
-            await this.plugin.signIn({ email, password, totp: totp || null });
-            this.display();
+            b.setButtonText("Signing in…").setDisabled(true);
+            try {
+              await this.plugin.signIn({ email, password, totp: totp || null });
+            } finally {
+              this.display();
+            }
           }),
       );
 
@@ -117,8 +201,12 @@ export class SyncSettingTab extends PluginSettingTab {
       })
       .addButton((b) =>
         b.setButtonText("Use token").onClick(async () => {
-          await this.plugin.signInWithToken(token);
-          this.display();
+          b.setButtonText("Signing in…").setDisabled(true);
+          try {
+            await this.plugin.signInWithToken(token);
+          } finally {
+            this.display();
+          }
         }),
       );
   }
@@ -200,14 +288,101 @@ export class SyncSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
-    new Setting(el)
+    const statusSetting = new Setting(el)
       .setName("Status")
       .setDesc(this.plugin.statusText())
-      .addButton((b) =>
+      .addButton((b) => {
+        this.syncButton = b;
         b.setButtonText("Sync now").onClick(() => {
           this.plugin.requestSync("manual", 0);
-        }),
-      );
+        });
+      });
+    this.statusDescEl = statusSetting.descEl;
+
+    this.activeListEl = el.createDiv({ cls: "vault-axi-active-files" });
+    this.activeListEl.style.marginTop = "-6px";
+    this.activeListEl.style.marginBottom = "12px";
+
+    this.updateStatusUI();
+    this.unsubscribeStatus = this.plugin.onStatusChange(() => {
+      this.updateStatusUI();
+    });
+  }
+}
+
+export class SyncStatusModal extends Modal {
+  private unsubscribe: (() => void) | null = null;
+  private headlineEl: HTMLElement | null = null;
+  private activeListEl: HTMLElement | null = null;
+  private detailEl: HTMLElement | null = null;
+  private syncButton: ButtonComponent | null = null;
+
+  constructor(
+    app: App,
+    private readonly plugin: VaultAxiSyncPlugin,
+  ) {
+    super(app);
+  }
+
+  override onOpen(): void {
+    this.setTitle("Vault AXI Sync");
+    this.headlineEl = this.contentEl.createEl("p");
+    this.activeListEl = this.contentEl.createDiv({ cls: "vault-axi-active-files" });
+    this.activeListEl.style.marginBottom = "12px";
+    this.detailEl = this.contentEl.createDiv();
+    this.detailEl.style.marginBottom = "12px";
+    new Setting(this.contentEl).addButton((b) => {
+      this.syncButton = b;
+      b.setButtonText("Sync now")
+        .setCta()
+        .onClick(() => {
+          this.plugin.requestSync("manual", 0);
+        });
+    });
+
+    this.render();
+    this.unsubscribe = this.plugin.onStatusChange(() => {
+      this.render();
+    });
+  }
+
+  override onClose(): void {
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+    this.headlineEl = null;
+    this.activeListEl = null;
+    this.detailEl = null;
+    this.syncButton = null;
+    this.contentEl.empty();
+  }
+
+  private render(): void {
+    const status = this.plugin.getStatus();
+    if (this.headlineEl) {
+      this.headlineEl.setText(statusHeadline(status, this.plugin.statusText()));
+    }
+    if (this.activeListEl) {
+      renderActiveFilesList(this.activeListEl, status);
+    }
+    if (this.detailEl) {
+      this.detailEl.empty();
+      if (status.kind === "ok" && status.summary.failures.length > 0) {
+        const header = this.detailEl.createDiv({ text: "Could not sync:" });
+        header.style.fontSize = "var(--font-ui-smaller)";
+        header.style.color = "var(--text-error)";
+        const list = this.detailEl.createEl("ul");
+        list.style.fontSize = "var(--font-ui-smaller)";
+        list.style.fontFamily = "var(--font-monospace)";
+        for (const failure of status.summary.failures) {
+          list.createEl("li", { text: failure });
+        }
+      }
+    }
+    if (this.syncButton) {
+      const syncing = status.kind === "syncing";
+      this.syncButton.setButtonText(syncing ? "Syncing…" : "Sync now");
+      this.syncButton.setDisabled(syncing);
+    }
   }
 }
 

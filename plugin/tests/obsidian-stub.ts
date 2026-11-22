@@ -115,9 +115,27 @@ class Component {
   }
 }
 
+export class StatusBarStub {
+  text = "";
+  readonly history: string[] = [];
+  readonly attrs = new Map<string, string>();
+  readonly classes = new Set<string>();
+  setText(text: string): void {
+    this.text = text;
+    this.history.push(text);
+  }
+  setAttribute(name: string, value: string): void {
+    this.attrs.set(name, value);
+  }
+  addClass(cls: string): void {
+    this.classes.add(cls);
+  }
+}
+
 export class Plugin extends Component {
   data: unknown = null;
   readonly commands: { id: string; callback: () => void }[] = [];
+  readonly statusBar = new StatusBarStub();
   constructor(readonly app: App, readonly manifest: unknown) {
     super();
   }
@@ -129,10 +147,10 @@ export class Plugin extends Component {
     return Promise.resolve();
   }
   addStatusBarItem() {
-    return { setText: (_: string) => undefined, setAttribute: (_: string, __: string) => undefined };
+    return this.statusBar;
   }
   addRibbonIcon() {
-    return {};
+    return { setAttribute: (_: string, __: string) => undefined };
   }
   addCommand(cmd: { id: string; callback: () => void }) {
     this.commands.push(cmd);

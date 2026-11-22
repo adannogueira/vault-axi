@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import VaultAxiSyncPlugin from "../src/main";
+import VaultAxiSyncPlugin, { formatStatusBarText, formatStatusText } from "../src/main";
 import { S3Remote } from "../src/remotes/s3";
 import { Device, FakeS3 } from "./fakes";
 import { App, MemoryAdapter, notices, setRequestHandler } from "./obsidian-stub";
@@ -111,5 +111,117 @@ describe("plugin lifecycle in Obsidian", () => {
     expect(plugin.statusText()).toMatch(/passphrase does not unlock/);
     expect(notices.some((n) => n.includes("Vault AXI Sync failed"))).toBe(true);
     expect(adapter.files.size).toBe(0);
+  });
+
+  it("shows live active files in the status bar and notifies status subscribers during sync", async () => {
+    const s3 = new FakeS3();
+    setRequestHandler(s3.http);
+    const adapter = new MemoryAdapter();
+    adapter.write("notes/alpha.md", "alpha\n");
+    adapter.write("notes/beta.md", "beta\n");
+    const app = new App(adapter);
+    const plugin = new VaultAxiSyncPlugin(app as never, {} as never);
+    seedData(plugin, { backend: "s3", s3: { endpoint: "https://s3.test", bucket: "bucket", prefix: "vault" } });
+    await plugin.onload();
+    plugin.secrets.passphrase = "pass";
+
+    const seenStatuses: string[] = [];
+    const unsubscribe = plugin.onStatusChange(() => {
+      seenStatuses.push(plugin.statusBarText());
+    });
+
+    plugin.requestSync("manual", 0);
+    await settle(plugin);
+    unsubscribe();
+
+    const statusBar = (plugin as unknown as { statusBar: { text: string; history: string[] } }).statusBar;
+    expect(statusBar.history.some((t) => t.startsWith("vault-axi ⟳ Uploading") && t.includes("alpha.md"))).toBe(true);
+    expect(statusBar.text).toBe("vault-axi ✓");
+    expect(seenStatuses.some((t) => t.includes("Uploading"))).toBe(true);
+    expect(seenStatuses.at(-1)).toBe("vault-axi ✓");
+  });
+
+  it("runs a queued manual sync even when autoSync is disabled and ignores later edit debounces", async () => {
+    const s3 = new FakeS3();
+    const releases: (() => void)[] = [];
+    let holdFirstList = true;
+    setRequestHandler(async (req) => {
+      if (holdFirstList && req.method === "GET" && req.url.endsWith(".vault-manifest.json")) {
+        holdFirstList = false;
+        await new Promise<void>((resolve) => {
+          releases.push(resolve);
+        });
+      }
+      return s3.http(req);
+    });
+
+    const adapter = new MemoryAdapter();
+    adapter.write("a.md", "first\n");
+    const app = new App(adapter);
+    const plugin = new VaultAxiSyncPlugin(app as never, {} as never);
+    seedData(plugin, {
+      backend: "s3",
+      autoSync: false,
+      s3: { endpoint: "https://s3.test", bucket: "bucket", prefix: "vault" },
+    });
+    await plugin.onload();
+    plugin.secrets.passphrase = "pass";
+
+    // Start first manual sync; it pauses on listing.
+    plugin.requestSync("manual", 0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(plugin.isSyncing()).toBe(true);
+
+    // Edit while syncing and click Sync now again while autoSync is off.
+    adapter.write("b.md", "added mid-sync\n");
+    plugin.requestSync("manual", 0);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Release first sync; the queued manual follow-up must run and push b.md.
+    releases.shift()?.();
+    await settle(plugin);
+    const manifest = s3.objects.get("bucket/vault/.vault-manifest.json")?.body ?? "";
+    expect(manifest).toContain("a.md");
+    expect(manifest).toContain("b.md");
+  });
+
+  it("formats status bar and tooltip text cleanly for single, multiple and indeterminate states", () => {
+    expect(formatStatusBarText({ kind: "idle" })).toBe("vault-axi ○");
+    expect(
+      formatStatusBarText({
+        kind: "syncing",
+        progress: { phase: "listing", label: "Listing remote", done: 0, total: 0, active: [] },
+      }),
+    ).toBe("vault-axi ⟳ Listing remote…");
+    expect(
+      formatStatusBarText({
+        kind: "syncing",
+        progress: { phase: "pulling", label: "Downloading", done: 2, total: 5, active: ["notes/today.md"] },
+      }),
+    ).toBe("vault-axi ⟳ Downloading 2/5 · today.md");
+    expect(
+      formatStatusBarText({
+        kind: "syncing",
+        progress: {
+          phase: "pushing",
+          label: "Uploading",
+          done: 1,
+          total: 6,
+          active: ["a/one.md", "a/two.md", "a/three.md", "a/four.md"],
+        },
+      }),
+    ).toBe("vault-axi ⟳ Uploading 1/6 · one.md (+3)");
+    expect(
+      formatStatusText({
+        kind: "syncing",
+        progress: {
+          phase: "pushing",
+          label: "Uploading",
+          done: 1,
+          total: 6,
+          active: ["a/one.md", "a/two.md", "a/three.md", "a/four.md"],
+        },
+      }),
+    ).toBe("Uploading (1/6): a/one.md, a/two.md, a/three.md (+1 more)");
   });
 });
